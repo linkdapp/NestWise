@@ -1,0 +1,117 @@
+################################################################################
+# Standalone, edit-and-run copy of the Grid Infrastructure PHASE B (configure)
+# response file, for people who aren't running the Ansible layer. This is the
+# RENDERED shape of
+# ansible/roles/grid_silent_install/templates/grid_install.rsp.j2 with the
+# values from ansible/group_vars/all.yml substituted in — see
+# ../docs/network-and-hosts.md and ../docs/patching-strategy.md first.
+#
+# This file is used with `config.sh` (Phase B, cluster configuration), AFTER a
+# software-only install (Phase A — see the companion grid_install_swonly.rsp in
+# this same directory) and its orainstRoot.sh/root.sh have already completed.
+# See ../docs/patching-strategy.md for the two-phase design.
+#
+# GI is 19.0.0 (19.3 base + RU 19.24) here, NOT 12.2.0.1 — a deliberate,
+# independent-version design (see ../docs/known-risks.md #2): 19c GI + 12.2.0.1
+# DB on top.
+#
+# Every field below is verified field-by-field against the real, blank
+# gridsetup.rsp shipped in 19.3 install media — see ../docs/known-risks.md #10
+# for the response-file fields worth getting right the first time
+# (networkInterfaceList type values, disksWithFailureGroupNames, ORACLE_HOME).
+################################################################################
+
+oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v19.0.0
+
+# Required on Unix (real template's comment: "optional... if installing on Windows").
+INVENTORY_LOCATION=/u01/app/oraInventory
+
+oracle.install.option=CRS_CONFIG
+
+ORACLE_BASE=/u01/app/oracle
+# Shared ORACLE_BASE — same value as the database software owner's (grid and oracle
+# both write here, both members of oinstall; see ansible/group_vars/all.yml). GRID_HOME
+# (ansible/group_vars/all.yml, /u01/app/grid/19.3.0) is a completely separate top-level
+# path, not nested under this base at all, so it never trips Oracle's "Grid home must
+# not be under an Oracle base directory" installer check.
+ORACLE_HOME=/u01/app/grid/19.3.0
+
+oracle.install.asm.OSDBA=asmdba
+oracle.install.asm.OSOPER=asmoper
+oracle.install.asm.OSASM=asmadmin
+
+oracle.install.crs.config.scanType=LOCAL_SCAN
+oracle.install.crs.config.ClusterConfiguration=STANDALONE
+oracle.install.crs.config.configureAsExtendedCluster=false
+oracle.install.crs.config.clusterName=usatclust1
+oracle.install.crs.config.gpnp.scanName=scan-usatclust1.usat.com
+oracle.install.crs.config.gpnp.scanPort=1521
+
+# Applicable for STANDALONE cluster configuration per the real template's Section D
+# comment. No GNS here: name resolution is real DNS (BIND, ansible/roles/dns_bind),
+# not Oracle-managed GNS/DHCP.
+oracle.install.crs.config.gpnp.configureGNS=false
+oracle.install.crs.config.autoConfigureClusterNodeVIP=false
+
+oracle.install.crs.config.clusterNodes=oradbserv05:oradbserv05-vip,oradbserv06:oradbserv06-vip
+
+# interfaceName:subnet:type — type 1=PUBLIC, 2=PRIVATE, 3=DO NOT USE, 4=ASM,
+# 5=ASM & PRIVATE. OL7 uses classic eth-style interface naming, not enp0sN. No
+# dedicated ASM network in this lab, so eth2 carries both (type 5) — plain
+# PRIVATE (2) produces [FATAL] [INS-41208]. See ../docs/known-risks.md #10.
+oracle.install.crs.config.networkInterfaceList=eth1:192.168.56.0:1,eth2:192.168.2.0:5
+
+# FLEX_ASM_STORAGE, not LOCAL_ASM_STORAGE — "LOCAL_ASM_STORAGE" isn't a real value in
+# the 19.3 schema (only FLEX_ASM_STORAGE, CLIENT_ASM_STORAGE, FILE_SYSTEM_STORAGE are).
+# Flex ASM is the standard architecture for a normal RAC deployment since 12.2.
+oracle.install.crs.config.storageOption=FLEX_ASM_STORAGE
+
+# GIMR — disabled, a lab-scale resource tradeoff. See
+# ../ansible/group_vars/all.yml's configure_gimr comment.
+oracle.install.crs.configureGIMR=false
+oracle.install.asm.configureGIMRDataDG=false
+
+# ASM Filter Driver — NOT used (this project uses ASMLib, ../docs/known-risks.md #4).
+# Explicit false; the real template flags this as applicable once storageOption is
+# FLEX_ASM_STORAGE.
+oracle.install.asm.configureAFD=false
+
+oracle.install.asm.diskGroup.name=DATA01
+# DATA01 hosts OCR + voting, not just data (GIMR disabled, see above). NORMAL
+# redundancy, 3 failure groups, 3 real voting files — a deliberate choice to
+# demonstrate the voting-quorum mechanism (see ../docs/known-risks.md #9 and
+# ../ansible/group_vars/all.yml's voting-disk comment block). OCR itself IS ALSO
+# multiplexed further, to DATA02, post-install via `ocrconfig -add`, unrelated to
+# this setting.
+oracle.install.asm.diskGroup.redundancy=NORMAL
+oracle.install.asm.diskGroup.AUSize=0
+# ASM disk paths use /dev/disk/by-label/<LABEL> — a generic udev mechanism, not
+# tied to ASMLib specifically. See ../docs/known-risks.md #4: by-label resolves
+# to the correct physical disk even when raw /dev/sdX letters differ between
+# nodes at attach/clone time.
+# DATA01 is created here (install time); DATA02 and RECO are created afterward via
+# asmca once the cluster is up — see ansible/roles/grid_silent_install/tasks/main.yml.
+#
+# disksWithFailureGroupNames is REQUIRED here since redundancy is NORMAL, not
+# EXTERNAL — see ../docs/known-risks.md #10. Format is a flat alternating list
+# (disk1,FGName1,disk2,FGName2,...) — one failure group per disk, named
+# FG_<label>.
+oracle.install.asm.diskGroup.disksWithFailureGroupNames=/dev/disk/by-label/ASMDISK01,FG_ASMDISK01,/dev/disk/by-label/ASMDISK02,FG_ASMDISK02,/dev/disk/by-label/ASMDISK03,FG_ASMDISK03
+oracle.install.asm.diskGroup.disks=/dev/disk/by-label/ASMDISK01,/dev/disk/by-label/ASMDISK02,/dev/disk/by-label/ASMDISK03
+oracle.install.asm.diskGroup.diskDiscoveryString=/dev/disk/by-label/*
+
+oracle.install.asm.SYSASMPassword=<VAULT_THIS>
+oracle.install.asm.monitorPassword=<VAULT_THIS>
+
+# Not managing GI itself via Cloud Control/OEM at this phase.
+oracle.install.config.managementOption=NONE
+
+oracle.install.crs.rootconfig.executeRootScript=false
+
+# Run as (Phase B — AFTER grid_install_swonly.rsp's software install and its
+# orainstRoot.sh/root.sh have completed on both nodes):
+#   $GRID_HOME/crs/config/config.sh -silent -responseFile grid_install.rsp
+# Then, in order: root.sh on oradbserv05, then oradbserv06 — THIS root.sh run is the
+# one that actually forms the cluster (CRS, ASM, OCR/voting). See
+# ../ansible/roles/grid_silent_install/tasks/main.yml for the full two-phase sequence.
+# DATA02 and RECO diskgroups are created separately, after the cluster is up — see that same file.

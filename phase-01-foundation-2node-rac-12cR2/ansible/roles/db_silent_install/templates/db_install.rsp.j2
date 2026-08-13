@@ -1,0 +1,32 @@
+################################################################################
+# Database 12.2.0.1 silent response file — software-only-then-patched install
+# across both RAC nodes (DBCA runs separately, see roles/dbca_noncdb).
+#
+# CAVEAT: same note as grid_install.rsp.j2 — diff against the real
+# db_install.rsp shipped with this exact patch level before trusting it.
+################################################################################
+
+oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v12.2.0
+
+oracle.install.option=INSTALL_DB_SWONLY
+
+ORACLE_HOSTNAME={{ inventory_hostname }}.{{ domain }}
+UNIX_GROUP_NAME=oinstall
+INVENTORY_LOCATION={{ inventory_loc }}
+ORACLE_BASE={{ oracle_base }}
+ORACLE_HOME={{ db_home }}
+
+oracle.install.db.InstallEdition=EE
+oracle.install.db.OSDBA_GROUP=dba
+oracle.install.db.OSOPER_GROUP=oper
+oracle.install.db.OSBACKUPDBA_GROUP=dba
+oracle.install.db.OSDGDBA_GROUP=dba
+oracle.install.db.OSKMDBA_GROUP=dba
+oracle.install.db.OSRACDBA_GROUP=dba
+
+# Software laid down on both nodes so RAC can address the same ORACLE_HOME path.
+oracle.install.db.CLUSTER_NODES={{ nodes | map(attribute='name') | join(',') }}
+oracle.install.db.isRACOneInstall=false
+
+DECLINE_SECURITY_UPDATES=true
+SECURITY_UPDATES_VIA_MYORACLESUPPORT=false

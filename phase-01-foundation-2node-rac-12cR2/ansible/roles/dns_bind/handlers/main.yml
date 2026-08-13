@@ -1,0 +1,10 @@
+---
+- name: restart named
+  systemd:
+    name: named
+    state: restarted
+
+- name: restart NetworkManager
+  systemd:
+    name: NetworkManager
+    state: restarted

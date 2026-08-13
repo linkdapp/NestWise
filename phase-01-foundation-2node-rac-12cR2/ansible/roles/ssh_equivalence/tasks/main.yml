@@ -1,0 +1,71 @@
+---
+# Sets up passwordless SSH equivalence for the grid and oracle OS users, bidirectionally,
+# across every host in rac_nodes (including self — GI's own tooling SSHes to its own
+# hostname too, not just the peer node). This is a genuine, mandatory Grid
+# Infrastructure/OUI prerequisite, not just a cluvfy nicety: gridSetup.sh's "OUI copies
+# GRID_HOME to every node in the response file's clusterNodes list over SSH equivalence"
+# behavior (see grid_silent_install's and db_silent_install's task comments) needs this
+# to already exist — nothing in this project's CRS_CONFIG response file sets it up for
+# you the way `-setupSSH` with inline passwords would.
+#
+# Symptom if this hasn't run yet: grid_install's cluvfy pre-check task (or, if you
+# somehow got past that, gridSetup.sh's own -applyRU step) hangs indefinitely with NO
+# output at all — not slow, actually stuck. Ansible's `command` module allocates no
+# PTY, so an SSH password prompt from cluvfy/gridSetup.sh trying to reach the peer node
+# as grid/oracle just blocks forever waiting for input that can never arrive. Ctrl+C the
+# hung run, run this role/tag, then re-run grid_install from where it left off.
+#
+# Uses only ansible-core modules (slurp, lineinfile, copy, command) — deliberately no
+# ansible.posix dependency (authorized_key/known_hosts live there), matching this
+# project's existing preference not to add collection dependencies without a reason.
+#
+# Keys are RSA in legacy PEM format specifically (see per_user.yml), NOT ed25519 —
+# gridSetup.sh's own bundled SSH client (separate from the system `ssh` binary) can't
+# parse anything else; see docs/known-risks.md #16 for the [INS-06003]/"invalid
+# privatekey" failure this fixes.
+#
+# Host-key confirmation prompts are a SEPARATE problem from the password-prompt hang
+# above, worth its own note: a per-user ~/.ssh/config with StrictHostKeyChecking no
+# does NOT reliably suppress the prompt, because ssh reads ~/.ssh/config out of the
+# INVOKING user's home directory, not the remote target user's — a manual
+# `ssh grid@oradbserv06 date` typed while logged in as yourself (not `su - grid`
+# first) never reads /home/grid/.ssh/config at all. Fixed below by pre-populating
+# known_hosts directly via ssh-keyscan instead — both a SYSTEM-WIDE copy
+# (/etc/ssh/ssh_known_hosts, covers literally any local OS user) and per-software-owner
+# copies (grid/oracle, belt-and-suspenders).
+
+- name: Build the list of node identities to pre-populate in known_hosts (short name, FQDN, and IP for every rac_nodes host)
+  set_fact:
+    ssh_keyscan_targets: >-
+      {{ (nodes | map(attribute='name') | list)
+       + (nodes | map(attribute='name') | map('regex_replace', '^(.*)$', '\1.' ~ domain) | list)
+       + (nodes | map(attribute='public_ip') | list) }}
+
+- name: Scan SSH host keys for every rac_nodes identity from this node (self + peers, by name/FQDN/IP)
+  # No auth needed — ssh-keyscan just reads whatever host key sshd presents on port 22,
+  # so this works even before any SSH equivalence exists. Runs on EVERY node (not
+  # run_once): each node needs its OWN known_hosts populated, since ssh gets run in
+  # both directions plus self-loopback (GI's own tooling SSHes to its own hostname
+  # too). -T 5: fail fast on a genuinely unreachable node instead of hanging the play.
+  command: "ssh-keyscan -T 5 -H {{ ssh_keyscan_targets | join(' ') }}"
+  register: keyscan_result
+  changed_when: false
+  failed_when: false
+
+- name: Pre-populate the SYSTEM-WIDE known_hosts (covers any OS user's manual `ssh grid@peer` test, not just the grid/oracle automation below)
+  copy:
+    dest: /etc/ssh/ssh_known_hosts
+    content: "{{ keyscan_result.stdout }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Set up SSH equivalence for grid
+  include_tasks: per_user.yml
+  vars:
+    ssh_user: "{{ grid_user }}"
+
+- name: Set up SSH equivalence for oracle
+  include_tasks: per_user.yml
+  vars:
+    ssh_user: "{{ oracle_user }}"

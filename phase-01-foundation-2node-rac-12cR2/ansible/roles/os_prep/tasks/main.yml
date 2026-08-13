@@ -1,0 +1,698 @@
+---
+# OS baseline for a 12.2.0.1 GI/DB node on Oracle Linux 7. Intended to run ONCE
+# against the golden template VM before cloning — see
+# docs/golden-image-and-cloning.md — not repeatedly against already-cloned nodes,
+# though it's idempotent either way. See docs/known-risks.md #1 for the OS
+# certification boundary this project is deliberately working within (OL7 is
+# right for this phase and Phase 2, not certified for the later 26ai upgrade).
+
+- name: "Push /etc/hosts (single source of truth: docs/network-and-hosts.md)"
+  template:
+    src: hosts.j2
+    dest: /etc/hosts
+    mode: "0644"
+
+- name: Set hostname
+  hostname:
+    name: "{{ inventory_hostname }}.{{ domain }}"
+
+# --- Preinstall RPM ------------------------------------------------------------
+# Both preinstall RPMs this project needs are natively available via yum on OL7.
+# PRIMARY: oracle-database-preinstall-19c, matching GI (19.3 base + RU 19.24).
+# Oracle changed its preinstall-RPM naming convention starting with 18c — it's a
+# flat "oracle-database-preinstall-<version>" name now, not the older "oracle-
+# database-server-<version>-preinstall" shape still used for 12.2 below. Confirmed
+# against the actual RPM filename (oracle-database-preinstall-19c-1.0-3.el7.x86_64.rpm).
+# VERIFY this exact name is still current before a real run:
+#   yum list available 'oracle-database-preinstall-19c*'
+#
+# The 12.2 DATABASE layer's OWN preinstall RPM (oracle-database-server-12cR2-
+# preinstall) is ALSO natively available on OL7, under the OLDER naming
+# convention — installed here too (not just as an optional fallback), since its
+# baseline (kernel/ulimit minimums) is worth having natively rather than only
+# inheriting equivalents via the 19c RPM.
+
+- name: Install the Oracle Database 19c preinstallation RPM (primary OS baseline mechanism — GI layer)
+  yum:
+    name: oracle-database-preinstall-19c
+    state: present
+
+- name: Install the Oracle Database 12.2 preinstallation RPM (DB layer's own baseline)
+  yum:
+    name: oracle-database-server-12cR2-preinstall
+    state: present
+  when: install_local_12cr2_preinstall_rpm | default(true)
+  # Var name is a holdover from when this was staged from a local file on a
+  # different platform — kept for continuity even though it's a normal yum
+  # install here; set false in group_vars/all.yml to skip it if ever needed.
+
+# --- Oracle's documented 12.2-on-OL7 package list — the reconciliation/cross-check ---
+# Cross-checks the 19c preinstall RPM's actual package set against Oracle's official
+# 12.2 install-guide table, rather than assuming the 19c RPM's dependency list happens
+# to cover everything the 12.2.0.1 DB layer needs. Split into
+# a REQUIRED list (Oracle's main table — fails loud if genuinely missing/unavailable)
+# and an OPTIONAL list (Oracle's own "Optional Packages" table — best-effort, doesn't
+# block the play). A package list installed atomically in one `yum:` call means one
+# unavailable optional package (ipmiutil, libvirt-libs — neither applicable to a
+# VirtualBox VM) would abort the whole task and block the required packages too, so
+# each package is checked per-item first and reported, per the "verify, report,
+# create-if-missing" pattern this role follows throughout (most tasks below get this
+# for free from Ansible's module idempotency — template/copy/user/group/file all
+# check-then-act on their own; this is the one spot where a single module call would
+# hide that per-item detail).
+- name: "Check which of Oracle's required OL7 packages are already installed"
+  command: "rpm -q {{ item }}"
+  register: chk_required_pkgs
+  changed_when: false
+  failed_when: false
+  # Exact match to Oracle's 12.2 Installation Guide Table 2-4 (Oracle Linux 7 / RHEL 7
+  # package requirements) — verified against a real error this list previously got
+  # wrong: `libnsl` isn't part of this table at all (that's an OL8/RHEL8-era
+  # requirement, where glibc dropped NIS/sunrpc support — OL7's glibc still has it
+  # built in, so there's no separate `libnsl` package to install), and `fontconfig`
+  # should be `fontconfig-devel` (which pulls in `fontconfig` as a dependency anyway).
+  # This list was also missing compat-libstdc++-33, elfutils-libelf-devel,
+  # libaio-devel, libXrender-devel, and libstdc++-devel outright. compat-libcap1 is
+  # also part of this table but deliberately NOT repeated here — it already has its
+  # own dedicated check/install task below (the PRVF-7532 cluvfy prereq), so adding
+  # it here too would just be a redundant second install path for the same package.
+  loop:
+    - bc
+    - binutils
+    - compat-libstdc++-33
+    - elfutils-libelf
+    - elfutils-libelf-devel
+    - fontconfig-devel
+    - glibc
+    - glibc-devel
+    - ksh
+    - libaio
+    - libaio-devel
+    - libXrender
+    - libXrender-devel
+    - libX11
+    - libXau
+    - libXi
+    - libXtst
+    - libgcc
+    - libstdc++
+    - libstdc++-devel
+    - libxcb
+    - make
+    - policycoreutils
+    - policycoreutils-python
+    - smartmontools
+    - sysstat
+
+- name: Report already-installed required packages
+  debug:
+    msg: "Already present: {{ chk_required_pkgs.results | selectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
+
+- name: Install only the missing required packages (fails loud if any is genuinely unavailable)
+  yum:
+    name: "{{ chk_required_pkgs.results | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
+    state: present
+  when: chk_required_pkgs.results | rejectattr('rc', 'equalto', 0) | list | length > 0
+
+- name: "Check which of Oracle's optional OL7 packages are already installed"
+  command: "rpm -q {{ item }}"
+  register: chk_optional_pkgs
+  changed_when: false
+  failed_when: false
+  # Oracle's 12.2 Installation Guide "Optional Packages" table for OL7/RHEL7. Two
+  # entries from that same table — net-tools and nfs-utils — are checked separately
+  # below instead, since this project treats them as required (RAC/ACFS), not
+  # optional. `libnsl2-devel` was previously listed here as an example of an
+  # expected-missing package; it isn't actually part of Oracle's optional table at
+  # all (another OL8/RHEL8-era package, not applicable on OL7) — dropped.
+  loop:
+    - ipmiutil            # Intelligent Platform Management Interface — not applicable to a VirtualBox VM, expect this missing
+    - libvirt-libs         # KVM — not applicable to a VirtualBox VM, expect this missing
+    - python               # Oracle ACFS Remote — OL7's default system Python (2.7), normally already present
+    - python-configshell    # Oracle ACFS Remote
+    - python-rtslib         # Oracle ACFS Remote
+    - python-six            # Oracle ACFS Remote
+    - targetcli             # Oracle ACFS Remote
+
+- name: Report optional package status (informational — never blocks the play)
+  debug:
+    msg: "{{ item.item }}: {{ 'already present' if item.rc == 0 else 'not available in enabled repos — expected, see docs/known-risks.md' }}"
+  loop: "{{ chk_optional_pkgs.results }}"
+  loop_control:
+    label: "{{ item.item }}"   # without this, Ansible's own "(item=...)" header dumps the full registered rpm -q result dict
+
+- name: "Install 32-bit (i686) companions — best-effort, not required for this project"
+  yum:
+    name:
+      - glibc.i686
+      - glibc-devel.i686
+      - libgcc.i686
+      - libstdc++.i686
+      - libaio.i686
+      - libX11.i686
+      - libXau.i686
+      - libXi.i686
+      - libXtst.i686
+      - libXrender.i686
+      - libxcb.i686
+      - compat-libcap1.i686
+    state: present
+  register: install_i686
+  failed_when: false   # informational only — see docs/known-risks.md; this project doesn't need 32-bit client support
+
+# --- Additional packages this project's RAC/DNS/chrony design needs specifically ---
+# Includes net-tools/nfs-utils, which Oracle lists as "optional" (RAC-Clusterware /
+# ACFS respectively) but this project genuinely needs — RAC and ACFS both apply here —
+# so they're treated as required. Same check/report/install-only-missing pattern as the
+# Oracle package list above, so one missing package doesn't silently block every other
+# package in the same yum call.
+- name: Check which of this project's additional required packages are already installed
+  command: "rpm -q {{ item }}"
+  register: chk_project_pkgs
+  changed_when: false
+  failed_when: false
+  loop:
+    - net-tools
+    - nfs-utils
+    - chrony
+    - bind
+    - bind-utils
+    - bind-libs
+
+- name: Report already-installed project-required packages
+  debug:
+    msg: "Already present: {{ chk_project_pkgs.results | selectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
+
+- name: Install only the missing project-required packages
+  yum:
+    name: "{{ chk_project_pkgs.results | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
+    state: present
+  when: chk_project_pkgs.results | rejectattr('rc', 'equalto', 0) | list | length > 0
+
+# --- compat-libcap1 — cluvfy/OUI prereq package ----------------------------------
+# cluvfy's PRVF-7532 check looks for this exact EL7-era compat shim; natively
+# available via yum on OL7 (confirmed against a real, previously successful OL7
+# install: compat-libcap1-1.10-7.el7.x86_64 installed via plain yum).
+- name: Check whether compat-libcap1 is already installed
+  command: rpm -q compat-libcap1
+  register: compat_libcap1_chk
+  changed_when: false
+  failed_when: false
+
+- name: Install compat-libcap1
+  yum:
+    name: compat-libcap1
+    state: present
+  when: compat_libcap1_chk.rc != 0
+
+# --- ASMLib packages — installed here (golden image, once, pre-clone), not in
+# asmlib_disks -------------------------------------------------------------------
+# Only ASM's disk MARKING and service config genuinely have to wait for both real
+# nodes + the shared disks to exist (see asmlib_disks/tasks/main.yml) — package
+# installation has no such dependency, so it belongs on the base image like every
+# other RPM here, not deferred to a post-clone role run. kmod-oracleasm and
+# oracleasm-support are natively on OL7's public yum channels; oracleasmlib is NOT
+# reliably available there (ULN subscription or a manual download from
+# oracle.com/linux/downloads are the real distribution paths — see
+# docs/known-risks.md #21) — install_local_oracleasmlib_rpm defaults true in
+# group_vars/all.yml, installing directly from oracleasmlib_local_rpm's path on this
+# node (no control-node copy step; matches this project's actual workflow of staging
+# manually-downloaded RPMs under /root/rpms before running os_prep).
+- name: Check whether kmod-oracleasm and oracleasm-support are already installed
+  command: "rpm -q {{ item }}"
+  register: chk_asmlib_base_pkgs
+  changed_when: false
+  failed_when: false
+  loop:
+    - kmod-oracleasm
+    - oracleasm-support
+  when: use_asmlib
+
+- name: Install kmod-oracleasm and oracleasm-support (natively on OL7's public yum channels)
+  yum:
+    name: "{{ chk_asmlib_base_pkgs.results | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"
+    state: present
+  when: use_asmlib and (chk_asmlib_base_pkgs.results | rejectattr('rc', 'equalto', 0) | list | length > 0)
+
+- name: Check whether oracleasmlib is already installed
+  command: rpm -q oracleasmlib
+  register: chk_oracleasmlib
+  changed_when: false
+  failed_when: false
+  when: use_asmlib
+
+- name: Install oracleasmlib via yum (only when install_local_oracleasmlib_rpm is explicitly set false)
+  yum:
+    name: oracleasmlib
+    state: present
+  when: use_asmlib and chk_oracleasmlib.rc != 0 and not (install_local_oracleasmlib_rpm | default(true))
+
+- name: Install oracleasmlib from the local RPM staged on this node (default path — see docs/known-risks.md #21)
+  yum:
+    name: "{{ oracleasmlib_local_rpm }}"
+    state: present
+    disable_gpg_check: true
+  when: use_asmlib and chk_oracleasmlib.rc != 0 and (install_local_oracleasmlib_rpm | default(true))
+
+- name: Create OS groups
+  # oinstall/dba/oper already exist by this point (created by the preinstall RPM task
+  # above) with the exact GIDs listed here — see the group_vars/all.yml comment for why
+  # those three are pinned to the RPM's own values instead of reassigned. The group
+  # module is a no-op ("ok") for any group whose GID already matches; only
+  # asmadmin/asmdba/asmoper are actually new here.
+  group:
+    name: "{{ item.name }}"
+    gid: "{{ item.gid }}"
+    state: present
+  loop:
+    - { name: oinstall, gid: "{{ oinstall_gid }}" }
+    - { name: dba,       gid: "{{ dba_gid }}" }
+    - { name: oper,      gid: "{{ oper_gid }}" }
+    - { name: asmadmin,  gid: "{{ asmadmin_gid }}" }
+    - { name: asmdba,    gid: "{{ asmdba_gid }}" }
+    - { name: asmoper,   gid: "{{ asmoper_gid }}" }
+
+- name: Ensure the vboxsf group exists (normally created by the VirtualBox Guest Additions installer)
+  # No gid pinned — Guest Additions usually gets there first and this just needs to
+  # confirm/attach to whatever GID it picked; if it hasn't run yet, group picks the next
+  # free GID and the later Guest Additions install reuses the existing group by name.
+  group:
+    name: "{{ vboxsf_group }}"
+    state: present
+
+- name: Create grid software owner (not created by the DB preinstall RPM)
+  # Oracle's own documented model for a separate ASM/GI owner: PRIMARY group oinstall
+  # (required — the central inventory group; without `group: oinstall` here, `user`
+  # defaults to creating a private "grid" primary group instead, which is wrong),
+  # secondary groups asmadmin (SYSASM — full ASM administration), asmdba (SYSDBA on the
+  # ASM instance, needed so the oracle DB owner can also connect to +ASM), asmoper
+  # (SYSOPER on ASM, optional but standard), dba (convenience in a lab, not required by
+  # Oracle). racdba/vboxsf are this project's additions, not Oracle's baseline.
+  user:
+    name: "{{ grid_user }}"
+    group: oinstall
+    groups: "asmadmin,asmdba,asmoper,dba,racdba,{{ vboxsf_group }}"
+    append: true
+    shell: /bin/bash
+    create_home: true
+
+- name: Ensure oracle user is in all the groups this project needs (preinstall RPM creates the base account)
+  user:
+    name: "{{ oracle_user }}"
+    groups: "oinstall,dba,asmdba,oper,racdba,{{ vboxsf_group }}"
+    append: true
+
+- name: Give oracle and grid sudo privileges (lab convenience — NOT a production pattern)
+  # Explicit, intentional relaxation for this home lab: both software-owner accounts get
+  # passwordless sudo so a DBA logged in as oracle/grid can run root-level diagnostics
+  # (crsctl-adjacent commands, service restarts) without switching users. Do not carry
+  # this into anything production-facing without reconsidering it.
+  copy:
+    dest: /etc/sudoers.d/11-oracle-grid
+    content: |
+      oracle ALL=(ALL) NOPASSWD: ALL
+      grid   ALL=(ALL) NOPASSWD: ALL
+    mode: "0440"
+    validate: "visudo -cf %s"
+
+- name: Deploy oracle user's .bash_profile
+  template:
+    src: oracle-bash_profile.j2
+    dest: "/home/{{ oracle_user }}/.bash_profile"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+
+- name: Deploy grid user's .bash_profile
+  template:
+    src: grid-bash_profile.j2
+    dest: "/home/{{ grid_user }}/.bash_profile"
+    owner: "{{ grid_user }}"
+    group: oinstall
+    mode: "0644"
+
+# --- /u01 storage: partition, format, label, and mount the dedicated disk ---------
+# Must run before "Create OFA directory structure" below — that task just creates
+# directories wherever the path already resolves to, root filesystem included, if
+# nothing has been mounted at u01_mount_point yet. Skipping this step (or running it
+# after removing a root-fs /u01 by hand) leaves /u01 carved out of the root disk
+# instead of its own dedicated one: `df -h /u01` should show u01_device's partition,
+# not the root disk.
+- name: "Check whether {{ u01_device }} already has a partition table (idempotency guard)"
+  command: "blkid -o value -s PTTYPE {{ u01_device }}"
+  register: u01_disk_pttype
+  changed_when: false
+  failed_when: false
+
+- name: "Partition {{ u01_device }} (single primary partition, GPT, whole disk)"
+  command: "parted -s {{ u01_device }} mklabel gpt mkpart primary xfs 0% 100%"
+  when: u01_disk_pttype.stdout | trim == ""
+  register: u01_partitioned
+
+- name: Re-read the partition table so the new partition device node appears without a reboot
+  command: "partprobe {{ u01_device }}"
+  when: u01_partitioned is changed
+
+- name: "Check whether {{ u01_partition }} is already formatted and labeled"
+  command: "blkid -o value -s LABEL {{ u01_partition }}"
+  register: u01_fs_label_chk
+  changed_when: false
+  failed_when: false
+
+- name: "Create the XFS filesystem on {{ u01_partition }} and label it {{ u01_fs_label }}"
+  command: "mkfs.xfs -L {{ u01_fs_label }} {{ u01_partition }}"
+  when: u01_fs_label_chk.stdout | trim != u01_fs_label
+
+- name: "Mount {{ u01_mount_point }} by label and persist it in /etc/fstab"
+  # state=mounted = present in fstab AND mounted right now, in one idempotent step —
+  # label-based (not /dev/sdX-based) so this survives a device path renumbering after
+  # reattaching disks post-clone, same reasoning as asmlib_disks' disk labeling.
+  mount:
+    path: "{{ u01_mount_point }}"
+    src: "LABEL={{ u01_fs_label }}"
+    fstype: xfs
+    opts: defaults
+    state: mounted
+
+# /u01 and /u01/app both follow the SAME Oracle-documented lifecycle, confirmed against
+# the current 19c install guide: owned grid:oinstall, 0775, BEFORE any install — this is
+# what lets OUI create /u01/app/oraInventory in the first place — and then root.sh
+# itself re-owns BOTH of them to root:oinstall as part of its normal, expected
+# post-install security hardening (see docs/known-risks.md #30). That means these two
+# tasks must NOT unconditionally force grid:oinstall on every os_prep re-run — this
+# project's os_prep gets re-run constantly during troubleshooting, and root.sh has
+# already run (at least on oradbserv05) by the time some of those re-runs happen. A
+# blind, unconditional `file` task here would silently undo root.sh's own ownership
+# change every time os_prep runs afterward — worth suspecting as a contributing cause
+# of some of today's chmod/EPERM weirdness even though not confirmed as the sole cause.
+# `stat` first, only act on a node that's still pre-install (owner isn't root yet).
+- name: "Check current owner of {{ u01_mount_point }} (root.sh re-owns this to root:oinstall after running — this task must not fight that)"
+  stat:
+    path: "{{ u01_mount_point }}"
+  register: u01_stat
+
+- name: "Pre-install ownership on {{ u01_mount_point }} itself — grid:oinstall (matches Oracle's documented OFA model; skipped once root.sh has already flipped this to root)"
+  file:
+    path: "{{ u01_mount_point }}"
+    state: directory
+    owner: "{{ grid_user }}"
+    group: oinstall
+    mode: "0775"
+  when: u01_stat.stat.pw_name != 'root'
+
+- name: "Check current owner of {{ oracle_base | dirname }} (/u01/app — same root.sh re-ownership lifecycle as {{ u01_mount_point }} above)"
+  stat:
+    path: "{{ oracle_base | dirname }}"
+  register: u01_app_stat
+
+- name: "Pre-install ownership on {{ oracle_base | dirname }} — grid:oinstall (matches Oracle's documented OFA model; skipped once root.sh has already flipped this to root)"
+  file:
+    path: "{{ oracle_base | dirname }}"
+    state: directory
+    owner: "{{ grid_user }}"
+    group: oinstall
+    mode: "0775"
+  when: u01_app_stat.stat.pw_name != 'root'
+
+# {{ oracle_base | dirname }}/grid (i.e. /u01/app/grid, the PARENT of grid_home
+# /u01/app/grid/19.3.0) never gets an explicit owner/mode of its own anywhere else in
+# this file — grid_home is created by the loop below, but Ansible's `file` module only
+# applies owner/group/mode to the LEAF path it's given; any missing PARENT directories
+# it has to create along the way (this one included) are left at whatever the default
+# umask produces, owned by whoever ran the task (root, via become). That's usually
+# harmless (0755 root:root still gives grid read+execute via "other" bits, enough to
+# traverse into grid_home) but it's accidental, not documented, and not guaranteed
+# across differently-configured control nodes — Oracle's own install guide explicitly
+# calls out grid:oinstall 0775 for this exact path, so make it explicit rather than
+# leaving it to chance. See docs/known-risks.md #30.
+- name: "Ownership/permissions on {{ oracle_base | dirname }}/grid (explicit — was previously just an accidental Ansible-created parent directory)"
+  file:
+    path: "{{ oracle_base | dirname }}/grid"
+    state: directory
+    owner: "{{ grid_user }}"
+    group: oinstall
+    mode: "0775"
+
+- name: Create OFA directory structure
+  file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    # oracle_base and grid_base are the SAME path (shared ORACLE_BASE, see
+    # group_vars/all.yml) — one entry, not two. 2775/setgid so grid (a member of
+    # oinstall) can write into it too, not just oracle. grid_home is a completely
+    # separate top-level path (/u01/app/grid/...), not nested under this shared base at
+    # all, so it gets its own entry with its own owner.
+    - { path: "{{ oracle_base }}",               owner: "{{ oracle_user }}", group: oinstall, mode: "2775" }
+    - { path: "{{ grid_home }}",                 owner: "{{ grid_user }}",   group: oinstall, mode: "0775" }
+    # Owner is grid, not oracle — see docs/known-risks.md #3. GI installs before the
+    # DB layer in this project's build order, and grid is the OS user that actually
+    # runs gridSetup.sh first, so grid needs to be the one that "owns" the central
+    # inventory the way Oracle's own docs describe (whichever user performs the FIRST
+    # Oracle software install on a host owns oraInventory) — getting this backwards
+    # produces [INS-32039] "Inappropriate file permissions for the specified inventory
+    # location" on a real gridSetup.sh run. 2775 (setgid) so oracle's later
+    # db_silent_install writes into the same inventory stay group-writable by grid
+    # too, not just the reverse.
+    - { path: "{{ inventory_loc }}",             owner: "{{ grid_user }}",   group: oinstall, mode: "2775" }
+    - { path: "{{ staging_dir }}",               owner: "{{ oracle_user }}", group: oinstall, mode: "2775" }
+    - { path: "{{ staging_dir }}/software",       owner: "{{ oracle_user }}", group: oinstall, mode: "2775" }
+    - { path: "{{ staging_dir }}/patches",        owner: "{{ oracle_user }}", group: oinstall, mode: "2775" }
+    - { path: "{{ staging_dir }}/response-files", owner: "{{ oracle_user }}", group: oinstall, mode: "2775" }
+
+- name: Confirm staging directory is writable by both software owners (dual-ownership check)
+  file:
+    path: "{{ staging_dir }}"
+    state: directory
+    mode: "2775"    # setgid — files created here inherit the oinstall group, so grid-owned writes stay group-writable by oracle and vice versa
+
+# --- Kernel parameters ---------------------------------------------------------
+# Filename deliberately sorts after everything else likely to land in /etc/sysctl.d —
+# the original "99-oracle.conf" name assumed that was already the last word, but a real
+# run showed fs.aio-max-nr/kernel.shmmax at runtime values higher than this file sets,
+# meaning something else's *.conf in the same directory sorts after "99-oracle.conf" and
+# wins (systemd-sysctl applies files within a directory in lexical order, last write
+# wins per key — "9" sorts before most letters, not after). "zz90-" forces this file to
+# load last regardless of what else is dropped in — confirm on a real node with
+# `sysctl --system 2>&1 | grep -B1 -E 'aio-max-nr|shmmax'`, which prints the exact
+# file that set each final value.
+- name: Kernel parameters (sysctl) for GI/DB, RAC interconnect, and I/O tuning
+  template:
+    src: 99-oracle-sysctl.conf.j2
+    dest: /etc/sysctl.d/zz90-oracle-override.conf
+    mode: "0644"
+  notify: reload sysctl
+
+- name: Remove the old /etc/sysctl.d/99-oracle.conf filename if present (superseded by zz90-oracle-override.conf above)
+  file:
+    path: /etc/sysctl.d/99-oracle.conf
+    state: absent
+  notify: reload sysctl
+
+# --- tuned — the vm.* sysctl values above get fought by the active tuned profile
+# unless tuned itself carries them ---------------------------------------------
+# `tuned-adm recommend` picks `virtual-guest` on a VirtualBox VM by default, and
+# virtual-guest sets vm.swappiness=30 (and, via its throughput-performance parent,
+# vm.dirty_ratio=30) — tuned actively re-applies its own profile's sysctl values,
+# so the plain sysctl.d file above can render correctly and still not "win" once
+# tuned starts/reasserts. Confirmed on a real node: `verify_baseline` caught
+# vm.swappiness=30/vm.dirty_ratio=30 live even though zz90-oracle-override.conf was
+# deployed and unchanged. See docs/known-risks.md #23. Fix: a custom tuned profile
+# that inherits virtual-guest (`include=`) but overrides just the vm.* keys this
+# project cares about, so tuned carries the target values instead of fighting a
+# separate file.
+- name: Ensure the custom tuned profile directory exists
+  file:
+    path: /etc/tuned/oracle-db-vm
+    state: directory
+    mode: "0755"
+
+- name: Deploy the custom tuned profile (virtual-guest base + Oracle DB vm.* overrides)
+  template:
+    src: tuned-oracle-db-vm.conf.j2
+    dest: /etc/tuned/oracle-db-vm/tuned.conf
+    mode: "0644"
+
+- name: Ensure the tuned service is enabled and running (required for `tuned-adm profile` to take effect)
+  systemd:
+    name: tuned
+    enabled: true
+    state: started
+
+- name: Check the currently active tuned profile
+  command: tuned-adm active
+  register: tuned_active_chk
+  changed_when: false
+  failed_when: false
+
+- name: Activate the oracle-db-vm tuned profile (only if not already active)
+  command: tuned-adm profile oracle-db-vm
+  when: "'oracle-db-vm' not in tuned_active_chk.stdout"
+
+# --- Resource limits -------------------------------------------------------------
+- name: Resource limits for grid/oracle shell sessions
+  template:
+    src: oracle-limits.conf.j2
+    dest: /etc/security/limits.d/99-oracle.conf
+    mode: "0644"
+
+- name: PAM — ensure pam_limits is loaded for login sessions
+  lineinfile:
+    path: /etc/pam.d/login
+    line: "session required pam_limits.so"
+    state: present
+
+# --- I/O scheduler ----------------------------------------------------------------
+# OL7's kernel (3.10) doesn't have the multi-queue block layer at all — only the
+# legacy single-queue schedulers ("deadline"/"cfq"/"noop") are valid choices here.
+# Set via a GRUB kernel command-line parameter, confirmed against a real,
+# previously successful OL7 install (GRUB_CMDLINE_LINUX="crashkernel=auto rhgb
+# quiet numa=off transparent_hugepage=never elevator=deadline"). "deadline" is the
+# standard 12c/19c-era recommendation for a single-queue scheduler. Requires a
+# reboot to take effect (kernel command-line parameter, not a live-reloadable
+# setting) — same "documented, not automated across reboots" pattern as THP below.
+- name: "Check current I/O scheduler GRUB setting"
+  command: grep -q 'elevator=deadline' /etc/default/grub
+  register: grub_elevator_chk
+  changed_when: false
+  failed_when: false
+
+- name: "Add elevator=deadline to GRUB_CMDLINE_LINUX"
+  lineinfile:
+    path: /etc/default/grub
+    backrefs: true
+    regexp: '^(GRUB_CMDLINE_LINUX="[^"]*)"$'
+    line: '\1 elevator=deadline"'
+  when: grub_elevator_chk.rc != 0
+  register: grub_elevator_set
+
+- name: "Regenerate grub.cfg (BIOS boot — this project's VirtualBox VMs use MBR/BIOS, not UEFI)"
+  command: grub2-mkconfig -o /boot/grub2/grub.cfg
+  when: grub_elevator_set is changed
+
+- name: "Note: I/O scheduler change requires a reboot to take effect"
+  debug:
+    msg: >
+      elevator=deadline {{ 'was just added to GRUB_CMDLINE_LINUX and grub.cfg
+      regenerated — reboot this node for it to take effect.' if grub_elevator_set
+      is changed else 'was already set.' }} Confirm after reboot with
+      `cat /sys/block/sd*/queue/scheduler`.
+
+- name: Disable Transparent Huge Pages via tuned profile (kernel boot flag is more reliable long-term — documented, not automated across reboots here)
+  debug:
+    msg: >
+      THP must stay disabled for Oracle workloads. Verified via
+      `cat /sys/kernel/mm/transparent_hugepage/enabled` after first boot.
+      If it re-enables after a kernel update, add `transparent_hugepage=never`
+      to the GRUB kernel command line and rebuild grub config — not automated
+      here since it requires a reboot to confirm.
+
+# The dedicated `selinux:` Ansible module needs the `libselinux-python` bindings
+# imported directly (`import selinux`) and fails hard (ModuleNotFoundError) without
+# them — and on OL7 those bindings only exist for Python 2 (`libselinux-python`);
+# there is no `python3-libselinux` in OL7's base repos the way there is on OL8/OL9.
+# Since this project standardizes on `/usr/bin/python3` as the interpreter (see
+# docs/known-risks.md #17), using the dedicated module here would mean installing a
+# second, Python-2-only package purely for this one task. `setenforce`/editing
+# /etc/selinux/config directly avoids the dependency entirely — no Python SELinux
+# bindings needed for either, and it's the same mechanism Oracle's own install guides
+# document by hand.
+#
+# Fully disabled, not just permissive — a deliberate lab-convenience decision (same
+# category as firewalld below), made after a real gridSetup.sh run hit
+# PRCF-2087/PRCF-2001 connection-refused errors during the RAC install. See
+# docs/known-risks.md #26 (and #25 for the firewalld half of the same incident). Two
+# caveats worth knowing:
+#   1. `setenforce 0` only reaches Permissive at runtime — the kernel can't go from
+#      enforcing/permissive to fully Disabled without SELinux being unloaded, which
+#      only happens at boot. So immediately after this play, `getenforce` will still
+#      report "Permissive," not "Disabled," until the node is rebooted. The
+#      /etc/selinux/config change below is what makes it come up Disabled on next boot.
+#   2. verify_baseline's check accounts for this — it checks /etc/selinux/config
+#      (the persisted target), not live getenforce, for exactly this reason.
+- name: "SELinux — check current runtime mode"
+  command: getenforce
+  register: selinux_runtime
+  changed_when: false
+  failed_when: false
+
+- name: "SELinux — set runtime mode to permissive now (best available at runtime short of a reboot; see docs/known-risks.md #26)"
+  command: setenforce 0
+  when: selinux_runtime.stdout | trim not in ['Permissive', 'Disabled']
+
+- name: "SELinux — persist disabled across reboot in /etc/selinux/config (lab convenience, not a production pattern; see docs/known-risks.md #26)"
+  lineinfile:
+    path: /etc/selinux/config
+    regexp: '^SELINUX='
+    line: 'SELINUX=disabled'
+
+# --- NOZEROCONF — cluvfy's zeroconf prereq check --------------------------------
+# PRVE-10077 : NOZEROCONF parameter was not specified or was not set to 'yes' in
+# /etc/sysconfig/network — see docs/known-risks.md #7. Zeroconf's 169.254.0.0/16
+# link-local auto-addressing
+# can collide with the address range Oracle Clusterware uses internally for its own
+# link-local HAIP/interconnect addressing if the OS is left free to assign one on the
+# private interconnect NIC; cluvfy checks this file's setting directly, not runtime
+# network state, so it fails identically whether or not zeroconf ever actually
+# triggered. Neither line existing at all nor "NOZEROCONF=no" satisfies the check —
+# only a literal "NOZEROCONF=yes" line does, so lineinfile (not a bare append) is used
+# to stay idempotent on re-run and to correct an existing "no" value if one is ever
+# present.
+- name: "NOZEROCONF=yes in /etc/sysconfig/network (cluvfy PRVE-10077)"
+  lineinfile:
+    path: /etc/sysconfig/network
+    regexp: "^NOZEROCONF="
+    line: "NOZEROCONF=yes"
+    create: true
+    mode: "0644"
+
+- name: Check whether firewalld is even active (this project's minimal lab builds often don't have it running at all)
+  command: systemctl is-active firewalld
+  register: firewalld_active
+  changed_when: false
+  failed_when: false
+
+# firewalld fully disabled — a deliberate lab convenience, not a production pattern
+# (same category of choice as oracle/grid's passwordless sudo above), not a partial
+# per-interface trusted-zone carve-out. Real cause this replaces: gridSetup.sh's own
+# remote file-transfer mechanism opens ad-hoc ephemeral TCP listener ports (confirmed
+# on a real run: PRCF-2087/PRCF-2001 "Connection ... refused" on ports like
+# 14669/26577/59161, a different random port each attempt) over the PUBLIC interface
+# (eth1) for node-to-node file copy during Phase A/B installs — not just the private
+# interconnect (eth2). Putting only eth2 in firewalld's trusted zone (this role's
+# previous approach) left eth1 filtered by the default zone's normal allowlist
+# (ssh, dhcpv6-client, and little else), which silently blocks this exact traffic.
+# Scoping to "just the right ephemeral port range on just eth1" is possible but not
+# worth the complexity on a NAT-isolated single-host lab network with no other
+# traffic to protect against — see docs/known-risks.md #25.
+- name: "firewalld — disable entirely (lab convenience; see docs/known-risks.md #25 for why a per-interface carve-out isn't enough)"
+  systemd:
+    name: firewalld
+    enabled: false
+    state: stopped
+  when: firewalld_active.stdout | trim == 'active'
+
+- name: Note firewalld is not running (informational — nothing to disable if it's not managing anything)
+  debug:
+    msg: >
+      firewalld is {{ firewalld_active.stdout | trim }}, not active — nothing to
+      disable. If this is unexpected (you meant for firewalld to be running and
+      filtering), that's a change from this project's lab-convenience default; see
+      docs/known-risks.md #25 before re-enabling it.
+  when: firewalld_active.stdout | trim != 'active'
+
+- name: chrony — confirm NTP-style time sync is active (GI requires consistent time across nodes)
+  systemd:
+    name: chronyd
+    state: started
+    enabled: true
+
+- name: Swap check (GI prereq — at least matches RAM up to 16GB, half beyond that)
+  debug:
+    msg: >
+      Confirm swap sizing manually against current GI prereq guidance for this
+      node's RAM — not automated here because it depends on the VM's actual
+      allocated memory (see scripts/vm-tuning-vboxmanage.*).

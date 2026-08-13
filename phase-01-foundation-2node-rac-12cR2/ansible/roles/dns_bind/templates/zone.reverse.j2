@@ -1,0 +1,23 @@
+$TTL 3H
+@       IN SOA  {{ dns_master }}.{{ domain }}.        hostmaster.{{ domain }}. (
+                                {{ ansible_date_time.epoch }}   ; serial — epoch seconds, always increases.
+                                      ; Same reasoning as zone.forward.j2 — see docs/known-risks.md #12.
+                                1D      ; refresh
+                                1H      ; retry
+                                1W      ; expire
+                                3H )    ; minimum
+        NS      {{ dns_master }}.{{ domain }}.
+        NS      {{ dns_secondary }}.{{ domain }}.
+
+{% for n in nodes %}
+{{ n.public_ip.split('.')[3] }}   PTR     {{ n.name }}.{{ domain }}.
+{{ n.vip_ip.split('.')[3] }}   PTR     {{ n.vip_name }}.{{ domain }}.
+{% endfor %}
+{% for ip in scan_ips %}
+{{ ip.split('.')[3] }}   PTR     {{ scan_name }}.{{ domain }}.
+{% endfor %}
+{{ chrony_master_ip.split('.')[3] }}   PTR     {{ chrony_master_hostname }}.{{ domain }}.
+
+{# NOTE: private-network (192.168.2.0/24) reverse records intentionally omitted here —
+   the interconnect is non-routed and doesn't need public reverse resolution. Add a
+   second reverse zone for 192.168.2.0/24 if cluvfy ends up wanting it. #}

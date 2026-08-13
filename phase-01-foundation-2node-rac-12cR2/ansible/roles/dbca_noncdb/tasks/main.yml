@@ -1,0 +1,213 @@
+---
+# Runs from node 1 only (see ansible/site.yml — hosts: rac_node1). DBCA talks
+# to the whole cluster via the nodelist parameter in the response file; it
+# does not need to run per-node.
+#
+# DBCA also runs `datapatch -verbose` automatically as its final step (documented
+# Oracle behavior since 12.2.0.1, for databases created through DBCA specifically) —
+# no separate manual datapatch/OJVM step follows this role. The tasks at the end of
+# this file verify that automatic run actually landed cleanly rather than assuming
+# it — see docs/patching-strategy.md Mechanism 3 for why that's worth checking here.
+
+- name: Confirm the cluster is up before attempting to create a database on it
+  become: true
+  become_user: "{{ grid_user }}"
+  command: "{{ grid_home }}/bin/crsctl stat res -t"
+  register: crs_status
+  changed_when: false
+
+- name: Show cluster status
+  debug:
+    var: crs_status.stdout_lines
+
+- name: Fail if CRS resources aren't online
+  fail:
+    msg: >
+      Cluster resources aren't reporting ONLINE. Fix Grid Infrastructure
+      before running DBCA — a database created against a half-up cluster is
+      a worse debugging session than a slower, sequential build.
+  when: "'ONLINE' not in crs_status.stdout"
+
+# --- IDEMPOTENCY GUARD: has the database already been created? --------------------
+# `srvctl config database` succeeding (rc 0) means the database is already
+# registered with the cluster — the only way that happens is a prior successful DBCA
+# run. Real, native signal (srvctl's own config store), not an invented marker file.
+# ADDED 2026-08-09 — this task had no guard at all before; re-running
+# `dbca -createDatabase` with the same db_unique_name/SIDs against an
+# already-existing database would collide with existing datafiles/instances rather
+# than cleanly no-op, since DBCA's createDatabase isn't designed to be re-run that
+# way.
+#
+# UPDATED 2026-08-12 — must run from db_home's srvctl, not grid_home's. Oracle's own
+# rule: database-resource srvctl commands (config/status/start/stop database) have to
+# run from the DATABASE home when GI and DB are at different versions (19c GI, 12.2.0.1
+# DB here — a deliberate, documented pairing, see known-risks.md #2), not from
+# grid_home's srvctl — confirmed the hard way (see known-risks.md #44): grid_home's
+# srvctl against a registered 12.2.0.1 database fails PRCD-1229 ("differs from the
+# program version ... Instead run the program from <db_home>"), which — because this
+# task is `failed_when: false` — would have looked exactly like "database doesn't
+# exist" to this guard on every run after the first, and re-triggered
+# dbca -createDatabase against an already-existing database.
+- name: "Check whether the database has already been created"
+  become: true
+  become_user: "{{ oracle_user }}"
+  command: "{{ db_home }}/bin/srvctl config database -d {{ db_unique_name }}"
+  register: db_exists_check
+  changed_when: false
+  failed_when: false
+
+- name: Report DBCA status
+  debug:
+    msg: >
+      Database {{ db_unique_name }} {{ 'already exists — srvctl confirms it is
+      registered with the cluster. Skipping dbca -createDatabase re-invocation.' if
+      db_exists_check.rc == 0 else 'not yet created — running dbca -createDatabase
+      now.' }}
+
+# --- Audit file destination: local per-node filesystem path, not shared/ASM -------
+# DBCA validates this directory exists and is writable BEFORE it does anything else
+# (DBT-06608 if not: "The specified audit file destination ... is not writable") —
+# it does not create it for you in silent mode. Because this is an OS filesystem
+# path (not ASM/CFS), each node needs its own copy — this play runs from rac_node1
+# only (see site.yml), so the directory has to be created explicitly on every
+# rac_nodes host here rather than relying on the play's own inventory scope.
+- name: "Ensure the audit file destination exists and is writable, on every RAC node"
+  file:
+    path: "{{ oracle_base }}/admin/{{ db_unique_name }}/adump"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0750"
+    recurse: true
+  loop: "{{ groups['rac_nodes'] }}"
+  delegate_to: "{{ item }}"
+
+- name: Render dbca_gp_noncdb.rsp
+  template:
+    src: dbca_gp_noncdb.rsp.j2
+    dest: "{{ staging_dir }}/response-files/dbca_gp_noncdb.rsp"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"          # contains SYS/SYSTEM passwords
+  when: db_exists_check.rc != 0
+
+- name: Run DBCA silently to create the General Purpose non-CDB RAC database
+  become: true
+  become_user: "{{ oracle_user }}"
+  command: >
+    {{ db_home }}/bin/dbca -silent -createDatabase
+    -responseFile {{ staging_dir }}/response-files/dbca_gp_noncdb.rsp
+  register: dbca_result
+  changed_when: dbca_result.rc == 0
+  when: db_exists_check.rc != 0
+
+- name: Show DBCA output
+  debug:
+    var: dbca_result.stdout_lines
+  when: db_exists_check.rc != 0
+
+# db_home's srvctl, not grid_home's — see the idempotency guard's comment above and
+# known-risks.md #44 for why.
+- name: Confirm the database registered with the cluster (RAC-aware, both instances)
+  become: true
+  become_user: "{{ oracle_user }}"
+  command: "{{ db_home }}/bin/srvctl status database -d {{ db_unique_name }}"
+  register: db_status
+  changed_when: false
+
+- name: Show database status across both instances
+  debug:
+    var: db_status.stdout_lines
+
+# --- Online redo log layout verification (multiplexing + size) --------------------
+# db_create_online_log_dest_1/_2 + redoLogFileSize in the response file should have
+# produced, for every group General_Purpose.dbc creates across both RAC threads: 2
+# members per group, one under {{ asm_diskgroup_data }}, one under
+# {{ asm_diskgroup_reco }}, each 128MB. READ-ONLY check, not an automatic fix — how
+# many groups the template actually creates per thread isn't something this project
+# controls directly, so this confirms the real outcome rather than assuming the
+# response-file settings landed exactly as intended. If the layout doesn't match,
+# resize/re-multiplex by hand with ALTER DATABASE ADD/DROP LOGFILE MEMBER — not
+# scripted here, since blind redo-log DDL against a live RAC thread structure is
+# exactly the kind of first-time, hard-to-reverse operation this project leaves for
+# a human to review (same reasoning as the patch-application pauses).
+- name: Check online redo log group/member layout (group, thread, member path, size)
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: >
+    ORACLE_HOME={{ db_home }} ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba <<'EOF'
+    set heading off feedback off linesize 200
+    select l.group# || ' thread=' || l.thread# || ' size_mb=' || (l.bytes/1024/1024)
+    || ' members=' || (select count(*) from v$logfile lf where lf.group# = l.group#)
+    || ' ' || lf2.member
+    from v$log l, v$logfile lf2
+    where lf2.group# = l.group#
+    order by l.group#, lf2.member;
+    EOF
+  register: redolog_check
+  changed_when: false
+
+- name: Show online redo log layout (confirm 2 members per group, one in each diskgroup, 128MB each)
+  debug:
+    var: redolog_check.stdout_lines
+
+- name: Confirm this really is non-CDB (guards against a template/flag mismatch)
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: >
+    ORACLE_HOME={{ db_home }} ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba <<'EOF'
+    set heading off feedback off
+    select 'CDB=' || cdb from v$database;
+    EOF
+  register: cdb_check
+  changed_when: false
+
+- name: Show CDB flag
+  debug:
+    var: cdb_check.stdout_lines
+
+# --- OJVM datapatch verification (docs/patching-strategy.md Mechanism 3) -----
+# DBCA itself already ran `datapatch -verbose` automatically as the final step of
+# creating this database (documented Oracle behavior since 12.2.0.1, for
+# DBCA-created databases specifically) — db_silent_install patched db_home's
+# binaries (RU via -applyRU, OJVM via -applyOneOffs) before this role ever ran, so
+# there's nothing left to apply manually. This is a READ-ONLY verification, not a
+# re-application: General_Purpose.dbc (db_template) is a seed-based template, and
+# seed-based DBCA templates have a documented history (Mike Dietrich/Oracle, the
+# January 2020 RU on 19c) of incomplete post-patch object validity that "Custom
+# Database" creation doesn't exhibit — worth confirming rather than assuming here.
+
+- name: Check dba_registry_sqlpatch for the OJVM patch registration
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: >
+    ORACLE_HOME={{ db_home }} ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba <<'EOF'
+    set heading off feedback off linesize 200
+    select patch_id || ' ' || patch_type || ' ' || status || ' ' || to_char(action_time, 'YYYY-MM-DD HH24:MI:SS')
+    from dba_registry_sqlpatch order by action_time;
+    EOF
+  register: sqlpatch_check
+  changed_when: false
+
+- name: Show dba_registry_sqlpatch (confirm 33561275/OJVM is listed as SUCCESS)
+  debug:
+    var: sqlpatch_check.stdout_lines
+
+- name: Check invalid object count post-creation
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: >
+    ORACLE_HOME={{ db_home }} ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba <<'EOF'
+    set heading off feedback off
+    select count(*) from dba_objects where status = 'INVALID';
+    EOF
+  register: invalid_object_check
+  changed_when: false
+
+- name: Show invalid object count (a handful is normal after any DBCA run; hundreds — especially MDSYS-owned — matches the seed-template/OJVM gap documented in patching-strategy.md Mechanism 3, and is worth a manual "datapatch -verbose" + utlrp.sql re-run to confirm/fix)
+  debug:
+    var: invalid_object_check.stdout_lines

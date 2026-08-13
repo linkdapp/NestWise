@@ -1,0 +1,37 @@
+// Managed by ansible role dns_bind — secondary NS ({{ dns_secondary }})
+// Pulls zones from the primary via AXFR — no local zone files to maintain here.
+options {
+        listen-on port 53 { {{ nodes[1].public_ip }}; 127.0.0.1; };
+        listen-on-v6 port 53 { ::1; };
+        directory       "/var/named";
+        allow-query     { 192.168.56.0/24; localhost; };
+        recursion yes;
+        dnssec-validation yes;
+};
+
+logging {
+        channel default_debug {
+                file "data/named.run";
+                severity dynamic;
+        };
+};
+
+zone "." IN {
+        type hint;
+        file "named.ca";
+};
+
+include "/etc/named.rfc1912.zones";
+include "/etc/named.root.key";
+
+zone "{{ domain }}" {
+        type slave;
+        masters { {{ dns_master_ip }}; };
+        file "slaves/{{ domain }}";
+};
+
+zone "{{ '.'.join((dns_master_ip.split('.')[2::-1])) }}.in-addr.arpa" {
+        type slave;
+        masters { {{ dns_master_ip }}; };
+        file "slaves/{{ domain }}.rev";
+};

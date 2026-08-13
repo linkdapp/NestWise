@@ -1,0 +1,34 @@
+################################################################################
+# Standalone, edit-and-run copy of the Database software response file.
+# Rendered shape of ansible/roles/db_silent_install/templates/db_install.rsp.j2.
+# Replace <...> placeholders before running.
+#
+# CAVEAT: validate against the actual db_install.rsp shipped with your media
+# for this exact 12.2.0.1 patch level.
+################################################################################
+
+oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v12.2.0
+oracle.install.option=INSTALL_DB_SWONLY
+
+ORACLE_HOSTNAME=<oradbserv05_or_oradbserv06>.usat.com
+UNIX_GROUP_NAME=oinstall
+INVENTORY_LOCATION=/u01/app/oraInventory
+ORACLE_BASE=/u01/app/oracle
+ORACLE_HOME=/u01/app/oracle/product/12.2.0/db_1
+
+oracle.install.db.InstallEdition=EE
+oracle.install.db.OSDBA_GROUP=dba
+oracle.install.db.OSOPER_GROUP=oper
+oracle.install.db.OSBACKUPDBA_GROUP=dba
+oracle.install.db.OSDGDBA_GROUP=dba
+oracle.install.db.OSKMDBA_GROUP=dba
+oracle.install.db.OSRACDBA_GROUP=dba
+
+oracle.install.db.CLUSTER_NODES=oradbserv05,oradbserv06
+oracle.install.db.isRACOneInstall=false
+
+DECLINE_SECURITY_UPDATES=true
+SECURITY_UPDATES_VIA_MYORACLESUPPORT=false
+
+# Run as: ./runInstaller -silent -applyRU <patch_dir> -responseFile db_install.rsp
+# Then run root.sh (runs on both nodes; no ordering constraint here, unlike GI's root.sh).

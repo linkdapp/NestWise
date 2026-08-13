@@ -1,0 +1,556 @@
+---
+# Verification-only role — asserts a node matches what os_prep would have produced,
+# without applying any changes itself. Built for the "build oradbserv05 by hand, verify
+# with Ansible" workflow (see docs/golden-image-and-cloning.md): run this against a
+# manually-built node before trusting it as the clone source, and again against the
+# clone after personalization, before handing either node to the rest of the pipeline.
+#
+# Every check registers its result and keeps going rather than stopping at the first
+# failure — the point is a complete gap list in one pass, not a stack of re-runs.
+
+- name: Initialize the failure list
+  set_fact:
+    verify_failures: []
+
+# --- Preinstall RPM ------------------------------------------------------------
+# preinstall_rpm in group_vars/all.yml is oracle-database-preinstall-19c (Oracle's
+# post-18c flat naming convention, not the older "server"+"RxCy" shape still used
+# for the 12.2 package below). The 12.2 fallback below is a normal native yum
+# package on OL7 (see os_prep's own task comment) —
+# install_local_12cr2_preinstall_rpm defaults true in group_vars/all.yml.
+- name: Check preinstall RPM
+  command: "rpm -q {{ preinstall_rpm }}"
+  register: chk_preinstall
+  changed_when: false
+  failed_when: false
+
+- name: Record preinstall RPM failure
+  set_fact:
+    verify_failures: "{{ verify_failures + ['Preinstall RPM (' + preinstall_rpm + ') not installed'] }}"
+  when: chk_preinstall.rc != 0
+
+# Fallback check — only meaningful if install_local_12cr2_preinstall_rpm is true
+# (now the default on OL7); skipped entirely otherwise, not reported as a gap.
+- name: Check 12.2 preinstall RPM (DB layer's own baseline — native on OL7)
+  command: "rpm -q oracle-database-server-12cR2-preinstall"
+  register: chk_preinstall_12cr2
+  changed_when: false
+  failed_when: false
+  when: install_local_12cr2_preinstall_rpm | default(true)
+
+- name: Record 12.2 preinstall RPM failure
+  set_fact:
+    verify_failures: "{{ verify_failures + ['12.2 preinstall RPM (oracle-database-server-12cR2-preinstall) not installed, but install_local_12cr2_preinstall_rpm is true'] }}"
+  when: (install_local_12cr2_preinstall_rpm | default(true)) and chk_preinstall_12cr2.rc != 0
+
+# --- Oracle's official OL7 package list (12.2 install guide, Table 2-4) ---------
+# Mirrors os_prep's own OL7 package list exactly — see that role's task comment for
+# the correction history (`libnsl` isn't part of this table on OL7 at all, that's an
+# OL8/RHEL8-era requirement; `fontconfig` should be `fontconfig-devel`; this list was
+# also missing compat-libcap1, compat-libstdc++-33, elfutils-libelf-devel,
+# libaio-devel, libXrender-devel, and libstdc++-devel). Split into REQUIRED (Oracle's
+# main table — a real gap) and OPTIONAL (Oracle's own "Optional Packages"
+# table — informational only). net-tools/nfs-utils are checked as required here even
+# though Oracle's table calls them optional — this project's RAC/ACFS design needs
+# them, and os_prep installs them accordingly. i686 (32-bit) companions are
+# informational — this project doesn't target 32-bit client support.
+- name: Check Oracle's documented required packages for OL7 (64-bit)
+  command: "rpm -q {{ item }}"
+  register: chk_oracle_pkgs
+  changed_when: false
+  failed_when: false
+  loop:
+    - bc
+    - binutils
+    - compat-libcap1
+    - compat-libstdc++-33
+    - elfutils-libelf
+    - elfutils-libelf-devel
+    - fontconfig-devel
+    - glibc
+    - glibc-devel
+    - ksh
+    - libaio
+    - libaio-devel
+    - libXrender
+    - libXrender-devel
+    - libX11
+    - libXau
+    - libXi
+    - libXtst
+    - libgcc
+    - libstdc++
+    - libstdc++-devel
+    - libxcb
+    - make
+    - policycoreutils
+    - policycoreutils-python
+    - smartmontools
+    - sysstat
+    - net-tools           # required for this project — RAC/Clusterware
+    - nfs-utils           # required for this project — ACFS
+
+- name: Record missing required-package gaps
+  set_fact:
+    verify_failures: "{{ verify_failures + ['Required package not installed: ' + item.item] }}"
+  loop: "{{ chk_oracle_pkgs.results }}"
+  when: item.rc != 0
+
+- name: "Check Oracle's optional OL7 packages (informational — never a gap)"
+  command: "rpm -q {{ item }}"
+  register: chk_oracle_pkgs_optional
+  changed_when: false
+  failed_when: false
+  loop:
+    - ipmiutil            # Intelligent Platform Management Interface — not applicable to a VirtualBox VM
+    - libvirt-libs         # KVM — not applicable to a VirtualBox VM
+    - python               # Oracle ACFS Remote — OL7's default system Python (2.7), normally already present
+    - python-configshell    # Oracle ACFS Remote
+    - python-rtslib         # Oracle ACFS Remote
+    - python-six            # Oracle ACFS Remote
+    - targetcli             # Oracle ACFS Remote
+
+- name: Report optional package status (does not add to verify_failures)
+  debug:
+    msg: "{{ item.item }}: {{ 'present' if item.rc == 0 else 'not installed (expected — optional, see docs/known-risks.md)' }}"
+  loop: "{{ chk_oracle_pkgs_optional.results }}"
+  loop_control:
+    label: "{{ item.item }}"   # without this, Ansible's own "(item=...)" header dumps the full registered rpm -q result dict
+
+- name: "Check 32-bit (i686) companions — informational, only for packages that commonly ship one on OL7"
+  command: "rpm -q {{ item }}.i686"
+  register: chk_oracle_pkgs_i686
+  changed_when: false
+  failed_when: false
+  loop:
+    - glibc
+    - glibc-devel
+    - libgcc
+    - libstdc++
+    - libaio
+    - libX11
+    - libXau
+    - libXi
+    - libXtst
+    - libXrender
+    - libxcb
+    - compat-libcap1
+
+# Genuinely informational — this project doesn't target 32-bit client support (see
+# the check task's own name above). A previous version of this task added every
+# missing i686 companion straight to verify_failures, contradicting that stated
+# intent and failing the play over packages the project explicitly doesn't need;
+# fixed to match the OPTIONAL-package pattern above (report via debug, never a gap).
+- name: Report 32-bit (i686) companion status (does not add to verify_failures)
+  debug:
+    msg: "{{ item.item }}.i686: {{ 'present' if item.rc == 0 else 'not installed (informational only — see docs/known-risks.md)' }}"
+  loop: "{{ chk_oracle_pkgs_i686.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# --- Users and groups ------------------------------------------------------------
+- name: Check required groups exist with expected GIDs
+  command: "getent group {{ item.name }}"
+  register: chk_groups
+  changed_when: false
+  failed_when: false
+  loop:
+    - { name: oinstall, gid: "{{ oinstall_gid }}" }
+    - { name: dba,       gid: "{{ dba_gid }}" }
+    - { name: asmadmin,  gid: "{{ asmadmin_gid }}" }
+    - { name: asmdba,    gid: "{{ asmdba_gid }}" }
+    - { name: asmoper,   gid: "{{ asmoper_gid }}" }
+    - { name: oper,      gid: "{{ oper_gid }}" }
+
+- name: Record group failures (missing, or GID mismatch)
+  set_fact:
+    verify_failures: "{{ verify_failures + [\"Group \" + item.item.name + \" missing or GID != \" + (item.item.gid | string)] }}"
+  loop: "{{ chk_groups.results }}"
+  when: item.rc != 0 or (item.stdout.split(':')[2] | default('')) != (item.item.gid | string)
+
+- name: Check grid and oracle users exist with expected primary/secondary groups
+  command: "id {{ item }}"
+  register: chk_users
+  changed_when: false
+  failed_when: false
+  loop:
+    - "{{ grid_user }}"
+    - "{{ oracle_user }}"
+
+- name: Record missing-user failures
+  set_fact:
+    verify_failures: "{{ verify_failures + ['User ' + item.item + ' does not exist'] }}"
+  loop: "{{ chk_users.results }}"
+  when: item.rc != 0
+
+- name: Check grid and oracle users' PRIMARY group (must be oinstall, not a private per-user group)
+  command: "id -gn {{ item }}"
+  register: chk_primary_group
+  changed_when: false
+  failed_when: false
+  loop:
+    - "{{ grid_user }}"
+    - "{{ oracle_user }}"
+
+- name: Record primary-group gaps
+  set_fact:
+    verify_failures: "{{ verify_failures + [item.item + ' user primary group is ' + (item.stdout | trim) + ', expected oinstall'] }}"
+  loop: "{{ chk_primary_group.results }}"
+  when: item.rc == 0 and (item.stdout | trim) != 'oinstall'
+
+- name: Check grid user group membership
+  command: "id -nG {{ grid_user }}"
+  register: chk_grid_groups
+  changed_when: false
+  failed_when: false
+
+- name: Record grid group-membership gaps
+  set_fact:
+    verify_failures: "{{ verify_failures + ['grid user missing group: ' + item] }}"
+  loop: "{{ ['oinstall', 'asmadmin', 'asmdba', 'asmoper', 'dba', 'racdba', vboxsf_group] }}"
+  when: chk_grid_groups.rc == 0 and item not in chk_grid_groups.stdout.split()
+
+- name: Check oracle user group membership
+  command: "id -nG {{ oracle_user }}"
+  register: chk_oracle_groups
+  changed_when: false
+  failed_when: false
+
+- name: Record oracle group-membership gaps
+  set_fact:
+    verify_failures: "{{ verify_failures + ['oracle user missing group: ' + item] }}"
+  loop: "{{ ['oinstall', 'dba', 'asmdba', 'oper', 'racdba', vboxsf_group] }}"
+  when: chk_oracle_groups.rc == 0 and item not in chk_oracle_groups.stdout.split()
+
+# --- Shell profiles ----------------------------------------------------------------
+- name: Check oracle/grid .bash_profile exist and are Ansible-managed
+  command: "grep -q 'Managed by Ansible' /home/{{ item }}/.bash_profile"
+  register: chk_bash_profile
+  changed_when: false
+  failed_when: false
+  loop:
+    - "{{ oracle_user }}"
+    - "{{ grid_user }}"
+
+- name: Record bash_profile gaps
+  set_fact:
+    verify_failures: "{{ verify_failures + ['/home/' + item.item + '/.bash_profile missing or not Ansible-managed'] }}"
+  loop: "{{ chk_bash_profile.results }}"
+  when: item.rc != 0
+
+# --- Sudo -------------------------------------------------------------------------
+- name: Check sudoers drop-in for oracle/grid exists and is valid
+  command: "visudo -cf /etc/sudoers.d/11-oracle-grid"
+  register: chk_sudoers
+  changed_when: false
+  failed_when: false
+
+- name: Record sudoers failure
+  set_fact:
+    verify_failures: "{{ verify_failures + ['/etc/sudoers.d/11-oracle-grid missing or invalid'] }}"
+  when: chk_sudoers.rc != 0
+
+# --- /u01 storage --------------------------------------------------------------------
+- name: Check /u01 is mounted on the dedicated disk, not the root filesystem
+  command: "findmnt -n -o SOURCE {{ u01_mount_point }}"
+  register: chk_u01_source
+  changed_when: false
+  failed_when: false
+
+- name: Record /u01-on-wrong-filesystem gap
+  set_fact:
+    verify_failures: "{{ verify_failures + [u01_mount_point + ' is not mounted from ' + u01_partition + ' (currently: ' + (chk_u01_source.stdout | trim | default('not mounted at all')) + ') — os_prep must partition/format/mount it before this directory gets created'] }}"
+  when: chk_u01_source.rc != 0 or (chk_u01_source.stdout | trim) != u01_partition
+
+# {{ u01_mount_point }} and {{ oracle_base | dirname }} (/u01/app) legitimately change
+# owner over the life of this node — grid:oinstall before root.sh has ever run,
+# root:oinstall afterward (Oracle's own documented lifecycle, root.sh does this itself
+# — see docs/known-risks.md #30). Not a pass/fail check for that reason: either owner is
+# correct depending on where the node is in that lifecycle. Only flagged if it's neither
+# — that's the actual anomaly worth a look (e.g. still oracle:oinstall from before #30's
+# fix, or root.sh having only partially run).
+- name: "Check {{ u01_mount_point }} / {{ oracle_base | dirname }} ownership (informational — see docs/known-risks.md #30)"
+  stat:
+    path: "{{ item }}"
+  register: chk_u01_lifecycle
+  loop:
+    - "{{ u01_mount_point }}"
+    - "{{ oracle_base | dirname }}"
+
+- name: Note unexpected {{ u01_mount_point }} / /u01/app ownership
+  debug:
+    msg: >
+      {{ item.item }} is owned by {{ item.stat.pw_name }} — expected grid:oinstall
+      (pre-root.sh) or root:oinstall (post-root.sh), see docs/known-risks.md #30.
+      Worth investigating, not auto-failed since it's not itself confirmed broken.
+  loop: "{{ chk_u01_lifecycle.results }}"
+  when: item.stat.exists and item.stat.pw_name not in ['root', grid_user]
+
+# --- OFA directories ----------------------------------------------------------------
+# oracle_base and grid_base are the SAME path (shared ORACLE_BASE — see
+# group_vars/all.yml) — checked once, not twice. grid_home is a separate top-level
+# path, checked directly with its own owner. inventory_loc owner is grid, not oracle
+# — see docs/known-risks.md #3 (INS-32039 / oraInventory ownership).
+- name: Check OFA directories exist with expected ownership
+  stat:
+    path: "{{ item.path }}"
+  register: chk_dirs
+  loop:
+    - { path: "{{ oracle_base }}",  owner: "{{ oracle_user }}" }
+    - { path: "{{ grid_home }}",    owner: "{{ grid_user }}" }
+    - { path: "{{ inventory_loc }}", owner: "{{ grid_user }}" }
+    - { path: "{{ staging_dir }}",  owner: "{{ oracle_user }}" }
+
+- name: Record OFA directory failures
+  set_fact:
+    verify_failures: "{{ verify_failures + [item.item.path + ' missing or not owned by ' + item.item.owner] }}"
+  loop: "{{ chk_dirs.results }}"
+  when: not item.stat.exists or item.stat.pw_name != item.item.owner
+
+- name: Check staging directory is group-writable by oinstall (dual oracle/grid ownership)
+  stat:
+    path: "{{ staging_dir }}"
+  register: chk_staging_mode
+
+- name: Record staging-dir mode/group failure
+  set_fact:
+    verify_failures: "{{ verify_failures + [staging_dir + ' is not group oinstall + setgid 2775 (dual ownership requirement)'] }}"
+  when: chk_staging_mode.stat.exists and (chk_staging_mode.stat.gr_name != 'oinstall' or not chk_staging_mode.stat.mode.endswith('775') or chk_staging_mode.stat.mode[0] != '2')
+
+# --- Kernel parameters --------------------------------------------------------------
+# fs.aio-max-nr / kernel.shmmax: Oracle documents these as MINIMUMS, not exact required
+# values — os_prep's own zz90-oracle-override.conf sets a floor (1048576 / 32GB), but
+# oracle-database-preinstall-19c's own baseline is more generous (4194304 / ~4TB) and
+# wins on this project's nodes regardless of file precedence tricks. Neither number is
+# a memory *reservation* —
+# shmmax is a ceiling on how large a single System V shared-memory segment is ALLOWED to
+# be, not memory actually set aside; aio-max-nr is a cap on concurrent async-I/O request
+# contexts, a few hundred bytes of kernel memory each, not a preallocation either. A 4TB
+# ceiling is harmless even on a 128GB lab host as long as the real configured SGA
+# (db_memory_percentage in group_vars/all.yml, sized off actual VM RAM at DBCA time)
+# stays sane — which it does. So: checked as a MINIMUM (actual >= expected), not an
+# exact match — an exact-match assertion here was the actual bug, not the RPM's values.
+- name: Spot-check key sysctl values with a documented Oracle MINIMUM (actual may exceed, must not be below)
+  command: "sysctl -n {{ item.key }}"
+  register: chk_sysctl_min
+  changed_when: false
+  failed_when: false
+  loop:
+    - { key: fs.aio-max-nr, expect: "1048576" }
+    - { key: kernel.shmmax, expect: "34359738368" }
+
+- name: Record sysctl-below-minimum gaps
+  set_fact:
+    verify_failures: "{{ verify_failures + ['sysctl ' + item.item.key + ' = ' + (item.stdout | trim) + ' (below Oracle minimum ' + item.item.expect + ')'] }}"
+  loop: "{{ chk_sysctl_min.results }}"
+  when: (item.stdout | trim | int) < (item.item.expect | int)
+
+# vm.swappiness / vm.dirty_ratio: this project's own memory-pressure tuning preference
+# (see the comment in os_prep/templates/99-oracle-sysctl.conf.j2), not an Oracle-
+# documented minimum — an exact match is the right check here, unlike the two above.
+- name: Spot-check this project's own tuning values (exact match expected)
+  command: "sysctl -n {{ item.key }}"
+  register: chk_sysctl_exact
+  changed_when: false
+  failed_when: false
+  loop:
+    - { key: vm.swappiness,  expect: "5" }
+    - { key: vm.dirty_ratio, expect: "40" }
+
+- name: Record sysctl mismatches (exact-match values)
+  set_fact:
+    verify_failures: "{{ verify_failures + ['sysctl ' + item.item.key + ' = ' + (item.stdout | trim) + ' (expected ' + item.item.expect + ')'] }}"
+  loop: "{{ chk_sysctl_exact.results }}"
+  when: (item.stdout | trim) != item.item.expect
+
+# tuned's active profile is a common root cause if the two sysctl checks above ever
+# fail on a VM — virtual-guest (tuned's default recommendation on VirtualBox) resets
+# vm.swappiness/vm.dirty_ratio on its own; see docs/known-risks.md #23. Checked
+# directly here so a gap points straight at the cause instead of just the symptom.
+- name: Check active tuned profile
+  command: tuned-adm active
+  register: chk_tuned_profile
+  changed_when: false
+  failed_when: false
+
+- name: Record tuned profile gap
+  set_fact:
+    verify_failures: "{{ verify_failures + ['tuned active profile is not oracle-db-vm (' + (chk_tuned_profile.stdout | trim) + ') — vm.swappiness/vm.dirty_ratio above are likely being reset by the wrong profile, see known-risks.md #23'] }}"
+  when: "'oracle-db-vm' not in chk_tuned_profile.stdout"
+
+# --- Resource limits ------------------------------------------------------------------
+- name: Check limits file exists for grid and oracle
+  command: "grep -q {{ item }} /etc/security/limits.d/99-oracle.conf"
+  register: chk_limits
+  changed_when: false
+  failed_when: false
+  loop:
+    - "{{ grid_user }}"
+    - "{{ oracle_user }}"
+
+- name: Record limits-file gaps
+  set_fact:
+    verify_failures: "{{ verify_failures + ['/etc/security/limits.d/99-oracle.conf has no entries for ' + item.item] }}"
+  loop: "{{ chk_limits.results }}"
+  when: item.rc != 0
+
+# --- I/O scheduler -------------------------------------------------------------------
+# OL7's 3.10 kernel has no blk-mq schedulers, so os_prep sets the I/O scheduler via
+# a GRUB kernel parameter rather than a udev rule (see that role's task comment).
+# Checks GRUB_CMDLINE_LINUX for elevator=deadline instead — this is a
+# boot-parameter change, so it only takes effect after a reboot; a node that had
+# os_prep run but hasn't rebooted since will legitimately show this as still pending
+# in the LIVE scheduler even though the GRUB config itself is already correct. The
+# check below only verifies the GRUB config, not `cat /sys/block/sd*/queue/scheduler`
+# — confirm that by hand after a reboot if you need proof it actually took.
+- name: Check I/O scheduler GRUB parameter is present
+  command: grep -q 'elevator=deadline' /etc/default/grub
+  register: chk_io_grub
+  changed_when: false
+  failed_when: false
+
+- name: Record I/O scheduler GRUB parameter gap
+  set_fact:
+    verify_failures: "{{ verify_failures + ['elevator=deadline missing from GRUB_CMDLINE_LINUX in /etc/default/grub (run --tags os_prep, then reboot for it to take effect)'] }}"
+  when: chk_io_grub.rc != 0
+
+# --- SELinux / firewalld --------------------------------------------------------------
+# Checks the PERSISTED target in /etc/selinux/config, not live `getenforce` — os_prep
+# only reaches runtime Permissive via `setenforce 0` (SELinux can't be unloaded to a
+# true Disabled state without a reboot), so `getenforce` will legitimately still say
+# "Permissive" on a node that had os_prep run but hasn't rebooted since, even though
+# it's fully correct. Checking /etc/selinux/config avoids that false gap. See
+# docs/known-risks.md #25.
+- name: Check SELinux is set to disabled in /etc/selinux/config
+  command: grep -q '^SELINUX=disabled$' /etc/selinux/config
+  register: chk_selinux
+  changed_when: false
+  failed_when: false
+
+- name: Record SELinux gap
+  set_fact:
+    verify_failures: "{{ verify_failures + ['/etc/selinux/config does not have SELINUX=disabled (run --tags os_prep, then reboot for it to fully take effect — live getenforce may still show Permissive until then)'] }}"
+  when: chk_selinux.rc != 0
+
+- name: Check current runtime SELinux mode (informational only — not a gap by itself, see comment above)
+  command: getenforce
+  register: chk_selinux_runtime
+  changed_when: false
+  failed_when: false
+
+- name: Note if a reboot is still pending to fully disable SELinux
+  debug:
+    msg: >
+      /etc/selinux/config is correctly set to disabled, but live SELinux mode is
+      still "{{ chk_selinux_runtime.stdout | trim }}" — reboot this node to
+      complete the transition to Disabled.
+  when:
+    - chk_selinux.rc == 0
+    - (chk_selinux_runtime.stdout | trim) != 'Disabled'
+
+- name: Check firewalld is not active
+  command: systemctl is-active firewalld
+  register: chk_firewalld
+  changed_when: false
+  failed_when: false
+
+- name: Record firewalld gap
+  set_fact:
+    verify_failures: "{{ verify_failures + ['firewalld is ' + (chk_firewalld.stdout | trim) + ', expected inactive/disabled (see docs/known-risks.md #25)'] }}"
+  when: (chk_firewalld.stdout | trim) == 'active'
+
+# --- NOZEROCONF (cluvfy PRVE-10077, see docs/known-risks.md #7) -----------------------
+- name: Check NOZEROCONF=yes is set in /etc/sysconfig/network
+  command: grep -c '^NOZEROCONF=yes$' /etc/sysconfig/network
+  register: chk_nozeroconf
+  changed_when: false
+  failed_when: false
+
+- name: Record NOZEROCONF gap
+  set_fact:
+    verify_failures: "{{ verify_failures + ['NOZEROCONF=yes missing from /etc/sysconfig/network (cluvfy PRVE-10077)'] }}"
+  when: (chk_nozeroconf.stdout | trim) != '1'
+
+# --- ASMLib ----------------------------------------------------------------------------
+# PACKAGES are part of os_prep's own baseline now (installed on the golden image,
+# pre-clone — see os_prep's task comment) — a real gap here means os_prep genuinely
+# didn't install them, not just "hasn't run yet". Service config and disk marking
+# still happen later via the asmlib_disks role, which in site.yml's build order runs
+# AFTER both of verify_baseline's two documented call sites
+# (golden-image-and-cloning.md Step 2, before cloning oradbserv05; Step 5, right
+# after personalizing oradbserv06) — asmlib_disks deliberately waits until both real
+# nodes exist and the shared disks are attached to both for THAT part. So the service
+# check below stays informational-only (verify_asmlib_disks-gated) while the package
+# check is now a real, unconditional gap.
+- name: Check ASMLib packages installed
+  command: "rpm -q {{ item }}"
+  register: chk_asmlib_pkgs
+  changed_when: false
+  failed_when: false
+  loop:
+    - kmod-oracleasm
+    - oracleasm-support
+    - oracleasmlib
+  when: use_asmlib
+
+- name: Report ASMLib package status
+  debug:
+    msg: "{{ item.item }}: {{ 'installed' if item.rc == 0 else 'NOT installed' }}"
+  loop: "{{ chk_asmlib_pkgs.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: use_asmlib
+
+- name: Record ASMLib package gaps
+  set_fact:
+    verify_failures: "{{ verify_failures + ['ASMLib package not installed: ' + item.item] }}"
+  loop: "{{ chk_asmlib_pkgs.results }}"
+  when: use_asmlib and item.rc != 0
+
+- name: Check oracleasm service is enabled
+  command: systemctl is-enabled oracleasm
+  register: chk_asmlib_svc
+  changed_when: false
+  failed_when: false
+  when: use_asmlib
+
+- name: Record oracleasm service gap
+  set_fact:
+    verify_failures: "{{ verify_failures + ['oracleasm service not enabled'] }}"
+  when: >
+    use_asmlib and chk_asmlib_svc.stdout is defined and 'enabled' not in chk_asmlib_svc.stdout
+    and (verify_asmlib_disks | default(false))
+
+# --- Identity (hostname/network) — meaningful once a node has its final identity ------
+- name: Check hostname matches inventory
+  command: hostname -f
+  register: chk_hostname
+  changed_when: false
+  failed_when: false
+
+- name: Record hostname mismatch
+  set_fact:
+    verify_failures: "{{ verify_failures + ['hostname is ' + (chk_hostname.stdout | trim) + ', expected ' + inventory_hostname + '.' + domain] }}"
+  when: (chk_hostname.stdout | trim) != (inventory_hostname + '.' + domain)
+
+# --- Report -----------------------------------------------------------------------------
+- name: Show verification summary
+  debug:
+    msg: >-
+      {{ (verify_failures | length == 0)
+         | ternary('PASS — node matches expected os_prep baseline.',
+                    'FAIL — ' + (verify_failures | length | string) + ' gap(s) found:') }}
+
+- name: List every gap found
+  debug:
+    var: verify_failures
+  when: verify_failures | length > 0
+
+- name: Fail the play if any gap was found (remove this task if you just want the report)
+  fail:
+    msg: >
+      {{ verify_failures | length }} gap(s) between this node's actual state and the
+      expected os_prep baseline — see the list above. Either fix manually, or run
+      `ansible-playbook site.yml --tags os_prep` (idempotent — safe to run against an
+      already-mostly-correct node) to close the gaps automatically.
+  when: verify_failures | length > 0

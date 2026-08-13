@@ -1,0 +1,122 @@
+---
+# Clones an already-built, real RAC node into a second node via VBoxManage, run from
+# the Ansible control node itself (localhost) rather than a separate host-side script.
+# See docs/golden-image-and-cloning.md for the full workflow this fits into — this
+# playbook only does the clone; personalizing the clone's hostname/IPs happens over the
+# VirtualBox console afterward, NOT over SSH (the clone boots as a network-identical
+# duplicate of the source and would conflict with it).
+#
+# Usage:
+#   ansible-playbook clone-node.yml -e source_vm=oradbserv05 -e target_vm=oradbserv06
+#
+# Defaults to nodes[0]/nodes[1] from group_vars/all.yml if -e isn't passed. Pass
+# -e vboxmanage_bin=/path/to/VBoxManage.exe if auto-detection below picks the wrong one.
+
+- name: Clone a RAC node VM via VBoxManage
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    source_vm: "{{ nodes[0].name }}"
+    target_vm: "{{ nodes[1].name }}"
+    # WSL2's Windows-interop can execute a Windows .exe by full path even when it isn't
+    # on the Windows PATH (the VirtualBox installer doesn't add itself there by
+    # default) — so the fallback below reaches VBoxManage.exe directly via its default
+    # install location under /mnt/c, without depending on PATH at all.
+    vboxmanage_default_path: "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
+
+  tasks:
+    - name: Try VBoxManage.exe on PATH first
+      command: "VBoxManage.exe --version"
+      register: vbox_on_path
+      changed_when: false
+      failed_when: false
+      when: vboxmanage_bin is not defined
+
+    - name: Fall back to the default Windows install location if PATH lookup failed
+      command: "\"{{ vboxmanage_default_path }}\" --version"
+      register: vbox_default_path
+      changed_when: false
+      failed_when: false
+      when: vboxmanage_bin is not defined and vbox_on_path.rc != 0
+
+    - name: Resolve which VBoxManage binary actually works
+      set_fact:
+        vboxmanage_bin: >-
+          {{ vboxmanage_bin
+             if vboxmanage_bin is defined
+             else ('VBoxManage.exe' if (vbox_on_path.rc | default(1)) == 0
+                   else ('"' + vboxmanage_default_path + '"' if (vbox_default_path.rc | default(1)) == 0
+                         else '')) }}
+
+    - name: Fail with a clear message if VBoxManage isn't reachable by any method
+      fail:
+        msg: >
+          Could not run VBoxManage.exe on PATH or at the default install location
+          ({{ vboxmanage_default_path }}). If VirtualBox is installed somewhere else,
+          re-run with -e vboxmanage_bin='"C:\path\to\VBoxManage.exe"'. If WSL2 interop
+          itself isn't working, run the equivalent command directly from PowerShell
+          instead:
+            VBoxManage clonevm {{ source_vm }} --name {{ target_vm }} --register --mode all
+          See docs/ansible-on-windows.md.
+      when: vboxmanage_bin == ''
+
+    - name: Show which VBoxManage is being used
+      debug:
+        msg: "Using: {{ vboxmanage_bin }}"
+
+    - name: Confirm the source VM exists
+      command: "{{ vboxmanage_bin }} showvminfo {{ source_vm }} --machinereadable"
+      register: source_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the source VM doesn't exist
+      fail:
+        msg: "VM '{{ source_vm }}' not found. Build it manually first — see docs/golden-image-and-cloning.md."
+      when: source_check.rc != 0
+
+    - name: Fail if the source VM is running (clonevm needs it powered off for a clean, non-live clone)
+      fail:
+        msg: >
+          '{{ source_vm }}' is currently running. Shut it down first
+          ({{ vboxmanage_bin }} controlvm {{ source_vm }} acpipowerbutton),
+          then re-run this playbook — cloning a running VM either fails outright or
+          requires --live, which this playbook deliberately doesn't use for a database
+          node clone.
+      when: source_check.rc == 0 and 'VMState=\"running\"' in source_check.stdout
+
+    - name: Check whether the target VM name is already registered (don't silently overwrite)
+      command: "{{ vboxmanage_bin }} showvminfo {{ target_vm }} --machinereadable"
+      register: target_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if target already exists
+      fail:
+        msg: >
+          A VM named '{{ target_vm }}' is already registered. If this is a re-clone,
+          unregister/delete the old one first ({{ vboxmanage_bin }} unregistervm
+          {{ target_vm }} --delete) — not automated here since deleting a VM is not
+          something to do implicitly.
+      when: target_check.rc == 0
+
+    - name: Clone {{ source_vm }} to {{ target_vm }} (full clone, not linked)
+      command: >
+        {{ vboxmanage_bin }} clonevm {{ source_vm }}
+        --name {{ target_vm }} --register --mode all
+      register: clone_result
+
+    - name: Show clone result
+      debug:
+        var: clone_result.stdout_lines
+
+    - name: Next steps
+      debug:
+        msg: >
+          '{{ target_vm }}' is registered. DO NOT power it on at the same time as
+          '{{ source_vm }}' until it's been personalized — it currently has identical
+          hostname/IPs and will conflict on the shared networks. Boot ONLY
+          '{{ target_vm }}', log in via the VirtualBox console (not SSH), and follow
+          the personalization steps in docs/golden-image-and-cloning.md before powering
+          '{{ source_vm }}' back on.

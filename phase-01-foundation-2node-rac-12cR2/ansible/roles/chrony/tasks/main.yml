@@ -1,0 +1,116 @@
+---
+# chrony time sync: the OEM VM is the local stratum-10 master (no dependency on
+# internet NTP pools inside the lab), both RAC nodes are clients. Adapted from the
+# project's tested reference notes — see docs/known-risks.md #13 for the "local
+# stratum 10 is a safe fallback, not a bug" note, and docs/network-and-hosts.md for
+# the boot-race gotcha this role works around.
+#
+# This role runs against whichever inventory group the play targets. ansible/site.yml
+# targets rac_nodes only: oemserver01 already runs a working, manually-configured
+# NTP server outside this project's Ansible management, and there was no appetite
+# for bootstrapping SSH access to it just so this role could reach it. The "server"
+# branch below is effectively dead code under the current play (inventory_hostname
+# will never equal chrony_master_hostname when only rac_nodes is targeted) — left
+# in place, harmless, in case oemserver01 is ever brought under this project's
+# management later.
+
+- name: Install chrony
+  yum:
+    name: chrony
+    state: present
+
+- name: Disable/mask legacy ntpd if present (harmless if it never existed)
+  systemd:
+    name: ntpd
+    enabled: false
+    state: stopped
+  failed_when: false
+
+# --- Server branch: OEM VM only ----------------------------------------------
+
+- name: Render chrony.conf (server / local time master)
+  template:
+    src: chrony.conf.server.j2
+    dest: /etc/chrony.conf
+    mode: "0644"
+  when: inventory_hostname == chrony_master_hostname
+  notify: restart chronyd
+
+- name: Check whether firewalld is even active on the time master (this project's minimal lab builds often don't have it running at all)
+  command: systemctl is-active firewalld
+  register: firewalld_active
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == chrony_master_hostname
+
+- name: "Open firewalld for NTP (port 123/udp) on the public zone (only if firewalld is actually running)"
+  command: "firewall-cmd --zone=public --add-service=ntp --permanent"
+  register: fw_ntp
+  changed_when: "'ALREADY_ENABLED' not in fw_ntp.stdout"
+  failed_when: false
+  when: inventory_hostname == chrony_master_hostname and firewalld_active.stdout | trim == 'active'
+
+- name: Reload firewalld (only if firewalld is actually running)
+  command: firewall-cmd --reload
+  changed_when: false
+  when: inventory_hostname == chrony_master_hostname and firewalld_active.stdout | trim == 'active'
+
+- name: Note firewalld is not running on the time master (informational — nothing to reload if it's not managing anything)
+  debug:
+    msg: >
+      firewalld is {{ firewalld_active.stdout | trim }}, not active — skipped opening
+      the NTP service and reload. Not a gap in this lab (firewalld is permanently
+      disabled here); if that changes, `systemctl enable --now firewalld` and re-run
+      this role to open port 123.
+  when: inventory_hostname == chrony_master_hostname and firewalld_active.stdout | trim != 'active'
+
+# --- Client branch: RAC nodes -------------------------------------------------
+
+- name: Render chrony.conf (client)
+  template:
+    src: chrony.conf.client.j2
+    dest: /etc/chrony.conf
+    mode: "0644"
+  when: inventory_hostname != chrony_master_hostname
+  notify: restart chronyd
+
+# --- Both: the boot-race fix from the reference notes -------------------------
+# The reference notes hit "Could not resolve address of initstepslew server ..."
+# on VirtualBox's parallelized boot, and worked around it with an rc.local hack.
+# This drop-in is the more current equivalent — verify it actually survives a real
+# reboot before trusting it; if it doesn't, fall back to the rc.local approach
+# documented in docs/network-and-hosts.md.
+- name: Ensure the chronyd systemd drop-in directory exists
+  # The copy task right below writes into this directory — `copy`/`template` do NOT
+  # create parent directories on their own, so this has to run first.
+  file:
+    path: /etc/systemd/system/chronyd.service.d
+    state: directory
+    mode: "0755"
+
+- name: Ensure chronyd waits for network-online.target (systemd drop-in)
+  copy:
+    dest: /etc/systemd/system/chronyd.service.d/override.conf
+    content: |
+      [Unit]
+      After=network-online.target
+      Wants=network-online.target
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart chronyd
+
+- name: Enable and start chronyd
+  systemd:
+    name: chronyd
+    state: started
+    enabled: true
+
+- name: Show chrony sources (verification)
+  command: chronyc sources
+  register: chrony_sources
+  changed_when: false
+
+- name: Display chrony sources
+  debug:
+    var: chrony_sources.stdout_lines

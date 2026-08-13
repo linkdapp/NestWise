@@ -1,0 +1,125 @@
+################################################################################
+# Grid Infrastructure 19.0.0 (19.3 base + RU 19.24) — PHASE B response file:
+# cluster configuration (oracle.install.option=CRS_CONFIG), run via config.sh
+# AFTER Phase A's software-only install (grid_install_swonly.rsp.j2) and its
+# orainstRoot.sh/root.sh have already completed.
+#
+# GI is 19c here, NOT 12.2.0.1 — a deliberate, independent-version design (see
+# docs/known-risks.md #2): 19c GI + 12.2.0.1 DB on top.
+#
+# Every field below is verified field-by-field against the real, blank
+# gridsetup.rsp shipped in 19.3 install media — see docs/known-risks.md #10 for
+# the response-file fields worth getting right the first time
+# (networkInterfaceList type values, disksWithFailureGroupNames, ORACLE_HOME).
+#
+# INVENTORY_LOCATION/ORACLE_BASE/OSDBA/OSOPER/OSASM below are harmless
+# carried-over duplicates of Phase A's values (config.sh should treat them as
+# already-satisfied, since the software install already set them) — left in
+# rather than stripped out, since neither Oracle's docs nor a real run have yet
+# confirmed config.sh tolerates their absence, and leaving them costs nothing.
+################################################################################
+
+oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v19.0.0
+
+# Required on Unix (the real template's comment: "optional... if installing on Windows"
+# — meaning NOT optional here).
+INVENTORY_LOCATION={{ inventory_loc }}
+
+# CRS_CONFIG here means "configure the cluster" — by the time config.sh reads this
+# file, Phase A has already installed the software (CRS_SWONLY, grid_install_swonly.rsp.j2)
+# and root.sh has already run once for that. This is NOT the single-shot "stage +
+# configure together" usage CRS_CONFIG has when passed straight to gridSetup.sh —
+# same option value, different tool (config.sh vs gridSetup.sh) and different meaning
+# as a result. See docs/patching-strategy.md "Mechanism 2".
+oracle.install.option=CRS_CONFIG
+
+ORACLE_BASE={{ grid_base }}
+ORACLE_HOME={{ grid_home }}
+oracle.install.asm.OSDBA=asmdba
+oracle.install.asm.OSOPER=asmoper
+oracle.install.asm.OSASM=asmadmin
+
+oracle.install.crs.config.scanType=LOCAL_SCAN
+oracle.install.crs.config.ClusterConfiguration=STANDALONE
+oracle.install.crs.config.configureAsExtendedCluster=false
+oracle.install.crs.config.clusterName={{ cluster_name }}
+oracle.install.crs.config.gpnp.scanName={{ scan_name }}.{{ domain }}
+oracle.install.crs.config.gpnp.scanPort={{ scan_port }}
+
+# Applicable for STANDALONE cluster configuration (this project) per the real
+# template's Section D comment. No GNS here: name resolution is real DNS (BIND,
+# ansible/roles/dns_bind), not Oracle-managed GNS/DHCP.
+oracle.install.crs.config.gpnp.configureGNS=false
+oracle.install.crs.config.autoConfigureClusterNodeVIP=false
+
+# node:vip pairs, comma-separated — matches the real template's own "Flex Cluster"
+# example format exactly (all 19c standard clusters are Flex Clusters under the hood,
+# regardless of the STANDALONE ClusterConfiguration label above, which refers to
+# Domain Services Cluster membership, not node count).
+oracle.install.crs.config.clusterNodes={% for n in nodes %}{{ n.name }}:{{ n.vip_name }}{% if not loop.last %},{% endif %}{% endfor %}
+
+# interfaceName:subnet:type — type 1=PUBLIC, 2=PRIVATE, 3=DO NOT USE, 4=ASM,
+# 5=ASM & PRIVATE (see docs/known-risks.md #10 — getting this wrong produces
+# [FATAL] [INS-41208]). OL7 uses classic eth-style interface naming, not enp0sN:
+# eth1 = Host-Only Adapter (public cluster network), eth2 = Internal Network
+# (private interconnect). No dedicated ASM network in this lab —
+# FLEX_ASM_STORAGE requires SOME subnet marked for ASM use, so eth2 carries
+# both (type 5), not plain PRIVATE (type 2).
+oracle.install.crs.config.networkInterfaceList=eth1:192.168.56.0:1,eth2:192.168.2.0:5
+
+# FLEX_ASM_STORAGE, not LOCAL_ASM_STORAGE — "LOCAL_ASM_STORAGE" isn't a value that
+# exists in the real 19.3 schema at all (only FLEX_ASM_STORAGE, CLIENT_ASM_STORAGE,
+# FILE_SYSTEM_STORAGE do). Flex ASM is the standard/default architecture for a
+# normal RAC deployment since 12.2 — this is what "local, ASMLib-backed shared
+# disks" actually maps to in 19c's schema.
+oracle.install.crs.config.storageOption=FLEX_ASM_STORAGE
+
+# GIMR (Management Repository) — disabled, a lab-scale resource tradeoff. See the
+# configure_gimr comment in group_vars/all.yml.
+oracle.install.crs.configureGIMR={{ configure_gimr | lower }}
+oracle.install.asm.configureGIMRDataDG=false
+
+# ASM Filter Driver — NOT used. This project deliberately uses ASMLib for shared-disk
+# marking (docs/known-risks.md #4), not AFD; explicit false rather than left to
+# whatever gridSetup.sh would otherwise default to now that storageOption is
+# FLEX_ASM_STORAGE (the real template flags this field as "applicable" for that
+# storage option specifically).
+oracle.install.asm.configureAFD=false
+
+oracle.install.asm.diskGroup.name={{ asm_diskgroup_data }}
+# This diskgroup hosts OCR + voting (GIMR disabled, see above), not just data.
+# NORMAL redundancy, 3 failure groups, 3 real voting files — a deliberate choice
+# to demonstrate the voting-quorum mechanism (see docs/known-risks.md #9 and the
+# voting comment block in group_vars/all.yml). OCR itself is ALSO multiplexed
+# further, to DATA02, post-install via `ocrconfig -add` (see this role's
+# tasks/main.yml) — unrelated to this setting.
+oracle.install.asm.diskGroup.redundancy={{ asm_diskgroup_data_redundancy }}
+oracle.install.asm.diskGroup.AUSize=0
+
+# ASM disk paths use /dev/disk/by-label/<LABEL> — a generic udev mechanism, not
+# tied to ASMLib specifically — rather than /dev/oracleasm/disks/<LABEL>. See
+# docs/known-risks.md #4: by-label resolves to the correct physical disk even
+# when raw /dev/sdX letters differ between nodes at attach/clone time, the same
+# durability property as /dev/disk/by-id/, keyed to the label this project
+# already uses.
+#
+# disksWithFailureGroupNames is REQUIRED here since asm_diskgroup_data_redundancy
+# is NORMAL, not EXTERNAL — see docs/known-risks.md #10. The real template's own
+# guidance: "Failure Groups are not required if redundancy=EXTERNAL" — the
+# inverse also holds: NORMAL needs one failure group per disk, format is a flat
+# alternating list (disk1,FGName1,disk2,FGName2,...), not bare disk paths. One
+# failure group per disk, named FG_<label> — derived directly from
+# asm_diskgroup_data_disks below, no separate failure-group-name list needed.
+oracle.install.asm.diskGroup.disksWithFailureGroupNames={% for d in asm_diskgroup_data_disks %}/dev/disk/by-label/{{ d }},FG_{{ d }}{% if not loop.last %},{% endif %}{% endfor %}
+oracle.install.asm.diskGroup.disks={% for d in asm_diskgroup_data_disks %}/dev/disk/by-label/{{ d }}{% if not loop.last %},{% endif %}{% endfor %}
+oracle.install.asm.diskGroup.diskDiscoveryString=/dev/disk/by-label/*
+
+# Passwords — pulled from group_vars/all.yml, which should be ansible-vault
+# encrypted before this is ever run against real infrastructure.
+oracle.install.asm.SYSASMPassword={{ sys_password }}
+oracle.install.asm.monitorPassword={{ sys_password }}
+
+# Not managing GI itself via Cloud Control/OEM at this phase.
+oracle.install.config.managementOption=NONE
+
+oracle.install.crs.rootconfig.executeRootScript=false

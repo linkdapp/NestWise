@@ -1,0 +1,121 @@
+---
+# Stages the target Release Update for both GI and DB homes so it's on disk,
+# unzipped, and ready for -applyRU before grid_silent_install/db_silent_install
+# run. This role does NOT apply the patch itself — mechanism 1 (-applyRU) is
+# invoked as part of the installer command in those two roles, per
+# docs/patching-strategy.md. This role only handles staging + the mechanism-2
+# fallback for when -applyRU isn't viable for a given patch.
+#
+# run_once + delegate_to node1 on EVERY task below — ADDED 2026-08-09, a real bug
+# fix, not a style choice. /u01/app/oracle/staging is LOCAL disk on each node, not
+# shared storage (only the ASMDISK0x block devices are actually shared between
+# nodes) — so before this fix, this role checked/required the patch zips on BOTH
+# nodes independently, and failed on node2 if you'd only staged them on node1. But
+# only node1 ever actually needs them locally: grid_silent_install's -applyRU and
+# db_silent_install's -applyRU/-applyOneOffs both run delegate_to node1 only —
+# OUI copies the ALREADY-patched software to node2 over SSH equivalence as part of
+# the install itself, node2 never runs its own -applyRU. Matches the same
+# run_once/delegate_to pattern grid_silent_install and db_silent_install already use
+# for their own software staging.
+
+- name: Fail fast if patch IDs haven't been set
+  fail:
+    msg: >
+      gi_ru_patch_id / db_ru_patch_id are still "REPLACE_ME" in group_vars/all.yml.
+      Look up the current 12.2.0.1 Release Update on My Oracle Support first —
+      see ../../docs/patching-strategy.md. Refusing to guess a patch number.
+  when: gi_ru_patch_id == "REPLACE_ME" or db_ru_patch_id == "REPLACE_ME"
+  run_once: true
+
+- name: Confirm GI patch zip is present (downloaded from MOS out-of-band)
+  # Checks gi_ru_zip — Oracle's OWN MOS download filename
+  # (p{{ gi_ru_patch_id }}_190000_Linux-x86-64.zip), not a renamed
+  # "{{ gi_ru_patch_id }}.zip". Don't rename what MOS gives you to match this
+  # check; if a future patch download uses a different filename, update
+  # gi_ru_zip in group_vars/all.yml instead.
+  stat:
+    path: "{{ gi_ru_zip }}"
+  register: gi_patch_zip
+  run_once: true
+  delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+- name: Confirm DB patch zip is present (downloaded from MOS out-of-band)
+  # Same reasoning as above — checks db_ru_zip, Oracle's actual MOS filename.
+  stat:
+    path: "{{ db_ru_zip }}"
+  register: db_patch_zip
+  run_once: true
+  delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+- name: Fail with a clear message if patch zips aren't staged yet
+  fail:
+    msg: >
+      Expected {{ item.path }} on {{ groups['rac_nodes'][0] }} — download it from
+      My Oracle Support onto that node first (see docs/patching-strategy.md for how
+      to find the current patch number). This role does not fetch from MOS —
+      credentials/licensing make that a manual, out-of-band step. Only node1 needs
+      this locally — node2 gets already-patched software copied to it by OUI during
+      the install itself, see this role's header comment.
+  loop:
+    - { present: "{{ gi_patch_zip.stat.exists }}", path: "{{ gi_ru_zip }}" }
+    - { present: "{{ db_patch_zip.stat.exists }}", path: "{{ db_ru_zip }}" }
+  when: not item.present
+  run_once: true
+
+- name: Unzip GI patch to the shared patches staging directory (required for -applyRU)
+  # dest is the PARENT patches/ dir, not patches/{{ gi_ru_patch_id }} — Oracle's own
+  # patch zips already contain a top-level folder matching their own patch number
+  # (e.g. p39467003_...zip unzips its own 39467003/... tree). Setting dest to
+  # patches/{{ gi_ru_patch_id }} directly would double-nest it to
+  # patches/{{ gi_ru_patch_id }}/{{ gi_ru_patch_id }}/... — a real bug, not a style
+  # choice; gi_ru_patch_path (staging_dir/patches/{{ gi_ru_patch_id }}) only resolves
+  # to the right place if extraction lands the patch's own folder directly under
+  # patches/.
+  unarchive:
+    src: "{{ gi_ru_zip }}"
+    dest: "{{ staging_dir }}/patches"
+    remote_src: true
+    owner: "{{ grid_user }}"
+    group: oinstall
+    creates: "{{ gi_ru_patch_path }}"
+  run_once: true
+  delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+- name: Unzip DB patch to the shared patches staging directory (required for -applyRU)
+  # Same reasoning as the GI patch above — dest is the parent patches/ dir, not
+  # patches/{{ db_ru_patch_id }}, so the zip's own 33559966/ folder (containing both
+  # 33583921/ and 33561275/ — see group_vars/all.yml) lands where db_ru_patch_path and
+  # db_ojvm_patch_path actually expect it.
+  unarchive:
+    src: "{{ db_ru_zip }}"
+    dest: "{{ staging_dir }}/patches"
+    remote_src: true
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    creates: "{{ staging_dir }}/patches/{{ db_ru_patch_id }}"
+  run_once: true
+  delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+- name: Record staged-patch marker for downstream roles/idempotency
+  copy:
+    dest: "{{ staging_dir }}/patches/.staged_ok"
+    content: |
+      gi_ru_patch_id={{ gi_ru_patch_id }}
+      db_ru_patch_id={{ db_ru_patch_id }}
+      staged_at={{ ansible_date_time.iso8601 }}
+    mode: "0644"
+  run_once: true
+  delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+# --- Mechanism 2 fallback, NOT run automatically -----------------------------
+# If a given patch's README says it can't be applied via -applyRU during
+# install (see docs/patching-strategy.md, mechanism 2), apply it manually
+# against the unconfigured home once grid_silent_install/db_silent_install
+# have done the software-only install and BEFORE root.sh / DBCA run:
+#
+#   {{ grid_home }}/OPatch/opatchauto apply {{ staging_dir }}/patches/{{ gi_ru_patch_id }}
+#   {{ db_home }}/OPatch/opatchauto apply {{ staging_dir }}/patches/{{ db_ru_patch_id }}
+#
+# Deliberately left as a manual command, not an Ansible task: opatchauto's
+# exit behavior and log location are worth watching interactively the first
+# time against a given patch, rather than trusting a task's changed_when.

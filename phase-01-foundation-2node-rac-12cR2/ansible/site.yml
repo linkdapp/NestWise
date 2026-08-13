@@ -1,0 +1,90 @@
+---
+# Top-level playbook. Run with --tags to control how much of the build
+# executes in one pass — see ../README.md "Build order" for the intended
+# sequencing and why grid configuration is deliberately not blindly chained.
+#
+# Intended usage: build oradbserv05 by hand, run os_prep + verify_baseline against it,
+# clone it (via clone-node.yml) to produce oradbserv06, personalize + verify that too
+# (see docs/golden-image-and-cloning.md), then run the rest against both real nodes.
+
+- name: "Bootstrap: ensure /usr/bin/python3 exists before any module-based task runs — OL7 ships Python 2.7 by default, not 3 (see docs/known-risks.md #17)"
+  hosts: rac_nodes
+  gather_facts: no
+  tags: [always]
+  tasks:
+    - name: Check for /usr/bin/python3
+      raw: test -e /usr/bin/python3
+      register: python3_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install python3 (raw — no Python needed on the target for this module to run)
+      raw: yum install -y python3
+      when: python3_check.rc != 0
+
+- name: OS baseline, packages, kernel/VM tuning, OFA layout (oradbserv05 first, closes gaps; safe to re-run on oradbserv06 post-clone)
+  hosts: rac_nodes
+  tags: [os_prep]
+  roles:
+    - os_prep
+
+- name: Verify a node's baseline matches what os_prep should have produced (run before cloning, and again on the clone)
+  hosts: rac_nodes
+  tags: [verify_baseline]
+  roles:
+    - verify_baseline
+
+- name: BIND DNS — oradbserv05 primary, oradbserv06 secondary, real SCAN round-robin
+  hosts: rac_nodes
+  tags: [dns_bind]
+  roles:
+    - dns_bind
+
+# Targets rac_nodes only, not chrony_targets (rac_nodes + time_master) — oemserver01
+# already runs a working, manually-configured NTP/chrony server outside this
+# project's management (per inventory/hosts.ini's own comment), and there's no
+# appetite for bootstrapping ansible SSH access to it just for this role to reach
+# it. Renders the CLIENT config (chrony_master_hostname/chrony_master_ip come from
+# group_vars directly, not from inventory group membership, so this doesn't affect
+# what the clients point at).
+- name: chrony — RAC nodes as clients of the existing OEM VM time master (oemserver01 itself is not managed by this phase)
+  hosts: rac_nodes
+  tags: [chrony]
+  roles:
+    - chrony
+
+- name: ASMLib — mark shared disks (oradbserv05 marks, oradbserv06 discovers)
+  hosts: rac_nodes
+  tags: [asmlib_disks]
+  roles:
+    - asmlib_disks
+
+- name: SSH equivalence for grid/oracle across both nodes (required by cluvfy AND by gridSetup.sh/runInstaller's own node propagation — see role comments)
+  hosts: rac_nodes
+  tags: [ssh_equivalence]
+  roles:
+    - ssh_equivalence
+
+- name: Stage and patch GI + DB homes before any configuration step runs
+  hosts: rac_nodes
+  tags: [patch_before_config]
+  roles:
+    - patch_before_config
+
+- name: "Grid Infrastructure: stage, install software, configure cluster, add storage (see role for sub-tags: grid_stage / grid_install_software / grid_configure_cluster / grid_storage)"
+  hosts: rac_nodes
+  tags: [grid_infrastructure]
+  roles:
+    - grid_silent_install
+
+- name: "Database software: stage, then install (see role for sub-tags: db_stage / db_install_software)"
+  hosts: rac_nodes
+  tags: [db_software]
+  roles:
+    - db_silent_install
+
+- name: Silent DBCA — General Purpose non-CDB database on the RAC cluster
+  hosts: rac_node1
+  tags: [dbca_noncdb]
+  roles:
+    - dbca_noncdb

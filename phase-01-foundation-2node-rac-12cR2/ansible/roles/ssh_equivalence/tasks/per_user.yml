@@ -1,0 +1,101 @@
+---
+# Included once per software-owner OS user (grid, then oracle) with ssh_user set.
+# Runs against the whole rac_nodes play in one pass — relies on Ansible's default
+# `linear` strategy running each task across every host before moving to the next task,
+# so by the time the "authorize every node's key" task runs below, every node has
+# already published its own public key as a fact for the others to read via hostvars.
+
+- name: "Ensure {{ ssh_user }}'s .ssh directory exists"
+  file:
+    path: "/home/{{ ssh_user }}/.ssh"
+    state: directory
+    owner: "{{ ssh_user }}"
+    group: oinstall
+    mode: "0700"
+
+- name: "Generate an RSA keypair for {{ ssh_user }} if one doesn't exist yet"
+  # RSA, in legacy PEM encoding (-m PEM), NOT ed25519, and NOT the modern OpenSSH key
+  # format ssh-keygen produces by default since OpenSSH 7.8 (~2018). This is a real,
+  # confirmed requirement, not a style choice — gridSetup.sh's OWN internal SSH setup
+  # (a bundled Java library, distinct from the system `ssh` binary) fails to parse
+  # anything else, surfacing as [INS-06003]/PRCZ-2006/PRVG-11001 with a garbled
+  # "invalid privatekey: [B@<hash>" message (a raw Java byte-array toString(), i.e. the
+  # library read *something* but couldn't decode it as a key). The system `ssh`/`sshd`
+  # couldn't care less about key type — manual `ssh grid@peer` with an ed25519 key
+  # worked fine — this is specifically Oracle's own bundled SSH client being far more
+  # restrictive. See docs/known-risks.md #16.
+  become: true
+  become_user: "{{ ssh_user }}"
+  command: >
+    ssh-keygen -t rsa -b 2048 -m PEM -N '' -f /home/{{ ssh_user }}/.ssh/id_rsa
+    -C "{{ ssh_user }}@{{ inventory_hostname }}"
+  args:
+    creates: "/home/{{ ssh_user }}/.ssh/id_rsa"
+
+- name: "Read {{ ssh_user }}'s public key back so it can be shared with peer nodes"
+  slurp:
+    src: "/home/{{ ssh_user }}/.ssh/id_rsa.pub"
+  register: pubkey_slurp
+
+- name: "Publish {{ ssh_user }}'s public key as a fact (readable via hostvars on later tasks/hosts)"
+  set_fact:
+    ssh_equiv_pubkey: "{{ pubkey_slurp.content | b64decode | trim }}"
+
+- name: "Authorize every rac_nodes host's {{ ssh_user }} public key on this node (self included)"
+  lineinfile:
+    path: "/home/{{ ssh_user }}/.ssh/authorized_keys"
+    line: "{{ hostvars[item].ssh_equiv_pubkey }}"
+    create: true
+    owner: "{{ ssh_user }}"
+    group: oinstall
+    mode: "0600"
+  loop: "{{ groups['rac_nodes'] }}"
+  when: hostvars[item].ssh_equiv_pubkey is defined
+
+# PRIMARY fix for the host-key confirmation prompt: pre-populate this user's own
+# known_hosts from the system-wide scan main.yml already ran (keyscan_result is a
+# registered fact from this same host's execution, still readable here — no need to
+# re-run ssh-keyscan per user). This is what actually makes `ssh grid@peer` /
+# `ssh oracle@peer` silent, including gridSetup.sh's own bundled-but-separate SSH
+# client, which reads the OS-level known_hosts same as system ssh does.
+- name: "Pre-populate {{ ssh_user }}'s known_hosts (primary fix — replaces the StrictHostKeyChecking config approach below, which didn't reliably suppress the prompt; see main.yml's 2026-08-08 correction note)"
+  copy:
+    dest: "/home/{{ ssh_user }}/.ssh/known_hosts"
+    content: "{{ keyscan_result.stdout }}"
+    owner: "{{ ssh_user }}"
+    group: oinstall
+    mode: "0600"
+
+# SECONDARY, belt-and-suspenders only — NOT the actual fix (see comment above and
+# main.yml). Still worth keeping: these are lab nodes whose SSH HOST keys get
+# regenerated (`ssh-keygen -A`) every time golden-image-and-cloning.md clones a new
+# node from the golden image, which would otherwise make known_hosts stale until this
+# role re-runs. This config only takes effect when ssh is invoked WHILE LOGGED IN AS
+# {{ ssh_user }} (ssh reads the invoking user's own ~/.ssh/config, not the remote
+# target user's) — that's exactly why it never helped a manual `ssh grid@peer` typed
+# from a different login, and why the system-wide known_hosts copy in main.yml exists
+# too.
+- name: "Relax host-key checking for {{ ssh_user }} against RAC cluster nodes only (secondary safety net, lab convenience — not a production pattern)"
+  copy:
+    dest: "/home/{{ ssh_user }}/.ssh/config"
+    owner: "{{ ssh_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      Host {% for n in nodes %}{{ n.name }} {{ n.name }}.{{ domain }} {% endfor %}
+        StrictHostKeyChecking no
+        UserKnownHostsFile /dev/null
+
+- name: "Verify {{ ssh_user }} equivalence to every rac_nodes peer (non-fatal, informational)"
+  become: true
+  become_user: "{{ ssh_user }}"
+  command: "ssh -o BatchMode=yes -o ConnectTimeout=5 {{ item }} hostname"
+  loop: "{{ groups['rac_nodes'] }}"
+  register: ssh_equiv_check
+  changed_when: false
+  failed_when: false
+
+- name: "Show {{ ssh_user }} equivalence check results (all should say OK before running grid_install/db_install)"
+  debug:
+    msg: "{{ ssh_user }} -> {{ item.item }}: {{ 'OK' if item.rc == 0 else 'FAILED (rc=' ~ item.rc ~ ') — ' ~ item.stderr }}"
+  loop: "{{ ssh_equiv_check.results }}"

@@ -1,0 +1,137 @@
+---
+# BIND DNS for the cluster's own domain — nodes[0] (oradbserv05) is primary, nodes[1] (oradbserv06) secondary.
+# Adapted from the project's tested reference notes (see docs/network-and-hosts.md).
+# Gives SCAN real 3-IP round-robin resolution instead of the single static IP an
+# /etc/hosts-only design would provide. See docs/known-risks.md #12 for the
+# /etc/hosts-vs-DNS shadowing gotcha and the BIND zone-serial requirement.
+
+- name: Install BIND
+  yum:
+    name:
+      - bind
+      - bind-utils
+      - bind-libs
+    state: present
+
+# --- Primary (dns_master, e.g. oradbserv05) -----------------------------------
+
+- name: Ensure /var/named exists with correct group ownership
+  file:
+    path: /var/named
+    state: directory
+    group: named
+    mode: "0770"
+  when: inventory_hostname == dns_master
+
+- name: Render named.conf (primary)
+  template:
+    src: named.conf.primary.j2
+    dest: /etc/named.conf
+    owner: root
+    group: named
+    mode: "0640"
+  when: inventory_hostname == dns_master
+  notify: restart named
+
+- name: Render forward zone file
+  template:
+    src: zone.forward.j2
+    dest: "/var/named/{{ domain }}"
+    owner: root
+    group: named
+    mode: "0640"
+  when: inventory_hostname == dns_master
+  notify: restart named
+
+- name: Render reverse zone file
+  template:
+    src: zone.reverse.j2
+    dest: "/var/named/{{ domain }}.rev"
+    owner: root
+    group: named
+    mode: "0640"
+  when: inventory_hostname == dns_master
+  notify: restart named
+
+# --- Secondary (dns_secondary, e.g. oradbserv06) --------------------------------
+
+- name: Render named.conf (secondary)
+  template:
+    src: named.conf.secondary.j2
+    dest: /etc/named.conf
+    owner: root
+    group: named
+    mode: "0640"
+  when: inventory_hostname == dns_secondary
+  notify: restart named
+
+# --- Both nodes ----------------------------------------------------------------
+
+- name: SELinux context for /var/named (SELinux is disabled elsewhere in this lab, but set the real context anyway — harmless either way, see docs/known-risks.md #26)
+  command: restorecon -R /var/named
+  changed_when: false
+  when: inventory_hostname == dns_master
+
+- name: Check whether firewalld is even active (this project's minimal lab builds often don't have it running at all)
+  command: systemctl is-active firewalld
+  register: firewalld_active
+  changed_when: false
+  failed_when: false
+
+- name: "Open firewalld for DNS (port 53 tcp+udp) on the public zone (only if firewalld is actually running)"
+  command: "firewall-cmd --zone=public --add-service=dns --permanent"
+  register: fw_dns
+  changed_when: "'ALREADY_ENABLED' not in fw_dns.stdout"
+  failed_when: false
+  when: firewalld_active.stdout | trim == 'active'
+
+- name: Reload firewalld (only if firewalld is actually running)
+  command: firewall-cmd --reload
+  changed_when: false
+  when: firewalld_active.stdout | trim == 'active'
+
+- name: Note firewalld is not running (informational — nothing to reload if it's not managing anything)
+  debug:
+    msg: >
+      firewalld is {{ firewalld_active.stdout | trim }}, not active — skipped opening
+      the DNS service and reload. Not a gap in this lab (firewalld is permanently
+      disabled here); if that changes, `systemctl enable --now firewalld` and re-run
+      this role to open port 53.
+  when: firewalld_active.stdout | trim != 'active'
+
+- name: Enable and start named
+  systemd:
+    name: named
+    state: started
+    enabled: true
+
+- name: Point resolv.conf at both name servers (primary first)
+  copy:
+    dest: /etc/resolv.conf
+    content: |
+      # Managed by ansible role dns_bind
+      search {{ domain }}
+      nameserver {{ dns_master_ip }}
+      nameserver {{ nodes[1].public_ip if inventory_hostname == dns_master else nodes[0].public_ip }}
+    mode: "0644"
+
+- name: Ensure NetworkManager doesn't overwrite resolv.conf
+  copy:
+    dest: /etc/NetworkManager/conf.d/90-dns-none.conf
+    content: |
+      [main]
+      dns=none
+    mode: "0644"
+  notify: restart NetworkManager
+
+- name: Verify SCAN resolves to all 3 IPs round-robin (informational check, run from the primary NS)
+  command: "nslookup {{ scan_name }}.{{ domain }} 127.0.0.1"
+  register: scan_lookup
+  changed_when: false
+  failed_when: false
+  when: inventory_hostname == dns_master
+
+- name: Show SCAN lookup result
+  debug:
+    var: scan_lookup.stdout_lines
+  when: inventory_hostname == dns_master and scan_lookup is defined

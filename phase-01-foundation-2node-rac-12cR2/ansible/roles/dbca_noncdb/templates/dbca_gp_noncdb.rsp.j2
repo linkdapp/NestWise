@@ -1,0 +1,93 @@
+################################################################################
+# DBCA 12.2.0.1 silent response file — General Purpose template,
+# non-CDB target, 2-node RAC (admin-managed), ASM storage.
+#
+# CONFIRMED 2026-08-12 against a real run: NO bracketed section header (e.g.
+# "[CREATEDATABASE]") belongs anywhere in this file. DBCA's response-file parser
+# validates against an XML schema (rspfmt_dbca_response_schema_v12.2.0) even though
+# the file itself is plain key=value text — a stray "[CREATEDATABASE]" line breaks
+# that validation with [DBT-00108]/cvc-complex-type, dumping the full list of every
+# valid flat parameter name as its error message (confusing at first glance, but
+# that dump is just confirming the parser expected flat key=value pairs the whole
+# way through, nothing bracketed). A previous version of this template had that
+# line; a real, working reference response file for a similar RAC build has no such
+# section header anywhere, confirming it was never valid here either.
+#
+# CONFIRMED 2026-08-12, second finding from the same run: "useAutomaticMemoryManagement"
+# is not a real element in this schema either — only "automaticMemoryManagement" is.
+# It doesn't appear anywhere in a real, working 12.2 RAC dbca.rsp reference (oracle-base.com,
+# same responseFileVersion), and the validator only complained about it after already
+# accepting every earlier line in this file (including enableArchive, further up) — so
+# it really was this one stray duplicate-looking line, not a wider problem. Removed.
+################################################################################
+
+responseFileVersion=/oracle/assistants/rspfmt_dbca_response_schema_v12.2.0
+
+gdbName={{ db_name }}
+sid={{ sid_prefix }}
+templateName={{ db_template }}
+
+# non-CDB target — see ../../README.md "Why non-CDB in a 12.2 build"
+createAsContainerDatabase={{ 'true' if db_is_cdb else 'false' }}
+
+sysPassword={{ sys_password }}
+systemPassword={{ system_password }}
+dbsnmpPassword={{ sys_password }}
+
+characterSet={{ db_character_set }}
+nationalCharacterSet={{ db_national_character_set }}
+
+# RAC, admin-managed, both nodes
+nodelist={{ nodes | map(attribute='name') | join(',') }}
+
+storageType=ASM
+diskGroupName={{ asm_diskgroup_data }}
+recoveryGroupName={{ asm_diskgroup_reco }}
+datafileJarLocation={{ db_home }}/assistants/dbca/templates
+datafileDestination=+{{ asm_diskgroup_data }}
+recoveryAreaDestination=+{{ asm_diskgroup_reco }}
+enableArchive=true
+
+memoryPercentage={{ db_memory_percentage }}
+totalMemory=0
+
+# Online redo log multiplexing + sizing — OMF-driven, applies to every group DBCA
+# creates for this template (General_Purpose.dbc, both RAC threads):
+#   - db_create_online_log_dest_1/_2 (two destinations set) is what makes OMF
+#     multiplex every redo log member across both diskgroups automatically — one
+#     member per group lands in {{ asm_diskgroup_data }}, the other in
+#     {{ asm_diskgroup_reco }}. OMF generates the actual filenames itself
+#     (o1_mf_<group>_<unique>_.log under ONLINELOG/ in each diskgroup) rather than
+#     literal names like "1a"/"1b" — same multiplexing outcome, system-managed
+#     naming instead of hand-picked.
+#   - redoLogFileSize (top-level, MB) resizes every group the template creates —
+#     confirmed a genuine dbca.rsp parameter (used the same way in real 12.2
+#     response files), independent of templateName.
+# The template controls how many groups get created per thread (2 threads here,
+# admin-managed RAC) — not something this response file overrides directly.
+# dbca_noncdb's post-creation verification queries v$log/v$logfile to confirm the
+# actual result (group count, members, sizes) rather than assuming this produced
+# exactly the intended topology.
+redoLogFileSize=128
+
+# Explicit, not left to the General_Purpose.dbc template default — the corresponding
+# directory is created by this role on every RAC node before DBCA runs (a local
+# filesystem path, not ASM/CFS, so each node needs its own copy — DBCA validates
+# this exists and is writable up front and fails with DBT-06608 if not).
+initParams=audit_file_dest={{ oracle_base }}/admin/{{ db_unique_name }}/adump,db_create_online_log_dest_1=+{{ asm_diskgroup_data }},db_create_online_log_dest_2=+{{ asm_diskgroup_reco }}
+
+emConfiguration=NONE
+# false, not the template default true — this project's 12.2.0.1 DBCA bundles the
+# same CVU build that hard-fails a mandatory "CRS Integrity" check against 19c GI
+# during runInstaller (legacy crs_stat binary, genuinely absent from a 19c
+# GRID_HOME — see docs/known-risks.md #37). DBCA's own CVU checks would hit the
+# same false positive; cluster health is already confirmed independently via
+# crsctl before this role even runs (the "Confirm the cluster is up" task above).
+runCVUChecks=false
+
+sampleSchema=false
+databaseType=MULTIPURPOSE
+
+automaticMemoryManagement=false
+
+listeners=LISTENER

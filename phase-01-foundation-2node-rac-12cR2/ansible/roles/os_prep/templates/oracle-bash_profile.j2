@@ -1,0 +1,47 @@
+# Managed by Ansible — os_prep role, template oracle-bash_profile.j2. Local edits
+# will be overwritten on the next `ansible-playbook site.yml --tags os_prep` run;
+# change this file in git, not by hand-editing /home/{{ oracle_user }}/.bash_profile.
+
+# User specific environment and startup programs
+PATH=$PATH:$HOME/.local/bin:$HOME/bin
+export PATH
+
+export ORACLE_HOSTNAME={{ inventory_hostname }}.{{ domain }}
+export ORACLE_BASE={{ oracle_base }}
+export DB_HOME={{ db_home }}
+export ORACLE_HOME=$DB_HOME
+export ORACLE_SID={{ sid_prefix }}{{ (nodes | map(attribute='name') | list).index(inventory_hostname) + 1 }}
+export ORACLE_UNQNAME={{ db_unique_name }}
+export ORATAB=/etc/oratab
+export TNS_ADMIN=$ORACLE_HOME/network/admin
+
+export PATH=$ORACLE_HOME/bin:$ORACLE_HOME/OPatch:/usr/bin:/usr/sbin:/bin:/sbin:/usr/bin/X11:/usr/local/bin
+export LD_LIBRARY_PATH=$ORACLE_HOME/lib:$ORACLE_HOME/oracm/lib:/lib:/usr/lib:/usr/local/lib
+export CLASSPATH=$ORACLE_HOME/JRE:$ORACLE_HOME/jlib:$ORACLE_HOME/rdbms/jlib:$ORACLE_HOME/network/jlib
+
+export TMP=/tmp
+export TMPDIR=$TMP
+
+########## End of Oracle variables ##########
+
+# Prompt: hostname-user-ORACLE_SID, e.g. oradbserv05-oracle-usat1$
+# ${ORACLE_SID} is escaped (not $ORACLE_SID) so bash re-expands it on every prompt draw,
+# not just once when this file is sourced — picks up a changed SID after `. oraenv`.
+export PS1="\h-\u-\${ORACLE_SID}\$ "
+
+##### Aliases ########
+alias tns='cd $ORACLE_HOME/network/admin'
+alias alertlog="vi $ORACLE_BASE/diag/rdbms/{{ db_unique_name | lower }}/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log"
+alias tailalert="echo -e \"\n\nTailing $ORACLE_BASE/diag/rdbms/{{ db_unique_name | lower }}/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log\n\n\"; tail -f $ORACLE_BASE/diag/rdbms/{{ db_unique_name | lower }}/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log"
+
+# Full OS-user switch to grid — passwordless via /etc/sudoers.d/11-oracle-grid (os_prep
+# role). Prefer this over sourcing grid's env vars into an oracle session: crsctl/srvctl
+# against OCR/voting disks need to run as the actual grid OS identity, not just with
+# grid's env vars borrowed by a different user — see docs/known-risks.md.
+alias su2grid='sudo -iu {{ grid_user }}'
+
+############ Change Control #############################
+# 1. Make a backup of this file before making any changes.
+# 2. Record all changes made to this file in this format:
+#    Date Time: Name: Reason for the change.
+# 3. This file is Ansible-managed (os_prep role) — prefer editing the template in git.

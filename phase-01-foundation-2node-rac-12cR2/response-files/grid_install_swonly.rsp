@@ -1,0 +1,42 @@
+################################################################################
+# Standalone, edit-and-run copy of the Grid Infrastructure PHASE A (software-only)
+# response file, for people who aren't running the Ansible layer. This is the
+# RENDERED shape of
+# ansible/roles/grid_silent_install/templates/grid_install_swonly.rsp.j2 with the
+# values from ansible/group_vars/all.yml substituted in.
+#
+# This project uses a two-phase model rather than a single-shot CRS_CONFIG
+# install — see ../docs/patching-strategy.md "Mechanism 2" for why. This file
+# stages GRID_HOME on both nodes and registers the central inventory — it does
+# NOT configure the cluster.
+# The companion Phase B file (grid_install.rsp, same directory) configures the
+# cluster afterward, via config.sh, once this phase's orainstRoot.sh/root.sh have
+# both completed.
+################################################################################
+
+oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v19.0.0
+
+INVENTORY_LOCATION=/u01/app/oraInventory
+
+# Software-only — cluster configuration happens later, via config.sh + grid_install.rsp.
+oracle.install.option=CRS_SWONLY
+
+ORACLE_BASE=/u01/app/oracle
+oracle.install.asm.OSDBA=asmdba
+oracle.install.asm.OSOPER=asmoper
+oracle.install.asm.OSASM=asmadmin
+
+# OUI still needs the node list to know where to copy GRID_HOME during a
+# software-only install. VIP names are included for node:vip schema-format
+# consistency even though VIPs aren't actually configured until Phase B.
+oracle.install.crs.config.clusterNodes=oradbserv05:oradbserv05-vip,oradbserv06:oradbserv06-vip
+
+# Not managing GI itself via Cloud Control/OEM at this phase.
+oracle.install.config.managementOption=NONE
+
+# Run as:
+#   $GRID_HOME/gridSetup.sh -silent -applyRU <patch_dir> -responseFile grid_install_swonly.rsp
+# Then, in order: orainstRoot.sh + root.sh on oradbserv05, then oradbserv06 — in
+# CRS_SWONLY mode these register the inventory/set ownership, they do NOT form the
+# cluster yet. See ../ansible/roles/grid_silent_install/tasks/main.yml and the
+# companion grid_install.rsp for Phase B.

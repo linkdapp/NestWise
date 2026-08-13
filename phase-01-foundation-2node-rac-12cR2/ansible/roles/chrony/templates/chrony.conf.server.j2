@@ -1,0 +1,15 @@
+# Managed by ansible role chrony — local time master ({{ chrony_master_hostname }})
+# No public pool servers: this lab doesn't depend on internet NTP.
+
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+
+# Allow the RAC subnet to sync from this host
+allow 192.168.56.0/24
+
+# Serve time even if not itself synchronized to an external source
+local stratum 10
+
+keyfile /etc/chrony.keys
+logdir /var/log/chrony

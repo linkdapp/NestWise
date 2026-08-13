@@ -1,0 +1,527 @@
+---
+# Silent Grid Infrastructure install — GI is 19.0.0 (19.3 base + RU 19.24), NOT
+# 12.2.0.1. This is a deliberate, independent-version design (GI and DB homes are
+# fully independent, a normal supported Oracle pattern) — see docs/known-risks.md
+# #2 for the reasoning (see db_silent_install for the 12.2.0.1 database layer
+# installed on top of this clusterware separately). Patched during
+# install via -applyRU (docs/patching-strategy.md mechanism 1). Root scripts are
+# deliberately left as a manual, called-out step — cluster-formation output on node 2
+# is worth watching interactively the first time, and CRS root scripts have to run in
+# a specific node order this role does not enforce.
+#
+# TWO-PHASE AS OF 2026-08-09 — this role used to run a single gridSetup.sh call with
+# oracle.install.option=CRS_CONFIG (stage software + configure the cluster together).
+# Switched to Oracle's own two-phase model instead — Phase A stages software only
+# (CRS_SWONLY), then Phase B configures the already-staged cluster via config.sh —
+# because a real manual run using two-phase is what actually got a live install past
+# INS-32022/INS-32047 cleanly (single-shot CRS_CONFIG produces those same warnings;
+# they're non-fatal either way, but two-phase is now confirmed working end-to-end and
+# single-shot wasn't re-verified after the switch). See docs/patching-strategy.md
+# "Mechanism 2" (this was already documented as a fallback, just not previously the
+# default). VERIFY the config.sh invocation below against the current 19c
+# Grid Infrastructure Installation Guide before a real run — this project's persona
+# rule is to say so rather than guess: config.sh's exact flag set has not been
+# independently confirmed against Oracle docs the way the rest of this file's
+# citations have been, only inferred from Oracle's documented "software-only install,
+# then configure separately" workflow description.
+#
+# TAGS, RENAMED 2026-08-09 — the whole role still runs end to end under
+# --tags grid_infrastructure (set in site.yml), but that name was deliberately
+# changed from the old --tags grid_install: most of a first run under the old name
+# was staging/unzipping, not "installing" anything, which was genuinely misleading —
+# a real question this project got asked. Below, each stage also carries its OWN tag
+# (grid_stage / grid_install_software / grid_configure_cluster / grid_storage) so you
+# can see and target exactly which stage you're in. These sub-tags are for RE-RUNS
+# and targeted troubleshooting, not first-time standalone use — running
+# --tags grid_configure_cluster alone before grid_stage/grid_install_software have
+# ever completed will fail, since nothing will have staged or installed the software
+# yet. The normal workflow is still: run --tags grid_infrastructure, let it walk
+# through however far it gets, do the manual root.sh step it asks for, then re-run
+# the SAME --tags grid_infrastructure command — the idempotency guards below (and in
+# the sub-tag blocks) make already-done stages no-ops, so the play "falls through" to
+# wherever it actually left off. See docs/known-risks.md #14 for the full mechanics.
+
+- name: "Stage GI software: extract, update OPatch, sanity-check with cluvfy"
+  tags: [grid_stage]
+  block:
+    - name: Render grid_install_swonly.rsp (Phase A — software-only)
+      template:
+        src: grid_install_swonly.rsp.j2
+        dest: "{{ staging_dir }}/response-files/grid_install_swonly.rsp"
+        owner: "{{ grid_user }}"
+        group: oinstall
+        mode: "0600"
+      run_once: true          # only invoked on the node gridSetup.sh actually runs from — see below
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    # --- Software staging: node 1 (the first host in rac_nodes) only ---
+    # This matches real Oracle behavior, not just this project's staging choice: OUI
+    # copies GRID_HOME to every node listed in the response file's clusterNodes
+    # parameter over the grid user's SSH equivalence as part of a single gridSetup.sh
+    # run (that copy happens later, during Phase A below — not during this staging
+    # block) — you don't stage software or invoke the installer separately on node 2.
+    # Running these tasks against both nodes independently (the previous behavior
+    # here) would either fail outright on node 2 (no local zip staged there) or,
+    # worse, attempt a second, conflicting cluster-install invocation. root.sh below
+    # is the opposite case — that genuinely has to run per node, so it isn't run_once.
+
+    - name: Ensure grid_home exists and is owned by the grid user
+      file:
+        path: "{{ grid_home }}"
+        state: directory
+        owner: "{{ grid_user }}"
+        group: oinstall
+        mode: "0775"
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Extract Grid Infrastructure software into grid_home
+      unarchive:
+        src: "{{ gi_software_zip }}"
+        dest: "{{ grid_home }}"
+        remote_src: true
+        owner: "{{ grid_user }}"
+        group: oinstall
+      args:
+        creates: "{{ grid_home }}/gridSetup.sh"
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    # --- cvuqdisk: cluvfy's own prereq package, required on BOTH nodes ------------
+    # PRVG-11550 : Package "cvuqdisk" is missing — see docs/known-risks.md #7. This
+    # is a genuinely different problem from
+    # everything else staged in this block: it's not GI software, it's a small OS
+    # package that cluvfy itself checks for and that gridSetup.sh's own root scripts
+    # also expect to already be present. It only exists inside the media that was
+    # just extracted (grid_home/cv/rpm/), so it has to be handled right here — after
+    # extraction, before the cluvfy sanity check below (which is exactly what fails
+    # without it) and before OPatch, per the order this was actually discovered in.
+    # Unlike everything else in this block, this is NOT run_once/delegate_to node1 —
+    # cvuqdisk is a real per-node OS package (rpm -q has to succeed independently on
+    # each node), so these tasks run against both hosts normally.
+    - name: "Fetch cvuqdisk RPM from node1's just-extracted media to the Ansible control node"
+      fetch:
+        src: "{{ grid_home }}/cv/rpm/{{ cvuqdisk_rpm_filename }}"
+        dest: "/tmp/{{ cvuqdisk_rpm_filename }}"
+        flat: true
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Stage the cvuqdisk RPM into this node's staging directory
+      copy:
+        src: "/tmp/{{ cvuqdisk_rpm_filename }}"
+        dest: "{{ staging_dir }}/{{ cvuqdisk_rpm_filename }}"
+        owner: "{{ grid_user }}"
+        group: oinstall
+        mode: "0644"
+
+    - name: Check whether cvuqdisk is already installed on this node
+      command: rpm -q cvuqdisk
+      register: cvuqdisk_check
+      changed_when: false
+      failed_when: false
+
+    - name: "Install cvuqdisk (required for cluvfy's package check, PRVG-11550)"
+      command: "rpm -ivh {{ staging_dir }}/{{ cvuqdisk_rpm_filename }}"
+      environment:
+        CVUQDISK_GRP: oinstall
+      register: cvuqdisk_install
+      changed_when: true    # only ever reached (see `when:`) when cvuqdisk wasn't already installed
+      when: cvuqdisk_check.rc != 0
+
+    # OPatch (MOS 6880880) is NOT the RU — it's the patching tool itself, and the
+    # RU's -applyRU frequently requires a newer OPatch than what shipped in the base
+    # 19.3 media. Unzip it straight into grid_home, overwriting the bundled OPatch/,
+    # before gridSetup.sh runs -applyRU in the next block. Same reasoning as
+    # everything else here: OUI propagates the whole grid_home (including this
+    # updated OPatch/) to node 2 during the install, so this only needs to happen
+    # once, on node 1.
+    - name: Confirm the GI OPatch zip is staged (downloaded from MOS out-of-band, patch 6880880 filtered to release 19.0.0.0.0)
+      stat:
+        path: "{{ gi_opatch_zip }}"
+      register: gi_opatch_zip_stat
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Fail with a clear message if the GI OPatch zip isn't staged yet
+      fail:
+        msg: >
+          Expected {{ gi_opatch_zip }} — download OPatch (MOS patch 6880880) filtered to
+          the Grid Infrastructure 19.0.0.0.0 release and place it there before this role
+          can update OPatch ahead of -applyRU.
+      when: not gi_opatch_zip_stat.stat.exists
+      run_once: true
+
+    - name: Update OPatch in grid_home from MOS patch 6880880 (required before -applyRU, not part of the RU itself)
+      unarchive:
+        src: "{{ gi_opatch_zip }}"
+        dest: "{{ grid_home }}"
+        remote_src: true
+        owner: "{{ grid_user }}"
+        group: oinstall
+      # No `creates:` guard here on purpose — unlike the base software zip (a
+      # one-time extraction into an empty home), re-running this should overwrite
+      # OPatch/ every time in case gi_opatch_zip gets updated to a newer OPatch
+      # later; unarchive's own checksum-diff behavior already keeps a no-op re-run
+      # cheap.
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Run cluvfy pre-crsinst sanity check (informational, non-fatal)
+      # Fresh-install form, not the -upgrade -rolling -src_crshome/-dest_crshome
+      # form used for an actual GI version upgrade — there's no existing CRS home
+      # here to upgrade from. runcluvfy.sh ships inside grid_home itself, so this
+      # only becomes runnable once the software extraction above has completed;
+      # running it here, right after staging and before -applyRU, mirrors the
+      # "always sanity-check what you just staged before touching OPatch/applying
+      # anything" habit. Non-fatal on purpose — cluvfy commonly reports warnings
+      # (e.g. swap size, RPM guidance) that don't actually block a real install;
+      # read the output rather than gating the play on its return code.
+      become: true
+      become_user: "{{ grid_user }}"
+      command: >
+        {{ grid_home }}/runcluvfy.sh stage -pre crsinst
+        -n {{ groups['rac_nodes'] | join(',') }}
+        -verbose
+      register: cluvfy_result
+      changed_when: false
+      failed_when: false
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Show cluvfy pre-crsinst output (review before proceeding to -applyRU)
+      debug:
+        var: cluvfy_result.stdout_lines
+      run_once: true
+
+    # --- GATE: don't silently fall through into Phase A without a human looking ----
+    # ADDED 2026-08-10, made UNCONDITIONAL 2026-08-10 — a real gap: cluvfy_result was
+    # registered but nothing ever read its rc, so a run where CVU itself reported
+    # "Pre-check for cluster services setup was unsuccessful" (real PRVF/PRVG
+    # failures, not the swap-size/RPM-guidance style warnings this task is meant to
+    # tolerate) still fell straight through into gridSetup.sh in the same play —
+    # exactly the scenario this task's own "review before proceeding" comment above
+    # was supposed to prevent, but nothing actually enforced. First fix only paused
+    # when cluvfy_result.rc != 0 (CVU's own non-zero exit code on a real FAIL) — an
+    # explicit, deliberate choice: **always** stop here for confirmation, on a clean
+    # pass too, not just a FAIL. -applyRU/gridSetup.sh is expensive and not
+    # trivially reversible; a human should see the actual cluvfy result — pass or
+    # fail — and explicitly say "continue" every single time, not just when
+    # something already looks broken. Same reasoning `grid_stage` re-running cluvfy
+    # on every `--tags grid_infrastructure` invocation already implies: this check
+    # is meant to be looked at each time, not rubber-stamped.
+    - name: Report cluvfy pre-crsinst status
+      debug:
+        msg: >
+          cluvfy pre-crsinst {{ 'reported real failures (see stdout above) — DO NOT
+          proceed to -applyRU/gridSetup.sh until these are understood and fixed.
+          Common real causes here: stale/incomplete /tmp/CVU_19.0.0.0.0_grid on a
+          node from a previous interrupted cluvfy run, or a genuine OS baseline gap
+          verify_baseline should also have caught (see docs/known-risks.md #7).' if
+          cluvfy_result.rc != 0 else 'passed cleanly (rc 0).' }}
+      run_once: true
+
+    - name: "PAUSE — confirm cluvfy result before proceeding to -applyRU/gridSetup.sh"
+      # Unconditional — reached every time this block runs, regardless of
+      # cluvfy_result.rc. See the comment above for why a clean pass isn't
+      # auto-continued either.
+      pause:
+        prompt: >
+          cluvfy pre-crsinst has finished (see the status line and full output
+          above — {{ 'FAILURES were reported' if cluvfy_result.rc != 0 else 'reported
+          a clean pass' }}). Review it now. Press ENTER to proceed to -applyRU/
+          gridSetup.sh, or Ctrl+C to abort and investigate first — re-running
+          --tags grid_infrastructure afterward will re-run this same cluvfy check
+          before trying gridSetup.sh again.
+      run_once: true
+
+- name: "Phase A — install GI software (gridSetup.sh, CRS_SWONLY, patched via -applyRU)"
+  tags: [grid_install_software]
+  block:
+    # --- IDEMPOTENCY GUARD: has Phase A already completed? ------------------------
+    # Central inventory.xml records every Oracle home OUI has ever registered — a
+    # HOME entry with LOC="{{ grid_home }}" means gridSetup.sh's CRS_SWONLY pass
+    # already ran successfully. This is a real, native Oracle record, not a marker
+    # file invented for this project, so it's a reliable signal to skip re-invoking
+    # gridSetup.sh on a repeat run. ADDED 2026-08-09 — this used to be an open
+    # "HONEST CAVEAT" in this file (re-running the whole play after Phase A
+    # completed would re-run gridSetup.sh with no guard at all); resolved now
+    # rather than left as a documented gap.
+    - name: "Check whether Phase A (software-only install) has already completed"
+      command: >
+        grep -q 'LOC="{{ grid_home }}"' {{ inventory_loc }}/ContentsXML/inventory.xml
+      register: phase_a_inventory_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Report Phase A status
+      debug:
+        msg: >
+          Phase A (software-only install) {{ 'already completed — grid_home is registered
+          in the central inventory. Skipping gridSetup.sh re-invocation.' if
+          phase_a_inventory_check.rc == 0 else 'not yet done — running gridSetup.sh now.' }}
+      run_once: true
+
+    - name: "Run gridSetup.sh silently (software-only, CRS_SWONLY), patched via -applyRU"
+      become: true
+      become_user: "{{ grid_user }}"
+      when: phase_a_inventory_check.rc != 0
+      command: >
+        {{ grid_home }}/gridSetup.sh -silent
+        -applyRU {{ gi_ru_patch_path }}
+        -responseFile {{ staging_dir }}/response-files/grid_install_swonly.rsp
+        {{ '-ignorePrereq -ignoreSysPrereqs' if use_ignore_prereq else '' }}
+      register: gridsetup_result
+      failed_when: gridsetup_result.rc not in [0, 6]   # 6 = success with config actions pending (root scripts)
+      changed_when: gridsetup_result.rc == 0
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Show gridSetup.sh output (contains the orainstRoot.sh/root.sh command sequence to run)
+      debug:
+        var: gridsetup_result.stdout_lines
+      when: phase_a_inventory_check.rc != 0
+      run_once: true
+
+    - name: "STOP — manual step required (software-only root scripts)"
+      debug:
+        msg: >
+          gridSetup.sh has laid down and patched the software on every node (CRS_SWONLY —
+          no cluster configuration has happened yet). Now, in this exact order: run
+          orainstRoot.sh then root.sh on {{ hostvars[groups['rac_nodes'][0]].inventory_hostname }}
+          first, then the same two scripts on {{ hostvars[groups['rac_nodes'][1]].inventory_hostname }}.
+          Do not run them concurrently on both nodes. In CRS_SWONLY mode these scripts
+          register the central inventory and set ownership/permissions — they do NOT form
+          the cluster yet (no CRS, no ASM). Once both nodes are done, re-run
+          --tags grid_infrastructure to continue into the next stage
+          (--tags grid_configure_cluster, config.sh), which is what actually
+          configures and starts the cluster. This is intentionally not automated as
+          a single unattended run — root scripts and their node order are worth
+          watching interactively the first time through.
+      when: phase_a_inventory_check.rc != 0
+      run_once: true
+
+    - name: "PAUSE — do not proceed to cluster configuration until Phase A root scripts have actually run"
+      # Only reached on a run that actually just did Phase A (guarded by the same
+      # when: as the STOP message above) — on a repeat run where Phase A was
+      # already complete, this is skipped too, so re-running the whole play once
+      # everything is done doesn't sit here waiting on a pointless ENTER press.
+      # Still a real fix for a real bug (2026-08-09): the STOP debug task above is
+      # just a message — Ansible does NOT stop executing after a `debug` task on
+      # its own. Without this `pause`, a single grid_infrastructure invocation on a
+      # genuinely fresh run would print that message and immediately fall through
+      # to config.sh (the next stage) in the SAME run, before orainstRoot.sh/root.sh
+      # have actually been run by hand.
+      pause:
+        prompt: >
+          Press ENTER once orainstRoot.sh + root.sh have completed on BOTH nodes (node1
+          first, then node2 — see the message above). Ctrl+C to abort and go run them now.
+      when: phase_a_inventory_check.rc != 0
+      run_once: true
+
+- name: "Phase B — configure the GI cluster (config.sh: ASM diskgroup, OCR/voting, GIMR, SCAN/network)"
+  tags: [grid_configure_cluster]
+  block:
+    # Oracle's documented second half of a software-only install: config.sh, located
+    # under GRID_HOME/crs/config, reads a CRS_CONFIG-option response file and
+    # performs the actual cluster configuration that Phase A's CRS_SWONLY install
+    # deliberately skipped. Only makes sense to run once Phase A's
+    # orainstRoot.sh/root.sh have completed on both nodes.
+    #
+    # grid_install.rsp is rendered by Ansible from grid_install.rsp.j2, not
+    # hand-edited or copied from an OUI-saved file — this project explicitly plans
+    # to reuse this role for the standby cluster (standby_nodes/standby_cluster_name/
+    # standby_scan_name already exist in group_vars/all.yml), and only
+    # Ansible-templated generation from group_vars extends to that build for free.
+    # See docs/known-risks.md #10 for the response-file fields worth getting right.
+    - name: Render grid_install.rsp (used by config.sh below)
+      template:
+        src: grid_install.rsp.j2
+        dest: "{{ staging_dir }}/response-files/grid_install.rsp"
+        owner: "{{ grid_user }}"
+        group: oinstall
+        mode: "0600"          # contains SYSASM password
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    # --- IDEMPOTENCY GUARD: has Phase B already completed? ------------------------
+    # `crsctl check crs` succeeding (rc 0) means CRS is fully up and configured —
+    # the cluster only reaches that state once config.sh AND Phase B's root.sh have
+    # both completed. Real, native signal (not an invented marker file), and the
+    # more important of the two guards in this role to have: re-running config.sh
+    # against an ALREADY-configured, live cluster is the riskier gap (ASM
+    # diskgroup/OCR/voting already exist at that point; config.sh isn't designed to
+    # be re-run against that state) — ADDED 2026-08-09, resolves the "HONEST
+    # CAVEAT" this file used to carry about config.sh having no guard at all. Safe
+    # to run even when Phase A hasn't completed yet or crsctl doesn't exist yet —
+    # `failed_when: false` just registers a non-zero rc either way, which this
+    # guard correctly reads as "not done."
+    - name: "Check whether Phase B (cluster configuration) has already completed"
+      command: "{{ grid_home }}/bin/crsctl check crs"
+      register: phase_b_crs_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Report Phase B status
+      debug:
+        msg: >
+          Phase B (cluster configuration) {{ 'already completed — crsctl check crs
+          succeeded. Skipping config.sh re-invocation.' if phase_b_crs_check.rc == 0 else
+          'not yet done (or CRS not fully up yet) — running config.sh now.' }}
+      run_once: true
+
+    - name: "Run config.sh silently to configure the cluster"
+      become: true
+      become_user: "{{ grid_user }}"
+      command: >
+        {{ grid_home }}/crs/config/config.sh -silent
+        -responseFile {{ staging_dir }}/response-files/grid_install.rsp
+        {{ '-ignorePrereq -ignoreSysPrereqs' if use_ignore_prereq else '' }}
+      register: configsh_result
+      failed_when: configsh_result.rc not in [0, 6]   # 6 = success with config actions pending (root.sh again)
+      changed_when: configsh_result.rc == 0
+      when: phase_b_crs_check.rc != 0
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Show config.sh output (contains the root.sh command sequence that actually forms the cluster)
+      debug:
+        var: configsh_result.stdout_lines
+      when: phase_b_crs_check.rc != 0
+      run_once: true
+
+    - name: "STOP — manual step required (cluster-forming root.sh)"
+      debug:
+        msg: >
+          config.sh has generated cluster configuration. Now, in this exact order: run
+          root.sh on {{ hostvars[groups['rac_nodes'][0]].inventory_hostname }} first, then
+          on {{ hostvars[groups['rac_nodes'][1]].inventory_hostname }}. Do not run them
+          concurrently. THIS is the root.sh run that actually forms the cluster (CRS,
+          ASM instance, OCR/voting) — watch node 2's cluster-join output interactively the
+          first time through, same reasoning as always for root scripts in this role. Once
+          both nodes are done, re-run --tags grid_infrastructure once more to pick up
+          the storage stage (--tags grid_storage: DATA02/RECO01 diskgroup creation and
+          OCR multiplexing, idempotent — skips whichever diskgroup/OCR location
+          already exists).
+      when: phase_b_crs_check.rc != 0
+      run_once: true
+
+    - name: "PAUSE — do not proceed to storage tasks until Phase B root.sh has actually formed the cluster"
+      # Same real gap as Phase A's pause above — without this, a single run that
+      # just did config.sh would try `asmcmd`/`asmca`/`ocrcheck` against a cluster
+      # that doesn't exist yet. Guarded the same way — skipped entirely on a repeat
+      # run where Phase B was already complete (crsctl check crs already passing),
+      # so this doesn't sit waiting on a pointless ENTER press once the cluster is
+      # fully up; the storage stage below has its own idempotency checks
+      # regardless.
+      pause:
+        prompt: >
+          Press ENTER once root.sh has completed on BOTH nodes (node1 first, then node2 —
+          see the message above) and the cluster is actually up. Ctrl+C to abort and go
+          run them now.
+      when: phase_b_crs_check.rc != 0
+      run_once: true
+
+- name: "Storage: DATA02/RECO01 diskgroups + OCR multiplexing (requires the cluster already up)"
+  tags: [grid_storage]
+  block:
+    # gridSetup.sh's response file only creates DATA01 (needed to bring the cluster
+    # up at all — hosts OCR/voting). DATA02 and RECO01 both need the cluster already
+    # online, so they're created here via asmca instead — re-run
+    # --tags grid_infrastructure (or just --tags grid_storage, once the cluster is
+    # confirmed up) once root.sh/resume is done; every task below is idempotent and
+    # skips whichever diskgroup/OCR location already exists.
+
+    - name: Check whether DATA02 diskgroup already exists (idempotency)
+      become: true
+      become_user: "{{ grid_user }}"
+      command: "{{ grid_home }}/bin/asmcmd lsdg {{ asm_diskgroup_data02 }}"
+      register: data02_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Create the DATA02 diskgroup via asmca (only if it doesn't exist yet and the cluster is up)
+      become: true
+      become_user: "{{ grid_user }}"
+      command: >
+        {{ grid_home }}/bin/asmca -silent -createDiskGroup
+        -diskGroupName {{ asm_diskgroup_data02 }}
+        -redundancy {{ asm_redundancy }}
+        {% for d in asm_diskgroup_data02_disks %}-disk '/dev/disk/by-label/{{ d }}' {% endfor %}
+      when: data02_check.rc != 0
+      register: data02_create
+      run_once: true
+
+    - name: Show DATA02 diskgroup creation output
+      debug:
+        var: data02_create.stdout_lines
+      when: data02_check.rc != 0
+      run_once: true
+
+    # --- OCR multiplexing to DATA02 -------------------------------------------
+    # Real OCR redundancy (up to 5 locations, `ocrconfig -add`/`-delete`) — NOT the
+    # same thing as voting-disk redundancy, which can't span diskgroups this way
+    # (see the voting-disk comment block in group_vars/all.yml). DATA01 already
+    # holds the primary OCR copy automatically (set at install time via the
+    # response file); this adds a second, independent copy in DATA02 now that it
+    # exists. Requires the diskgroup to already exist, so this has to run after
+    # DATA02 creation above, not before.
+
+    - name: Check current OCR configuration (idempotency)
+      become: true
+      command: "{{ grid_home }}/bin/ocrcheck"
+      register: ocrcheck_before
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Multiplex OCR to DATA02 (only if it isn't already configured there)
+      become: true
+      command: "{{ grid_home }}/bin/ocrconfig -add +{{ asm_diskgroup_data02 }}"
+      when: "('+' ~ asm_diskgroup_data02) not in ocrcheck_before.stdout"
+      register: ocr_add_result
+      run_once: true
+
+    - name: Show OCR configuration after multiplexing
+      become: true
+      command: "{{ grid_home }}/bin/ocrcheck"
+      register: ocrcheck_after
+      changed_when: false
+      run_once: true
+
+    - name: Show OCR configuration (confirm both +DATA01 and +DATA02 are listed)
+      debug:
+        var: ocrcheck_after.stdout_lines
+      run_once: true
+
+    - name: Check whether RECO01 diskgroup already exists (idempotency)
+      become: true
+      become_user: "{{ grid_user }}"
+      command: "{{ grid_home }}/bin/asmcmd lsdg {{ asm_diskgroup_reco }}"
+      register: reco_check
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Create the RECO01 diskgroup via asmca (only if it doesn't exist yet and the cluster is up)
+      become: true
+      become_user: "{{ grid_user }}"
+      command: >
+        {{ grid_home }}/bin/asmca -silent -createDiskGroup
+        -diskGroupName {{ asm_diskgroup_reco }}
+        -redundancy {{ asm_redundancy }}
+        {% for d in asm_diskgroup_reco_disks %}-disk '/dev/disk/by-label/{{ d }}' {% endfor %}
+      when: reco_check.rc != 0
+      register: reco_create
+      run_once: true
+
+    - name: Show RECO01 diskgroup creation output
+      debug:
+        var: reco_create.stdout_lines
+      when: reco_check.rc != 0
+      run_once: true

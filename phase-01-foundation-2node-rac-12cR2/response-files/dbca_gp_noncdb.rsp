@@ -1,0 +1,69 @@
+################################################################################
+# Standalone, edit-and-run copy of the DBCA response file — General Purpose
+# template, non-CDB, 2-node RAC, ASM. Rendered shape of
+# ansible/roles/dbca_noncdb/templates/dbca_gp_noncdb.rsp.j2, with that template's
+# Jinja variables substituted for their real group_vars/all.yml values (db name
+# apexdb, diskgroups DATA01/RECO01) — kept in sync as of this project's
+# docs/known-risks.md #37/#39/#40/#41/#42/#43/#44 fixes.
+#
+# CAVEAT: validate field names against the real dbca.rsp.dbt shipped at
+# $ORACLE_HOME/assistants/dbca/templates/ for this exact patch level before trusting
+# this file over a fresh Ansible-rendered one.
+################################################################################
+
+responseFileVersion=/oracle/assistants/rspfmt_dbca_response_schema_v12.2.0
+
+gdbName=apexdb
+sid=apexdb
+templateName=General_Purpose.dbc
+
+# non-CDB — see ../README.md "Why non-CDB in a 12.2 build". Flip to true
+# (and add PDB params) if the intent is CDB/PDB from day one instead.
+createAsContainerDatabase=false
+
+sysPassword=<VAULT_THIS>
+systemPassword=<VAULT_THIS>
+dbsnmpPassword=<VAULT_THIS>
+
+characterSet=AL32UTF8
+nationalCharacterSet=AL16UTF16
+
+nodelist=oradbserv05,oradbserv06
+
+storageType=ASM
+diskGroupName=DATA01
+recoveryGroupName=RECO01
+datafileJarLocation=/u01/app/oracle/product/12.2.0/db_1/assistants/dbca/templates
+datafileDestination=+DATA01
+recoveryAreaDestination=+RECO01
+enableArchive=true
+
+memoryPercentage=40
+totalMemory=0
+
+# Online redo log multiplexing (2 members/group, one in DATA01 one in RECO01, via
+# OMF) + resizing to 128MB — see known-risks.md #40 for the mechanism.
+redoLogFileSize=128
+
+# audit_file_dest must exist and be writable on every RAC node before DBCA runs
+# (DBT-06608 otherwise — known-risks.md #39). db_create_online_log_dest_1/_2 is what
+# actually drives the redo multiplexing above.
+initParams=audit_file_dest=/u01/app/oracle/admin/apexdb/adump,db_create_online_log_dest_1=+DATA01,db_create_online_log_dest_2=+RECO01
+
+emConfiguration=NONE
+# false, not true — this 12.2.0.1 DBCA's bundled CVU hard-fails a false-positive
+# "CRS Integrity" check against 19c GI (known-risks.md #37); cluster health is
+# already confirmed independently via crsctl before DBCA ever runs.
+runCVUChecks=false
+
+sampleSchema=false
+databaseType=MULTIPURPOSE
+
+automaticMemoryManagement=false
+
+listeners=LISTENER
+
+# Run from oradbserv05 only, as the oracle software owner (ORACLE_HOME=/u01/app/oracle/product/12.2.0/db_1):
+#   dbca -silent -createDatabase -responseFile dbca_gp_noncdb.rsp
+# Verify cluster is ONLINE (crsctl stat res -t) before running — see
+# ../ansible/roles/dbca_noncdb/tasks/main.yml.

@@ -1,0 +1,151 @@
+---
+# ASMLib setup — classic ASMLib v2: a real kmod-oracleasm kernel module, a real
+# oracleasmfs mount at /dev/oracleasm, and real /dev/oracleasm/disks/<LABEL> device
+# nodes. Confirmed against a real, previously successful OL7 install
+# (`oracleasm status`/`lsmod | grep oracleasm`/`df -ha | grep oracleasm` all show
+# the classic filesystem-backed model working as expected).
+#
+# grid_install.rsp.j2 uses /dev/disk/by-label/<LABEL> for the ASM disk paths rather
+# than /dev/oracleasm/disks/<LABEL> — by-label is a generic udev mechanism, not tied
+# to ASMLib at all, and it resolves to the correct physical disk even when raw
+# /dev/sdX letters differ between nodes (see docs/known-risks.md #4).
+#
+# PACKAGES (kmod-oracleasm, oracleasm-support, oracleasmlib) are installed by
+# os_prep, not here — see that role's task comment. Only the disk MARKING and
+# service config genuinely have to wait for both real nodes + the shared disks to
+# exist; package installation has no such dependency, so it belongs on the golden
+# image like every other RPM. This role configures the oracleasm service for the
+# grid user and marks/discovers the shared disks. Disk MARKING (createdisk) only
+# happens on dns_master (the first node) — the label gets written to the shared
+# block device itself, so the second node just needs to scan for it.
+
+# Tags below split this role into two tiers, from safest to most destructive:
+#   asmlib_service_config  — /etc/sysconfig/oracleasm, `oracleasm init`, enabling the
+#                            service. This is "configuring ASM" — deliberately separate
+#                            from disk marking so service config can land on a node
+#                            before a second node exists and ASMDISK naming is
+#                            settled by hand.
+#   asmlib_disk_marking    — `oracleasm createdisk` and everything after. Writes an ASM
+#                            label directly onto a raw block device — the destructive
+#                            tier. Requires asmlib_disks in group_vars/all.yml to be
+#                            correct real device paths first.
+
+- name: Configure oracleasm (non-interactive equivalent of `oracleasm configure -i`)
+  copy:
+    dest: /etc/sysconfig/oracleasm
+    content: |
+      # Managed by ansible role asmlib_disks
+      ORACLEASM_ENABLED=true
+      ORACLEASM_UID={{ grid_user }}
+      ORACLEASM_GID=asmadmin
+      ORACLEASM_SCANBOOT=true
+      ORACLEASM_SCANORDER=""
+      ORACLEASM_SCANEXCLUDE=""
+      ORACLEASM_USE_LOGICAL_BLOCK_SIZE=false
+    mode: "0644"
+  when: use_asmlib
+  tags: [asmlib_service_config]
+
+- name: Initialize the oracleasm driver/filesystem
+  # Loads the kernel module and sets up /dev/oracleasm — does not touch any specific
+  # disk, but it IS configuring ASM (not just installing packages), hence its own tag.
+  command: /usr/sbin/oracleasm init
+  register: asm_init
+  changed_when: "'already' not in asm_init.stdout"
+  failed_when: false
+  when: use_asmlib
+  tags: [asmlib_service_config]
+
+- name: Enable oracleasm at boot
+  systemd:
+    name: oracleasm
+    enabled: true
+    state: started
+  when: use_asmlib
+  tags: [asmlib_service_config]
+
+# --- Disk marking: primary node only ------------------------------------------
+# `oracleasm createdisk` writes a label directly onto the raw block device — wrong
+# device here means data loss (root disk, /u01, anything else already in use), not just
+# a failed task. See docs/known-risks.md #5 — the device paths in group_vars/all.yml
+# are placeholders until confirmed with `lsblk` on the real node. Two independent
+# guards before anything destructive runs: the path must exist AND must not already
+# carry a partition table, filesystem, or mountpoint.
+- name: Confirm the expected block devices exist before marking (fails loudly on a placeholder path)
+  stat:
+    path: "{{ item.device }}"
+  register: asm_dev_check
+  loop: "{{ asmlib_disks }}"
+  when: use_asmlib and inventory_hostname == dns_master
+  tags: [asmlib_disk_marking]
+
+- name: Fail if any ASM device path is missing (placeholders in group_vars/all.yml not yet updated to real /dev/sdX)
+  fail:
+    msg: >
+      {{ item.item.device }} does not exist on {{ inventory_hostname }}. Confirm the
+      real device path with `lsblk` after the shared disks are attached (see
+      docs/golden-image-and-cloning.md) and update asmlib_disks in
+      ansible/group_vars/all.yml before re-running.
+  loop: "{{ asm_dev_check.results }}"
+  when: use_asmlib and inventory_hostname == dns_master and not item.stat.exists
+  tags: [asmlib_disk_marking]
+
+- name: "Confirm each ASM device path is genuinely free (no partition table, filesystem, or mountpoint)"
+  command: "lsblk -no MOUNTPOINT,FSTYPE,PTTYPE {{ item.device }}"
+  register: asm_dev_in_use
+  changed_when: false
+  loop: "{{ asmlib_disks }}"
+  when: use_asmlib and inventory_hostname == dns_master
+  tags: [asmlib_disk_marking]
+
+- name: Fail if any ASM device path is already in use (already has a partition table, filesystem, or mountpoint)
+  fail:
+    msg: >
+      {{ item.item.device }} is not a free raw disk — `lsblk` reports
+      "{{ item.stdout | trim }}" (mountpoint/fstype/pttype). Marking it for ASMLib
+      would destroy whatever is already there. Confirm the real free shared-disk
+      device paths with `lsblk` (see docs/known-risks.md #5) and fix asmlib_disks in
+      ansible/group_vars/all.yml before re-running — do not override this check.
+  loop: "{{ asm_dev_in_use.results }}"
+  when: use_asmlib and inventory_hostname == dns_master and (item.stdout | trim) != ''
+  tags: [asmlib_disk_marking]
+
+- name: Mark each shared disk for ASMLib (primary node only — label is written to the shared device)
+  command: "/usr/sbin/oracleasm createdisk {{ item.label }} {{ item.device }}"
+  register: asm_createdisk
+  changed_when: "'created' in asm_createdisk.stdout|lower or asm_createdisk.rc == 0"
+  failed_when: asm_createdisk.rc != 0 and 'already' not in asm_createdisk.stderr|lower
+  loop: "{{ asmlib_disks }}"
+  when: use_asmlib and inventory_hostname == dns_master
+  tags: [asmlib_disk_marking]
+
+# --- Disk discovery: both nodes -------------------------------------------------
+- name: Scan for ASM disks (picks up disks marked by the primary node)
+  command: /usr/sbin/oracleasm scandisks
+  changed_when: false
+  when: use_asmlib
+  tags: [asmlib_disk_marking]
+
+- name: List discovered ASM disks (verification)
+  command: /usr/sbin/oracleasm listdisks
+  register: asm_listdisks
+  changed_when: false
+  when: use_asmlib
+  tags: [asmlib_disk_marking]
+
+- name: Show discovered ASM disks
+  debug:
+    var: asm_listdisks.stdout_lines
+  when: use_asmlib
+  tags: [asmlib_disk_marking]
+
+- name: Fail if the secondary node doesn't see all expected disks
+  fail:
+    msg: >
+      Expected {{ asmlib_disks | length }} ASM disks, oracleasm listdisks found
+      {{ asm_listdisks.stdout_lines | length }} on {{ inventory_hostname }}. Re-run
+      `oracleasm scandisks` manually, or confirm the shared disks are actually attached
+      to this VM (VirtualBox shareable disks are attached per-VM, not inherited from a
+      clone — see docs/golden-image-and-cloning.md).
+  when: use_asmlib and (asm_listdisks.stdout_lines | length) < (asmlib_disks | length)
+  tags: [asmlib_disk_marking]

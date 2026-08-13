@@ -1,0 +1,42 @@
+# Managed by ansible role os_prep — deployed as /etc/sysctl.d/zz90-oracle-override.conf
+# (NOT 99-oracle.conf — see the comment on the os_prep task that renders this file:
+# the preinstall RPM's own sysctl.d drop-in wins over "99-oracle.conf" for
+# fs.aio-max-nr/kernel.shmmax, so this file's name sorts after everything else in
+# /etc/sysctl.d to guarantee it wins).
+# Values are per Oracle 12.2 GI/DB installation guide minimums for Linux, plus this
+# project's own I/O and memory-pressure tuning. Re-check the GI/DB minimums against the
+# current install guide if a node's RAM changes materially (semaphore/shared-memory
+# limits scale with RAM).
+
+fs.file-max = 6815744
+fs.aio-max-nr = 1048576
+
+kernel.shmall = 4294967296
+kernel.shmmax = 34359738368
+kernel.shmmni = 4096
+
+kernel.sem = 250 32000 100 128
+
+net.ipv4.ip_local_port_range = 9000 65500
+net.core.rmem_default = 262144
+net.core.rmem_max = 4194304
+net.core.wmem_default = 262144
+net.core.wmem_max = 1048576
+
+# RAC interconnect stability
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+
+# --- Memory-pressure / writeback tuning (this project's own values, not an Oracle minimum) ---
+# vm.swappiness/vm.dirty_ratio here are NOT sufficient on their own on a VirtualBox
+# VM — the active tuned profile (virtual-guest, tuned's default recommendation for a
+# VM) actively re-asserts its own values (30/30) and fights this file. The real,
+# durable fix is the custom tuned profile os_prep deploys and activates right after
+# this file (see docs/known-risks.md #23) — these two lines are kept as an
+# immediate-at-boot value before tuned finishes starting, not the sole mechanism.
+vm.swappiness = 5
+vm.dirty_background_ratio = 3
+vm.dirty_ratio = 40
+vm.dirty_expire_centisecs = 1500
+vm.dirty_writeback_centisecs = 250
+vm.vfs_cache_pressure = 120

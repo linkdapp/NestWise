@@ -1,0 +1,396 @@
+---
+# ---------------------------------------------------------------------------
+# Single source of truth for hostnames, paths, versions. Every template and
+# response file in this repo reads from here — edit here, not in ten places.
+#
+# OS: Oracle Linux 7 — see docs/known-risks.md #1 for the certification boundary
+# this project is deliberately working within (right for this phase and Phase 2,
+# not certified for the later 26ai upgrade — that migration is planned, not
+# solved, in this phase).
+# ---------------------------------------------------------------------------
+
+# --- Cluster identity -------------------------------------------------------
+cluster_name: usatclust1
+db_name: apexdb
+db_unique_name: apexdb
+sid_prefix: apexdb          # instances become apexdb1 / apexdb2
+
+domain: usat.com
+
+# --- Node network (must match docs/network-and-hosts.md exactly) -----------
+# OL7 uses classic eth-style interface naming, not enp0sN.
+# eth0: NAT, DHCP — admin/internet access only, not part of the Oracle design
+# eth1: Host-Only Adapter — PUBLIC cluster network (public_ip/vip_ip below),
+#       gateway 192.168.56.1, DNS search domain usat.com
+# eth2: Internal Network "intnet" — PRIVATE interconnect (priv_ip below), no
+#       gateway. Must be the exact same internal network NAME string on both
+#       VMs (VirtualBox host-side VBoxManage setting, not an Ansible/guest-OS
+#       var) — see docs/known-risks.md #11: if it doesn't match, the
+#       private interconnect silently doesn't work at all.
+nodes:
+  - { name: oradbserv05, public_ip: 192.168.56.181, vip_name: oradbserv05-vip, vip_ip: 192.168.56.191, priv_name: oradbserv05-priv, priv_ip: 192.168.2.181 }
+  - { name: oradbserv06, public_ip: 192.168.56.182, vip_name: oradbserv06-vip, vip_ip: 192.168.56.192, priv_name: oradbserv06-priv, priv_ip: 192.168.2.182 }
+
+public_gateway: 192.168.56.1
+public_netmask: 255.255.255.0
+private_netmask: 255.255.255.0
+
+scan_name: scan-usatclust1
+# 3 real IPs, all resolving to the same name via BIND round-robin — see
+# ansible/roles/dns_bind. This is what actually gives SCAN its load-balancing/failover
+# behavior; a single static IP does not.
+scan_ips:
+  - 192.168.56.201
+  - 192.168.56.202
+  - 192.168.56.203
+scan_port: 1521
+
+# --- Standby cluster (Data Guard target, Phase 2) ---------------------------
+# Documented now so the addressing scheme isn't lost, but NOT built by this phase's
+# playbooks — phase-01 only provisions the primary cluster above. Same 3-NIC pattern.
+standby_cluster_name: usatclust2
+standby_nodes:
+  - { name: oradbserv07, public_ip: 192.168.56.184, vip_name: oradbserv07-vip, vip_ip: 192.168.56.194, priv_name: oradbserv07-priv, priv_ip: 192.168.2.184 }
+  - { name: oradbserv08, public_ip: 192.168.56.185, vip_name: oradbserv08-vip, vip_ip: 192.168.56.195, priv_name: oradbserv08-priv, priv_ip: 192.168.2.185 }
+standby_scan_name: scan-usatclust2
+standby_scan_ips:
+  - 192.168.56.211
+  - 192.168.56.212
+  - 192.168.56.213
+
+# --- DNS (BIND) — see docs/network-and-hosts.md and ansible/roles/dns_bind ---
+dns_master: oradbserv05        # primary NS, authoritative for {{ domain }}
+dns_secondary: oradbserv06     # secondary NS
+dns_master_ip: 192.168.56.181  # must match nodes[0].public_ip above
+
+# --- Chrony — OEM VM is the local time master, both RAC nodes are clients ---
+chrony_master_hostname: oemserver01
+chrony_master_ip: 192.168.56.65
+
+# --- /u01 storage: dedicated 75GB disk, NOT the root filesystem -------------
+# os_prep's "Create OFA directory structure" task only calls `file: state=directory` —
+# that creates a path on whatever filesystem currently backs it, root included, with no
+# awareness of intent. Without an explicit partition/format/mount step first, /u01 ends
+# up carved out of the 50GB root disk (sdb1 in this build) instead of the dedicated 75GB
+# disk attached for exactly this purpose — os_prep's partition/format/mount tasks
+# handle this explicitly, in order, before any directory gets created.
+# u01_device is the whole, unpartitioned disk (confirm with `lsblk` — attach order at
+# clone time can shift which /dev/sdX this ends up as, same caveat as asmlib_disks).
+u01_device: /dev/sdc
+u01_partition: /dev/sdc1
+u01_fs_label: ora_soft
+u01_mount_point: /u01
+
+# --- OFA directory layout ---------------------------------------------------
+oracle_base: /u01/app/oracle
+db_home: /u01/app/oracle/product/12.2.0/db_1
+inventory_loc: /u01/app/oraInventory
+
+# *** SHARED ORACLE_BASE — grid and oracle share the same base directory. ***
+# grid_base = oracle_base = /u01/app/oracle, set 2026-08-09. grid_home
+# (/u01/app/grid/19.3.0) is a completely separate top-level path, not a subdirectory of
+# this shared base at all — so the "Grid home must not be under an Oracle base
+# directory" installer check (INS-32022/INS-32026) doesn't apply by construction, not
+# as an accepted risk. os_prep's OFA directory task creates this shared base once
+# (owner oracle:oinstall, mode 2775/setgid so grid — a member of oinstall — can write
+# into it too), not as two separate oracle_base/grid_base entries.
+#
+# GI VERSION: 19.3 base + RU 19.24 (directory segment below is 19.3.0, not the
+# product/<version>/db_1 shape used for the DB home), NOT 12.2.0.1 — a deliberate,
+# independent-version design, not a workaround — see docs/known-risks.md #2. GI and
+# DB homes are fully independent, a normal supported Oracle pattern; db_home below
+# stays 12.2.0.1.
+grid_home: /u01/app/grid/19.3.0
+grid_base: /u01/app/oracle
+
+# Staging directory — dual ownership (oracle:oinstall, 2775) so both the oracle and
+# grid users can write to it; they share the oinstall group already.
+staging_dir: /u01/app/oracle/staging
+
+# verify_baseline's ASMLib package/service checks are only meaningful once the
+# asmlib_disks role has actually run — which, per site.yml's build order and
+# docs/golden-image-and-cloning.md, is AFTER both of verify_baseline's normal call
+# sites. Leave this false for the normal pre-clone/post-clone verify runs (ASMLib gaps
+# are still reported, just not treated as failures); pass
+# `-e verify_asmlib_disks=true` on the command line once asmlib_disks has run (packages,
+# service config, AND disk marking all actually done) and you want that covered too.
+verify_asmlib_disks: false
+
+# --- OS accounts -------------------------------------------------------------
+# GIDs 54321-54326 and 54330 are NOT free real estate — oracle-database-preinstall-19c
+# (installed earlier in this role) creates its own SYSDBA/SYSOPER/SYSBACKUP/SYSDG/SYSKM/
+# SYSRAC groups and claims those GIDs before this task ever runs:
+#   oinstall=54321  dba=54322  oper=54323  backupdba=54324  dgdba=54325  kmdba=54326  apexdba=54330
+# (confirm on any node with `id oracle` right after the preinstall RPM installs). The
+# original ASM GIDs here (54323-54326) collided head-on with the RPM's oper/backupdba/
+# dgdba/kmdba — that's what produced "groupadd: GID already exists" / "groupmod: GID
+# already exists" failures, not an idempotency bug in the group task. asmadmin/asmdba/
+# asmoper aren't created by the preinstall RPM at all (it doesn't know this node is
+# getting Grid Infrastructure/ASM), so they get the next free block, 54327-54329.
+# oper is left pointed at the RPM's own value (54323) instead of being reassigned —
+# renumbering a group the preinstall RPM already created and already put the oracle
+# user into is unnecessary churn. See docs/known-risks.md for the full writeup.
+grid_user: grid
+oracle_user: oracle
+oinstall_gid: 54321
+dba_gid: 54322
+oper_gid: 54323       # matches what oracle-database-preinstall-19c already created — do not move
+asmadmin_gid: 54327
+asmdba_gid: 54328
+asmoper_gid: 54329
+
+# vboxsf: created by the VirtualBox Guest Additions installer (VBoxLinuxAdditions.run),
+# GID varies by install — os_prep ensures the group exists (idempotent either way) and
+# adds oracle/grid to it so both software owners can read/write host-shared folders
+# (staging media dropped in via a VirtualBox shared folder, for example).
+vboxsf_group: vboxsf
+
+# --- ASM disks — ASMLib -------------------------------------------------------
+# Classic ASMLib v2: kmod-oracleasm and oracleasm-support are natively available via
+# yum on OL7. oracleasmlib is NOT reliably in the public yum channels — it's only
+# guaranteed via ULN (needs an active support subscription) or a manual download from
+# oracle.com/linux/downloads; confirmed via a real "No package matching 'oracleasmlib'
+# found" failure, corrected in known-risks.md #21. Two competing kmod packages exist
+# in principle (kmod-oracleasm for UEK vs kmod-redhat-oracleasm for the Red Hat
+# Compatible Kernel) — this project runs UEK, so kmod-oracleasm is correct here.
+# Packages install as part of `os_prep` (golden image, once, pre-clone) rather than
+# in `asmlib_disks` — only the disk marking/service config genuinely has to wait for
+# both real nodes to exist, package installation doesn't. See docs/known-risks.md #4.
+use_asmlib: true
+asm_disk_size_gb: 50
+# Device paths below are placeholders — real /dev/sdX paths depend on attach order at
+# clone time (see ../../phase-01-foundation-2node-rac-12cR2/docs/golden-image-and-cloning.md);
+# confirm with `lsblk` on the actual node before running the asmlib role.
+asmlib_disks:
+  - { label: ASMDISK01, device: /dev/sdd }
+  - { label: ASMDISK02, device: /dev/sde }
+  - { label: ASMDISK03, device: /dev/sdf }
+  - { label: ASMDISK04, device: /dev/sdg }
+  - { label: ASMDISK05, device: /dev/sdh }
+  - { label: ASMDISK06, device: /dev/sdi }
+# Three diskgroups: DATA01 (created during gridSetup.sh itself — hosts OCR/voting +
+# primary datafiles, the only diskgroup GI's response file can create at install time),
+# DATA02 and RECO01 (both created afterward via asmca, once the cluster is up — see
+# grid_silent_install/tasks/main.yml).
+#
+# asm_redundancy (EXTERNAL) still applies to DATA02/RECO01 — no ASM-level mirroring, no
+# failure-group requirement, appropriate for these two since neither hosts voting files
+# and this is a single physical host with no real storage-level redundancy underneath
+# either way.
+asm_redundancy: EXTERNAL
+# DATA01 gets its own, separate redundancy setting (NORMAL, not EXTERNAL like
+# DATA02/RECO01 above) — a deliberate choice to demonstrate the voting-quorum
+# mechanism (see docs/known-risks.md #9) for the certification showcase. NORMAL
+# needs 3 failure groups for voting (crsctl replace votedisk requires an odd
+# quorum count); grid_install.rsp.j2 derives one failure group per disk
+# (FG_<label>) from asm_diskgroup_data_disks below — no separate
+# failure-group-name list needed.
+asm_diskgroup_data_redundancy: NORMAL
+asm_diskgroup_data: DATA01                          # name kept as asm_diskgroup_data — grid_install.rsp.j2 reads this one for the install-time diskgroup
+asm_diskgroup_data_disks: [ASMDISK01, ASMDISK02, ASMDISK03]   # 3 disks — NORMAL needs 3 failure groups for voting
+asm_diskgroup_data02: DATA02
+asm_diskgroup_data02_disks: [ASMDISK04]             # EXTERNAL only needs 1 disk
+# CONFIRMED 2026-08-12 against the real cluster (kfod / crsctl both show it as
+# "RECO01", not "RECO" — ora.RECO01.dg is the actual registered resource name).
+# See docs/known-risks.md #43 — this var previously said RECO, which doesn't match
+# what asmca actually created, and broke dbca_gp_noncdb.rsp.j2 with DBT-06002.
+asm_diskgroup_reco: RECO01
+asm_diskgroup_reco_disks: [ASMDISK05, ASMDISK06]   # FRA
+
+# --- OCR / voting disk / GIMR placement ---------------------------------------
+# OCR is multiplexed to DATA01 (install time, automatic) + DATA02 (via `ocrconfig -add
+# +DATA02` in grid_silent_install, once DATA02 exists post-cluster-up) — real
+# redundancy, straightforward, supported.
+#
+# Voting disks do NOT work the same way — see docs/known-risks.md #9 for the full
+# mechanics. `crsctl replace votedisk` targets exactly ONE diskgroup; the number of
+# voting files Oracle creates is dictated entirely by THAT diskgroup's own redundancy
+# (EXTERNAL=1, NORMAL=3 failure groups, HIGH=5) — there is no "vote #1 in DATA01,
+# vote #2 in DATA02" configuration, Oracle doesn't support spanning voting files
+# across separate diskgroups. DATA01 runs NORMAL/3 disks here specifically to get 3
+# real voting files rather than 1 — on a single VirtualBox host the failure-group
+# isolation is largely theoretical (all 3 "failure groups" sit on the same physical
+# storage underneath), but it's a deliberate choice to demonstrate the mechanism
+# rather than optimize purely for this lab's actual fault-tolerance ceiling.
+#
+# GIMR (Grid Infrastructure Management Repository / MGMTDB) is disabled — a
+# lab-scale resource tradeoff, not a technical requirement either way.
+# configure_gimr below is read by grid_install.rsp.j2
+# (oracle.install.crs.configureGIMR).
+configure_gimr: false
+
+# --- Software / patch staging (populate once you've downloaded from MOS) ---
+# GI is 19.3 base media + a 19c RU (NOT 12.2 media — see the grid_home comment above and
+# docs/known-risks.md #2). DB stays 12.2.0.1 media + a 12.2 DBPSU.
+gi_software_zip: "{{ staging_dir }}/software/LINUX.X64_193000_grid_home.zip"
+db_software_zip: "{{ staging_dir }}/software/linuxx64_12201_database.zip"
+
+# GI RU: Patch 39467003 — GI Release Update 19.32.0.0.260721. Still confirm current on
+# MOS before a real build — this project deliberately doesn't treat any patch number as
+# permanently current (see docs/patching-strategy.md); this is what was on hand as of
+# 2026-08-08, not a claim that it stays the latest.
+#
+# This is a COMBO/bundle patch, not a flat RU — p39467003_190000_Linux-x86-64.zip
+# unzips into 39467003/ containing five separate MOS patch numbers as subdirectories:
+#   39472050  Database Release Update 19.32.0.0.260721 (Oracle home only if non-RAC;
+#             BOTH Oracle home and Grid home for RAC, which this project is)
+#   39526364  OCW Release Update 19.32.0.0.260721 (both Oracle home and Grid home)
+#   39503034  ACFS Release Update 19.32.0.0.260721 (Grid home only)
+#   39107855  Tomcat Release Update 19.0.0.0.0 (Grid home only)
+#   39107825  DBWLM Release Update 19.0.0.0.0 (Grid home only)
+# gi_ru_patch_path points at the TOP-level 39467003 directory, not any single component
+# — gridSetup.sh's -applyRU is designed to auto-discover and apply every component
+# patch found inside a combo directory in one pass; no need to enumerate them.
+#
+# gi_ru_zip is Oracle's OWN MOS download filename (p<patch_id>_<version>_<platform>.zip)
+# — patch_before_config checks/unzips THIS, not a renamed "{{ gi_ru_patch_id }}.zip".
+# Don't rename what MOS gives you to match the patch ID; update this variable instead
+# when the patch number changes (e.g. a newer quarterly GI RU).
+gi_ru_patch_id: "39467003"
+gi_ru_patch_path: "{{ staging_dir }}/patches/{{ gi_ru_patch_id }}"
+gi_ru_zip: "{{ staging_dir }}/patches/p39467003_190000_Linux-x86-64.zip"
+
+# DB RU: Patch 33559966 — Combo of OJVM Component RU 12.2.0.1.220118 + GI (DB) Jan 2022
+# RU 12.2.0.1.220118. Same currency caveat as above — 12.2.0.1 is past Premier Support
+# (see docs/known-risks.md #15), so "current" here means the latest that was actually
+# available for it, not a moving target the way the 19c GI RU is.
+#
+# CORRECTED 2026-08-12 (known-risks.md #35/#38) — neither -applyRU nor -applyOneOffs
+# is supported by the 12.2.0.1 Database installer at all ([INS-04003], confirmed
+# against a real run). db_silent_install now does a plain, unpatched software-only
+# install; both components below are applied AFTER install+root.sh, directly against
+# the real db_home, via opatchauto (both are System Patches — plain `opatch apply`
+# refuses them with "This command doesn't support System Patch", also confirmed
+# against a real run) — left as a manual, watched pause in db_silent_install rather
+# than an automated Ansible task (see that role's PAUSE task and known-risks.md #38
+# for why, and the exact per-node commands):
+#   33559966/33583921  the RU/PSU — db_ru_patch_path points at this. Applied via
+#                       `opatchauto apply` from GRID_HOME/OPatch, on EACH node.
+#   33559966/33561275  OJVM Release Update 12.2.0.1.220118 — db_ojvm_patch_path
+#                       points at this. Applied via `opatchauto apply ... -oh
+#                       $ORACLE_HOME -nonrolling` from DB_HOME/OPatch, on EACH node
+#                       (OJVM is a documented nonrolling patch type). This only
+#                       patches db_home's binaries; the SQL-level half (`datapatch`)
+#                       runs automatically as part of dbca_noncdb's DBCA call
+#                       (documented Oracle behavior for DBCA-created databases since
+#                       12.2.0.1 — NOT a separate manual step at that point).
+#                       dbca_noncdb verifies that automatic run landed cleanly rather
+#                       than assuming it did — see docs/patching-strategy.md
+#                       mechanism 3 for why (the General_Purpose.dbc seed-template
+#                       caveat).
+#
+# db_ru_zip, same reasoning as gi_ru_zip above: Oracle's own MOS download filename,
+# checked/unzipped as-is by patch_before_config — not renamed to "{{ db_ru_patch_id }}.zip".
+db_ru_patch_id: "33559966"
+db_ru_patch_path: "{{ staging_dir }}/patches/{{ db_ru_patch_id }}/33583921"
+db_ru_zip: "{{ staging_dir }}/patches/p33559966_122010_Linux-x86-64.zip"
+db_ojvm_patch_id: "33561275"
+db_ojvm_patch_path: "{{ staging_dir }}/patches/{{ db_ru_patch_id }}/{{ db_ojvm_patch_id }}"
+
+# OPatch itself (MOS patch 6880880) — NOT a Release Update, so it does not go through
+# patch_before_config's generic patches/ staging + -applyRU flow. Each RU's README
+# specifies a minimum OPatch version; the OPatch bundled with the base install media is
+# often below that minimum, so this needs to be unzipped INTO the home's OPatch
+# directory (overwriting it) before -applyRU runs — grid_silent_install/db_silent_install
+# do this right after extracting the software, before invoking gridSetup.sh/runInstaller.
+# Download separately per release line from MOS — these are two different zips despite
+# sharing the same base patch number:
+#   GI (19.3.0): p6880880_230000_LINUX.zip — NOTE this is labeled for the 23.0.0.0.0
+#     release line, not 19.0.0.0.0; Oracle's own guidance is normally to select "OPatch
+#     for DB 19.0.0.0.0" specifically for a 19c home, but grabbing the newest available
+#     OPatch build across release lines is common practice since OPatch itself is
+#     largely version-agnostic in recent releases. Confirm with `opatch version` after
+#     unzipping into grid_home before trusting this for a real build.
+#   DB (12.2.0.1): p6880880_122010_Linux-x86-64v12.2.0.1.40.zip — filename as provided;
+#     the "v12.2.0.1.40" suffix is unusual formatting (likely the OPatch version number
+#     appended to the filename) — verify this matches the actual file downloaded from
+#     MOS patch 6880880 before relying on it.
+gi_opatch_zip: "{{ staging_dir }}/patches/p6880880_230000_LINUX.zip"
+db_opatch_zip: "{{ staging_dir }}/patches/p6880880_122010_Linux-x86-64v12.2.0.1.40.zip"
+
+# cvuqdisk — cluvfy's own ASM-discovery helper package, NOT part of the preinstall
+# RPM's package list and not published in any yum repo (it ships only inside the GI
+# media itself, under grid_home/cv/rpm/). Without it, cluvfy fails every run with
+# PRVG-11550 "Package cvuqdisk is missing" on BOTH nodes — see docs/known-risks.md
+# #7. Filename below is the exact
+# one that ships in the 19.3 base GI media used by this project — if the GI base
+# media version ever changes, confirm this still matches `ls $GRID_HOME/cv/rpm/`
+# before trusting it.
+cvuqdisk_rpm_filename: "cvuqdisk-1.0.10-1.rpm"
+
+# --- Target database ---------------------------------------------------------
+db_template: General_Purpose.dbc
+db_is_cdb: false
+db_character_set: AL32UTF8
+db_national_character_set: AL16UTF16
+db_memory_percentage: 40     # % of node RAM DBCA sizes SGA+PGA to — tune per actual VM RAM
+
+# --- Passwords — placeholders only. Never commit real values. -------------------
+# sys_password covers SYS/SYSASM/ASM-monitor (grid_install.rsp.j2) and SYS/DBSNMP
+# (dbca_gp_noncdb.rsp.j2); system_password covers SYSTEM. Both were previously
+# committed here as literal weak values ("sys"/"system") — fine functionally for a
+# fully NAT-isolated lab, but not something to leave sitting in git history on a
+# public repo (see docs/known-risks.md #45). Override per-run instead, without
+# editing this file:
+#   ansible-playbook ... -e sys_password='real_value' -e system_password='real_value'
+# or, for something that persists across runs without being committed, create
+# group_vars/all_local.yml (gitignored) with just these two keys — Ansible merges
+# group_vars files automatically, last-loaded wins. ansible-vault is the correct
+# answer for anything beyond a single-host home lab; not set up here since every
+# `ansible-playbook` invocation in this SOP would then need --ask-vault-pass too.
+sys_password: "CHANGE_ME_sys_password"
+system_password: "CHANGE_ME_system_password"
+
+use_ignore_prereq: false   # not needed — 19.3 GI base and 12.2.0.1 DB are both natively certified on OL7
+
+# db_silent_install-ONLY, deliberately separate from use_ignore_prereq above (which
+# stays false — GI's own OS-level prereq validation is genuinely fine and worth
+# keeping). CONFIRMED 2026-08-12 against a real run: the 12.2.0.1 DB installer's
+# bundled CVU (CVU_12.2.0.1.0) hard-fails its own mandatory "CRS Integrity" check
+# (Severity:CRITICAL) with PRVF-7595/PRVG-2043, because it shells out to the legacy
+# crs_stat binary — deprecated and genuinely absent from a 19c GRID_HOME
+# (crs_stat: No such file or directory). This is a CVU-vs-GI version mismatch, not a
+# real cluster problem: crsctl check cluster -all and crsctl stat res -t both showed
+# a fully healthy cluster on both nodes at the exact time this failed. A matching
+# oracle-mosc community thread (GI 19c + a 12.x DB home, same crs_stat path pattern,
+# same PRVF-7595 text) confirms this isn't specific to this project's environment.
+# Left true rather than patched around some other way because there's no narrower
+# runInstaller flag to skip just this one check — see docs/known-risks.md #37.
+db_ignore_prereq: true
+
+# --- Preinstall RPM ----------------------------------------------------------
+# PRIMARY is oracle-database-preinstall-19c — Oracle changed its preinstall-RPM
+# naming convention starting with 18c, dropping the older "oracle-database-server-
+# <version>-preinstall" shape (still used for 12.2 below) in favor of a flat
+# "oracle-database-preinstall-<version>" name; confirmed against the actual RPM
+# filename (oracle-database-preinstall-19c-1.0-3.el7.x86_64.rpm) and natively
+# available via yum on OL7. Its kernel/ulimit baseline matches 12.2's, so it also
+# covers the 12.2.0.1 DATABASE layer that runs on top of this 19c GI — see the
+# reconciliation note in ansible/roles/os_prep/tasks/main.yml.
+# preinstall_rpm here is what verify_baseline's primary rpm -q check looks for.
+preinstall_rpm: oracle-database-preinstall-19c
+
+# TRUE by default — the 12.2-specific preinstall RPM is natively available via yum
+# on OL7 (see os_prep's task comment), so there's no reason to skip it: the DB layer
+# gets its own native baseline for free instead of only inheriting it via the 19c RPM.
+install_local_12cr2_preinstall_rpm: true
+
+# oracleasmlib fallback — TRUE by default now (see docs/known-risks.md #21):
+# oracleasmlib genuinely isn't reliably on OL7's public yum channels (ULN with an
+# active subscription, or a manual download from oracle.com/linux/downloads, are the
+# real distribution paths), confirmed against a real "No package matching
+# 'oracleasmlib' found" failure. Path is ON THE MANAGED NODE itself (os_prep just
+# `yum install`s it directly from there, no control-node copy step) — matches this
+# project's actual workflow of staging manually-downloaded RPMs under /root/rpms on
+# each node before running os_prep. Update the filename/version here if a different
+# oracleasmlib build gets staged.
+oracleasmlib_local_rpm: /root/rpms/oracleasmlib-2.0.15-1.el7.x86_64.rpm
+
+# TRUE by default — see comment above. Set false only if a specific environment's
+# yum config genuinely does carry oracleasmlib (e.g. an active ULN subscription
+# channel enabled) and the local-file fallback isn't needed.
+install_local_oracleasmlib_rpm: true
+
+# compat-libcap1 — cluvfy's PRVF-7532 prereq check (`compat-libcap1-1.10`) — genuinely
+# EL7-era, natively available via yum on OL7 (see os_prep's task comment, which
+# installs it directly — no local file needed).

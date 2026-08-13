@@ -1,0 +1,346 @@
+---
+# Silent Database software install — PLAIN software-only install (no -applyRU, no
+# -applyOneOffs), root.sh, THEN patched afterward against the real, fully-populated
+# db_home via OPatch directly (Mechanism 2 in docs/patching-strategy.md). OJVM's
+# remaining SQL-level half (datapatch) runs automatically as part of DBCA itself
+# (documented Oracle behavior since 12.2.0.1, for databases created through DBCA) —
+# dbca_noncdb verifies that run rather than re-applying it manually; see
+# docs/patching-strategy.md mechanism 3.
+#
+# CONFIRMED 2026-08-12 against a real run: the 12.2.0.1 Database runInstaller does
+# NOT support -applyRU or -applyOneOffs at all — [INS-04003] Invalid argument passed
+# from command line. Specified argument ([-applyRU]) is not a supported argument for
+# this application. Mechanism 1 (patch-during-install via -applyRU) genuinely never
+# applied to this project's DB layer — every source suggesting otherwise (including
+# ones this role's own earlier comments cited) turned out to be describing 18c+'s DB
+# installer, which does support -applyRU; 12.2.0.1's does not. GI's gridSetup.sh (19c)
+# is unaffected — that -applyRU usage in grid_silent_install is separately confirmed
+# working against a real run. See docs/known-risks.md #35 for the full story
+# (previous entries #31/#33/#34 spent real effort on the extraction-path question
+# before this more fundamental issue surfaced — worth reading in order for the
+# history, but the flow below supersedes all the -applyRU-based reasoning in them).
+#
+# CONFIRMED 2026-08-12 (second finding, after -waitforcompletion above): the plain
+# install still hard-failed with [FATAL] [INS-13013] — the DB installer's bundled CVU
+# (12.2.0.1.0) hits a mandatory, CRITICAL "CRS Integrity" check that shells out to the
+# legacy crs_stat binary, which genuinely doesn't exist in a 19c GRID_HOME. Confirmed
+# as a CVU-vs-GI version-mismatch false positive, not real cluster damage (crsctl
+# check cluster -all / crsctl stat res -t both clean at the time). db_ignore_prereq
+# (group_vars/all.yml) is now unconditionally true for this reason — see
+# docs/known-risks.md #37.
+#
+# TAGS, RENAMED 2026-08-09 — the whole role still runs end to end under
+# --tags db_software (set in site.yml; renamed from the old --tags db_install for
+# the same reason grid_silent_install's tags were renamed, see that role's header —
+# most of a first run is staging/unzipping, not "installing"). Sub-tags below
+# (db_stage / db_install_software / db_patch) are for re-runs and targeted
+# troubleshooting, not standalone first-time use.
+
+- name: "Stage DB software: extract, update OPatch"
+  tags: [db_stage]
+  block:
+    # --- Software staging: node 1 (the first host in rac_nodes) only ---
+    # Same reasoning as grid_silent_install: OUI copies db_home to every node
+    # listed in the response file's node list over the oracle user's SSH
+    # equivalence during a single runInstaller run (that copy happens later,
+    # during the install_software stage below — not during this staging block) —
+    # no need to stage the zip or invoke the installer separately on node 2.
+    # root.sh below is per-node deliberately (has to run on both).
+
+    - name: Render db_install.rsp
+      template:
+        src: db_install.rsp.j2
+        dest: "{{ staging_dir }}/response-files/db_install.rsp"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: "0644"
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Ensure db_home exists and is owned by the oracle user
+      # OUI creates/populates ORACLE_HOME itself during the actual install — this
+      # just pre-creates an empty, correctly-owned target for it, same as the OFA
+      # convention used elsewhere. NOT where the software zip gets extracted (see
+      # below).
+      file:
+        path: "{{ db_home }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: "0775"
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    # SETTLED 2026-08-12, per explicit direction after reviewing the actual zip
+    # contents together — extracts to the staging directory
+    # ({{ staging_dir }}/software), not db_home. linuxx64_12201_database.zip
+    # contains its own top-level "database/" folder (runInstaller, install/,
+    # response/, stage/, OPatch/, ...); unzip always recreates that folder wherever
+    # `dest` points, so extracting into db_home would just relocate the same
+    # database/ subfolder to db_home/database/ rather than eliminate it — confirmed
+    # by inspecting the actual staged zip's contents. Staging it separately keeps
+    # db_home genuinely empty until runInstaller actually populates it (the real
+    # ORACLE_HOME, set via ORACLE_HOME= in db_install.rsp), rather than leaving the
+    # installer media itself sitting inside ORACLE_HOME afterward. See
+    # docs/known-risks.md #31/#33/#34 for the full back-and-forth that landed here.
+    - name: Extract Database software to a staging location (NOT db_home — see comment above)
+      unarchive:
+        src: "{{ db_software_zip }}"
+        dest: "{{ staging_dir }}/software"
+        remote_src: true
+        owner: "{{ oracle_user }}"
+        group: oinstall
+      args:
+        creates: "{{ staging_dir }}/software/database/runInstaller"
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    # OPatch (MOS 6880880) is NOT the DBPSU — it's the patching tool itself. Only
+    # confirmed staged here (cheap, fail-fast); actually UPDATED later, in the
+    # install block below, against the real db_home once it exists — see that
+    # task's comment for why.
+    - name: Confirm the DB OPatch zip is staged (downloaded from MOS out-of-band, patch 6880880 filtered to release 12.2.0.1.0)
+      stat:
+        path: "{{ db_opatch_zip }}"
+      register: db_opatch_zip_stat
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Fail with a clear message if the DB OPatch zip isn't staged yet
+      fail:
+        msg: >
+          Expected {{ db_opatch_zip }} — download OPatch (MOS patch 6880880) filtered to
+          the Database 12.2.0.1.0 release and place it there before this role can update
+          OPatch ahead of applying the RU.
+      when: not db_opatch_zip_stat.stat.exists
+      run_once: true
+
+- name: "Install DB software (plain runInstaller, no -applyRU — see role header) + root.sh"
+  tags: [db_install_software]
+  block:
+    # --- IDEMPOTENCY GUARD: has the DB software already been installed? -----------
+    # `{{ db_home }}/root.sh` existing is the signal — Oracle only writes it near
+    # the end of a successful install session, once there's something real for the
+    # root user to run. See docs/known-risks.md #32 for why an earlier version of
+    # this check (grep'ing inventory.xml for a HOME entry) was too weak — OUI
+    # registers a HOME entry early in a session, well before install actually
+    # completes, so that check produced a real false positive on this project.
+    - name: "Check whether the DB software install has already completed"
+      stat:
+        path: "{{ db_home }}/root.sh"
+      register: db_root_sh_stat
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: "Set install-check result (kept as phase_install_check.rc for compatibility with the tasks below)"
+      set_fact:
+        phase_install_check: "{{ {'rc': 0 if db_root_sh_stat.stat.exists else 1} }}"
+      run_once: true
+
+    - name: Report DB software install status
+      debug:
+        msg: >
+          DB software install {{ 'already completed — ' + db_home + '/root.sh exists.
+          Skipping runInstaller re-invocation.' if phase_install_check.rc == 0 else
+          'not yet done (or a previous attempt did not reach root.sh) — running
+          runInstaller now.' }}
+      run_once: true
+
+    # PLAIN software-only install — no -applyRU, no -applyOneOffs. Confirmed against
+    # a real run that the 12.2.0.1 Database runInstaller rejects both flags outright
+    # ([INS-04003] Invalid argument ... not a supported argument for this
+    # application) — Mechanism 1 in docs/patching-strategy.md never applied to this
+    # project's DB layer, only to GI's 19c gridSetup.sh. Patching happens entirely
+    # after this, against the real db_home, via OPatch directly (Mechanism 2) — see
+    # the tasks below and docs/known-risks.md #35.
+    #
+    # -waitforcompletion (added 2026-08-12, known-risks.md #36): without it, OUI's
+    # runInstaller wrapper forks the actual Java installer into a DETACHED background
+    # process and returns control almost immediately — confirmed against a real run,
+    # where Ansible captured only "Preparing to launch Oracle Universal Installer...
+    # Please wait ..." before the command module's child process exited, well before
+    # install/link/root.sh-generation actually happened. The very next task
+    # (root.sh) then failed with ENOENT because db_home was still empty. This is
+    # documented, version-independent OUI behavior, not something specific to this
+    # project's env — House of Brick's own 12.2.0.1 transcript shows the identical
+    # symptom (a shell prompt appearing mid-output, before "installation ...
+    # successful" prints). -waitforcompletion makes runInstaller block until the
+    # install genuinely finishes before returning, so no log-polling is needed.
+    # grid_silent_install's gridSetup.sh call never hit this because that role
+    # already puts a manual `pause:` between gridSetup.sh and root.sh (see that
+    # role's Phase A) — the human delay of running orainstRoot.sh/root.sh by hand
+    # happened to give the background install enough time to finish first.
+    - name: Run runInstaller silently (software-only, unpatched — patched separately below)
+      become: true
+      become_user: "{{ oracle_user }}"
+      command: >
+        {{ staging_dir }}/software/database/runInstaller -silent -waitforcompletion
+        -responseFile {{ staging_dir }}/response-files/db_install.rsp
+        {{ '-ignorePrereq -ignoreSysPrereqs' if (use_ignore_prereq or db_ignore_prereq) else '' }}
+      register: dbinstall_result
+      failed_when: dbinstall_result.rc not in [0, 6]
+      changed_when: dbinstall_result.rc == 0
+      when: phase_install_check.rc != 0
+      run_once: true
+      delegate_to: "{{ groups['rac_nodes'][0] }}"
+
+    - name: Show runInstaller output (contains the root.sh command for the DB home, if any)
+      debug:
+        var: dbinstall_result.stdout_lines
+      when: phase_install_check.rc != 0
+      run_once: true
+
+    # Deliberately {{ db_home }}/root.sh, NOT {{ staging_dir }}/software/database/root.sh
+    # — root.sh is something OUI WRITES INTO the real ORACLE_HOME as part of a
+    # successful install, not something that ships inside the staging media. Every
+    # real transcript checked confirms this. See docs/known-risks.md #34.
+    - name: Run root.sh for the DB home (idempotent by design — orainstRoot only needed once, already run by GI)
+      become: true
+      command: "{{ db_home }}/root.sh"
+      register: db_root_sh
+      changed_when: "'has already been run' not in db_root_sh.stdout"
+
+    # --- OPatch upgrade, now against the REAL db_home ------------------------------
+    # Only makes sense after runInstaller has actually populated db_home — before
+    # that (in the stage block above) db_home had nothing in it to upgrade. Same
+    # documented approach as every real 12.2.0.1/19c+ transcript checked for this
+    # exact step (Mike Dietrich, dbi-services): move the bundled OPatch/ aside, unzip
+    # the newer one in its place. `mv` (not `rm -Rf`) so a re-run isn't destructive if
+    # something between here and the apply step below needs the old one back.
+    #
+    # CHANGED 2026-08-12 (known-risks.md #38): no longer run_once/delegate_to node1
+    # only — this now runs on BOTH nodes. Confirmed the actual patch apply below goes
+    # through opatchauto from grid_home (not db_home/OPatch directly), but patch
+    # READMEs for this era commonly expect every home opatchauto touches to carry a
+    # current OPatch too, and node2's db_home was still sitting on the OUI-bundled
+    # 12.2.0.1.6 — cheap and safe to close that gap on both nodes before a first-time
+    # opatchauto run rather than leave it as an open variable.
+    - name: "Check current OPatch version in db_home"
+      command: "{{ db_home }}/OPatch/opatch version"
+      register: db_opatch_version_before
+      changed_when: false
+      failed_when: false
+      tags: [db_patch]
+
+    - name: "Move the bundled OPatch aside (idempotent — creates/removes below skip this once already done)"
+      command: "mv {{ db_home }}/OPatch {{ db_home }}/OPatch.bundled"
+      args:
+        creates: "{{ db_home }}/OPatch.bundled"
+        removes: "{{ db_home }}/OPatch"
+      become: true
+      become_user: "{{ oracle_user }}"
+      tags: [db_patch]
+
+    - name: "Extract the newer OPatch (MOS 6880880) into db_home"
+      unarchive:
+        src: "{{ db_opatch_zip }}"
+        dest: "{{ db_home }}"
+        remote_src: true
+        owner: "{{ oracle_user }}"
+        group: oinstall
+      tags: [db_patch]
+
+    - name: "Confirm new OPatch version in db_home"
+      command: "{{ db_home }}/OPatch/opatch version"
+      register: db_opatch_version_after
+      changed_when: false
+      tags: [db_patch]
+
+    - name: Report OPatch version change
+      debug:
+        msg: >
+          OPatch in {{ db_home }} on {{ inventory_hostname }}: was
+          "{{ (db_opatch_version_before.stdout_lines | default(['unknown']))[0] }}",
+          now "{{ db_opatch_version_after.stdout_lines[0] }}".
+      tags: [db_patch]
+
+    # --- STOP HERE for the actual patch application — manual, not automated -------
+    # Both the RU and the OJVM one-off are System Patches — plain `opatch prereq`/
+    # `opatch apply` against db_home refuses them ("This command doesn't support
+    # System Patch"). `opatchauto` is required, invoked from DB_HOME/OPatch (this is
+    # a DB-only RU with no GI component — opatchauto must run from the OPatch of the
+    # home actually named via -oh, not grid_home), as root, ON EACH NODE, in order:
+    #   1. RU, from DB_HOME/OPatch, on oradbserv05 THEN oradbserv06.
+    #   2. OJVM one-off, from DB_HOME/OPatch, WITH -oh/-nonrolling (OJVM is a
+    #      documented nonrolling patch type), on oradbserv05 THEN oradbserv06.
+    # opatchauto patches one node per invocation — nothing here rolls to the second
+    # node automatically. datapatch is NOT needed manually at this stage either way —
+    # no database exists yet (dbca_noncdb hasn't run); DBCA registers the SQL-level
+    # half automatically for databases it creates (docs/patching-strategy.md
+    # Mechanism 3). STILL a manual pause, not an Ansible `command:` task — root-
+    # privileged, touches both nodes: worth watching interactively (same philosophy
+    # as root.sh, #8/#24) rather than trusting it to a `changed_when`.
+    - name: "PAUSE — run the DB RU + OJVM patch application by hand, on BOTH nodes (see prompt for the exact commands)"
+      pause:
+        prompt: >
+          OPatch is upgraded in {{ db_home }} on both nodes. Software-only install +
+          root.sh are done on both nodes — nothing patched yet. Both patches are
+          System Patches — plain `opatch prereq`/`opatch apply` against db_home will
+          fail with "This command doesn't support System Patch." opatchauto is
+          required, and it patches ONE node per invocation — run every step below on
+          BOTH {{ groups['rac_nodes'][0] }} and {{ groups['rac_nodes'][1] }}, RU
+          before OJVM on each node:
+
+          opatchauto must be invoked from the OPatch of the home actually being
+          patched (db_home here, not grid_home — passing -oh for a home other than
+          the one opatchauto is run from fails with "opatchauto must run from one of
+          the homes specified"). Both steps below run from DB_HOME/OPatch:
+
+          STEP 1 — RU, via sudo, from DB_HOME/OPatch, on EACH node (opatchauto
+          requires root — run it with sudo directly, don't su - root first):
+            export ORACLE_HOME={{ db_home }}
+            export PATH=$PATH:$ORACLE_HOME/OPatch
+            cd $ORACLE_HOME/OPatch
+            sudo ./opatchauto apply {{ db_ru_patch_path }} -oh $ORACLE_HOME
+
+          STEP 2 — OJVM one-off, via sudo, from DB_HOME/OPatch, on EACH node
+          (nonrolling — this patch type doesn't support rolling apply):
+            sudo ./opatchauto apply {{ db_ojvm_patch_path }} -oh $ORACLE_HOME -nonrolling
+
+          Confirm afterward, on BOTH nodes:
+            {{ db_home }}/OPatch/opatch lsinventory
+
+          No manual datapatch needed yet — no database exists until dbca_noncdb runs;
+          DBCA registers the SQL-level patch automatically when it creates one. Press
+          ENTER once both patches are confirmed applied on both nodes. Ctrl+C to stop
+          the whole run here.
+      run_once: true
+      tags: [db_patch]
+
+    # The old opatch prereq/apply-against-db_home flow (what was here before this
+    # fix) is deliberately not kept inline — it's the exact command sequence that
+    # produced "This command doesn't support System Patch", and keeping it in live
+    # Ansible output risked getting copy-pasted by mistake. Full history (the error,
+    # why it's wrong, and the opatchauto resolution) is in known-risks.md #35/#38.
+
+    # --- PAUSE: software+patching done, decide here whether to continue into DBCA --
+    # ADDED 2026-08-10, per explicit instruction — this project's default path
+    # continues straight into dbca_noncdb (silent, fully automated, non-CDB General
+    # Purpose database) as its own separate play/tag right after this one. Not
+    # everyone wants that: creating the database by hand (interactive DBCA, a
+    # different template, a different naming/sizing/CDB choice, or just wanting to
+    # inspect the freshly-patched ORACLE_HOME before anything writes to it) is a
+    # completely valid stopping point, and up to here everything this role has done
+    # is safe to leave exactly as-is. Nothing about database creation has started yet.
+    #
+    # Unconditional, same reasoning as grid_stage's cluvfy pause (docs/known-risks.md
+    # #24) — always stop here for an explicit decision, not just on some failure
+    # condition. This doesn't actually control whether dbca_noncdb runs by itself —
+    # that's still governed entirely by whether you pass --tags dbca_noncdb — but if
+    # you DO run both tags in the same ansible-playbook invocation (e.g.
+    # --tags db_software,dbca_noncdb), this is the one place that actually stops
+    # the whole run before DBCA does anything.
+    - name: "PAUSE — DB software install + patching complete on both nodes. Continue to DBCA?"
+      pause:
+        prompt: >
+          DB software (12.2.0.1) is installed, root.sh has run on both nodes, and the
+          RU/OJVM patch application above should be complete — ORACLE_HOME is ready,
+          nothing about database creation has happened yet. Press ENTER only if you
+          want this run to continue into dbca_noncdb (silent, fully automated non-CDB
+          General Purpose database) — that only actually happens if this
+          ansible-playbook invocation also included --tags dbca_noncdb. Ctrl+C now to
+          stop here with just the software installed and patched — safe to do, and
+          the normal choice if you're creating the database by hand instead
+          (interactive DBCA, a different template, or your own silent dbca
+          command/response file).
+      run_once: true

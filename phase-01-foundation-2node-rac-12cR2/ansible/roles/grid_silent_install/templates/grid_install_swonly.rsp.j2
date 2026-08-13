@@ -1,0 +1,39 @@
+################################################################################
+# Grid Infrastructure 19.0.0 (19.3 base + RU 19.24) — PHASE A response file:
+# software-only install (oracle.install.option=CRS_SWONLY).
+#
+# This project uses a two-phase model (software-only, root scripts, THEN a
+# separate configure step) rather than a single-shot CRS_CONFIG install (stage +
+# configure in one gridSetup.sh call), because a real run using two-phase is what
+# actually got a live install past INS-32022/INS-32047 cleanly. See
+# docs/patching-strategy.md "Mechanism 2".
+#
+# This response file stages GRID_HOME on every node in clusterNodes below and
+# registers the central inventory. It does NOT configure the cluster — no ASM
+# diskgroup, no OCR/voting, no GIMR, no SCAN/network config happens in this phase.
+# That's all Phase B, via config.sh against grid_configure.rsp.j2 (grid_install.rsp.j2
+# in this same directory — kept that filename so existing references/docs pointing at
+# it don't dangle; see that file's own header for why). See
+# grid_silent_install/tasks/main.yml for the full two-phase task sequence.
+################################################################################
+
+oracle.install.responseFileVersion=/oracle/install/rspfmt_crsinstall_response_schema_v19.0.0
+
+INVENTORY_LOCATION={{ inventory_loc }}
+
+# Software-only — cluster configuration happens later, via config.sh + grid_configure.rsp.j2.
+oracle.install.option=CRS_SWONLY
+
+ORACLE_BASE={{ grid_base }}
+oracle.install.asm.OSDBA=asmdba
+oracle.install.asm.OSOPER=asmoper
+oracle.install.asm.OSASM=asmadmin
+
+# OUI still needs the node list to know where to copy GRID_HOME during a
+# software-only install — same clusterNodes list Phase B's response file carries.
+# VIP names are included for node:vip schema-format consistency even though VIPs
+# aren't actually configured until Phase B.
+oracle.install.crs.config.clusterNodes={% for n in nodes %}{{ n.name }}:{{ n.vip_name }}{% if not loop.last %},{% endif %}{% endfor %}
+
+# Not managing GI itself via Cloud Control/OEM at this phase.
+oracle.install.config.managementOption=NONE

@@ -1,0 +1,24 @@
+$TTL 3H
+@       IN SOA  {{ dns_master }}.{{ domain }}.        hostmaster.{{ domain }}. (
+                                {{ ansible_date_time.epoch }}   ; serial — epoch seconds, always increases on
+                                      ; every apply (see docs/known-risks.md #12). A static serial would let
+                                      ; the secondary (oradbserv06) keep serving an arbitrarily stale copy
+                                      ; indefinitely — it decides whether to pull a zone transfer by
+                                      ; comparing serials against the primary's.
+                                1D    ; refresh
+                                1H    ; retry
+                                1W    ; expire
+                                3H )  ; minimum
+        NS      {{ dns_master }}.{{ domain }}.
+        NS      {{ dns_secondary }}.{{ domain }}.
+
+localhost               A       127.0.0.1
+{% for n in nodes %}
+{{ n.name }}                A       {{ n.public_ip }}
+{{ n.vip_name }}            A       {{ n.vip_ip }}
+{{ n.priv_name }}           A       {{ n.priv_ip }}
+{% endfor %}
+{% for ip in scan_ips %}
+{{ scan_name }}              A       {{ ip }}
+{% endfor %}
+{{ chrony_master_hostname }}            A       {{ chrony_master_ip }}

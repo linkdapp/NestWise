@@ -1,0 +1,67 @@
+127.0.0.1   localhost localhost.localdomain
+
+# OEM Suite Server
+{{ chrony_master_ip }}    {{ chrony_master_hostname }}.{{ domain }}    {{ chrony_master_hostname }}
+
+# RAC DB Server — Public
+{% for n in nodes %}
+{{ n.public_ip }}   {{ n.name }}.{{ domain }}     {{ n.name }}
+{% endfor %}
+
+# RAC DB Server — Private
+{% for n in nodes %}
+{{ n.priv_ip }}     {{ n.priv_name }}.{{ domain }}   {{ n.priv_name }}
+{% endfor %}
+
+# RAC DB Server — Virtual (pre-resolve before GI install; GI manages the VIP resource after)
+{% for n in nodes %}
+{{ n.vip_ip }}      {{ n.vip_name }}.{{ domain }}   {{ n.vip_name }}
+{% endfor %}
+
+# SCAN — CHANGED 2026-08-10, per explicit instruction: back in /etc/hosts, but now
+# ALL {{ scan_ips | length }} IPs (was a single-IP "bootstrap fallback" entry,
+# which is what caused PRVG-11368/PRVG-11826/PRVF-4664 — see docs/known-risks.md
+# #28 for the full incident). Listing all {{ scan_ips | length }} here, sourced
+# from the same scan_ips list dns_bind serves, means default /etc/nsswitch.conf
+# order (files before dns) now returns the full, correct IP set either way — cluvfy
+# only checks IP-set count/consistency, not resolution mechanism, so this satisfies
+# it the same as pure DNS would. One real, known tradeoff: unlike DNS, Linux does
+# NOT round-robin multiple /etc/hosts entries for the same name by default (glibc
+# returns them in file order every time) — matters less than it sounds in practice,
+# since SCAN's actual client load-balancing happens at the SCAN listener protocol
+# layer once a connection reaches any of the {{ scan_ips | length }} listeners, not
+# purely from which IP a client's resolver picked first. Kept BIND running as the
+# source of truth either way (both are templated from the same scan_ips list, so
+# they can't drift out of sync with each other) — if cluvfy is still unhappy with
+# both in place, that'll point at something other than IP-set consistency.
+{% for ip in scan_ips %}
+{{ ip }}       {{ scan_name }}.{{ domain }}   {{ scan_name }}
+{% endfor %}
+
+# STANDBY RAC DB SERVER ({{ standby_cluster_name }}) — Phase 2 Data Guard target, not
+# built by this phase's playbooks yet. Added proactively on both clusters now so redo
+# transport / DG broker / manual connectivity checks don't need a separate hosts-file
+# pass once Phase 2 actually stands these nodes up — see group_vars/all.yml
+# standby_nodes and docs/network-and-hosts.md.
+
+# Standby — Public
+{% for n in standby_nodes %}
+{{ n.public_ip }}   {{ n.name }}.{{ domain }}     {{ n.name }}
+{% endfor %}
+
+# Standby — Private
+{% for n in standby_nodes %}
+{{ n.priv_ip }}     {{ n.priv_name }}.{{ domain }}   {{ n.priv_name }}
+{% endfor %}
+
+# Standby — Virtual
+{% for n in standby_nodes %}
+{{ n.vip_ip }}      {{ n.vip_name }}.{{ domain }}   {{ n.vip_name }}
+{% endfor %}
+
+# Standby SCAN — all standby_scan_ips, same pattern as the primary cluster's SCAN
+# above. Not yet actively relevant (Phase 2's own BIND zone for usatclust2 doesn't
+# exist yet), listed proactively for consistency — see docs/known-risks.md #12.
+{% for ip in standby_scan_ips %}
+{{ ip }}   {{ standby_scan_name }}.{{ domain }}   {{ standby_scan_name }}
+{% endfor %}

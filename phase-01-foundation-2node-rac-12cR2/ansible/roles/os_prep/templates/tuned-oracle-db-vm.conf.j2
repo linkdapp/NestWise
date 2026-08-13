@@ -1,0 +1,30 @@
+# Managed by ansible role os_prep — deployed as /etc/tuned/oracle-db-vm/tuned.conf,
+# activated via `tuned-adm profile oracle-db-vm`.
+#
+# Why this exists: `tuned-adm recommend` on a VirtualBox guest picks `virtual-guest`
+# by default, and virtual-guest sets vm.swappiness=30 (and, via its throughput-
+# performance parent, vm.dirty_ratio=30) — tuned actively re-applies these values
+# itself, so a plain /etc/sysctl.d file setting different numbers gets fought/
+# overridden rather than winning outright (confirmed on a real node: the sysctl.d
+# file rendered correctly and `sysctl --system` reported the right values
+# immediately after, but a later check showed vm.swappiness=30/vm.dirty_ratio=30 —
+# tuned's own periodic/start-time re-assertion had won). See docs/known-risks.md #23.
+#
+# Fix: a custom profile that inherits everything else virtual-guest provides
+# (network readahead, other virtualization tuning) via `include=`, but overrides
+# just the vm.* keys this project actually cares about — so tuned itself carries
+# the target values instead of fighting a separate file. The zz90-oracle-override.conf
+# sysctl.d file (os_prep's other sysctl task) keeps the same vm.* values too, as an
+# immediate-at-boot value before tuned finishes starting — redundant with this file
+# by design, not a conflict, since both target the same numbers.
+
+[main]
+include=virtual-guest
+
+[sysctl]
+vm.swappiness = 5
+vm.dirty_background_ratio = 3
+vm.dirty_ratio = 40
+vm.dirty_expire_centisecs = 1500
+vm.dirty_writeback_centisecs = 250
+vm.vfs_cache_pressure = 120
