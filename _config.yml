@@ -1,3 +1,13 @@
 theme: jekyll-theme-minimal
 title: NestWise
 description: Oracle DBA POC and learning resources
+ 
+# Keep Jekyll from parsing/publishing the Ansible automation. These files
+# start with "---" (plain YAML document markers) and contain Jinja2 syntax
+# (e.g. `| join(',')`, `{% if not loop.last %}`) that Jekyll's Liquid engine
+# misreads as front matter + template tags, which breaks the whole Pages build.
+exclude:
+  - phase-01-foundation-2node-rac-12cR2/ansible
+  - phase-01-foundation-2node-rac-12cR2/response-files
+  - phase-01-foundation-2node-rac-12cR2/scripts
+ 
