@@ -1,97 +1,142 @@
-<div align="center">
+# NestWise — a real application, running on a real Oracle high-availability platform
 
-# Road to OracleOCM
-
-### A hands-on Oracle Maximum Availability Architecture (MAA) home lab — built, broken, fixed, and documented in public.
-
-*2-Node RAC → Data Guard → GoldenGate at 12c, upgraded live through 19c to 26ai, alongside an OEM 13.5 → 24ai upgrade — all on a single VirtualBox host, all scripted, all showcased.*
-
-</div>
+**Road to Oracle OCM:** building a production-grade Oracle Maximum Availability
+Architecture (MAA) lab from scratch, on real infrastructure, then proving it works by
+running a real application on top of it — in public, mistakes included.
 
 ---
 
-## What this is
+## The short version
 
-I'm building a full Oracle Maximum Availability Architecture stack from the ground up, on my own hardware, to demonstrate OCM-level DBA skills end to end rather than in isolated demos. That means a real 2-node RAC cluster on ASM, Data Guard with Fast-Start Failover, GoldenGate replication (Classic, later migrated to Microservices), and two live upgrade cycles — 12c → 19c → 26ai — plus upgrading the Enterprise Manager stack watching all of it from 13.5 to 24ai. Everything is provisioned with code (Ansible, silent installs, response files), not click-through installers, so the whole lab is rebuildable from this repository.
+Companies don't pay Oracle DBAs to install software once and walk away. They pay
+them to keep systems running when hardware fails, data grows, and versions age out
+— without customers noticing. This project builds that skill set end to end: a real
+two-node database cluster, automatic failover, live version upgrades, and a working
+application layered on top, so the infrastructure has something real to protect
+instead of sitting there configured but unused.
 
-This repo is both the infrastructure-as-code for the lab and the write-up of what happened building it — including the parts that didn't work the first time. If you're a hiring manager or a fellow DBA, the folders below are organized so you can jump straight to the skill area you care about.
+**NestWise** is that application — a local-recommendations tool (good neighborhoods,
+restaurants, places to stay, what's playing nearby) built on Oracle APEX and ORDS.
+It's deliberately small. What matters isn't its feature list; it's that it's a real
+app, taking real traffic, depending on the platform underneath it actually staying up.
 
-**Status:** actively in progress. See [Project Status](#project-status) for what's built vs. planned.
+Where things stand right now: the database cluster is built and running a real
+database. Automatic failover protection (Data Guard) is next. NestWise goes live on
+top of that. From there the platform keeps growing — replication, security
+hardening, live version upgrades across two major Oracle releases, and eventually a
+second data source (MongoDB) feeding into the same app.
+
+Every step gets documented as it actually happened — including the parts that broke
+first. [`known-risks.md`](phase-01-foundation-2node-rac-12cR2/docs/known-risks.md) alone
+currently runs to 45 real, numbered issues hit and
+fixed during the build so far. That's the point: this isn't a polished diagram of
+what Oracle HA is supposed to look like, it's a record of building it.
 
 ---
 
-## Architecture
+## For the technical reader
 
 ```mermaid
 flowchart TB
-    subgraph N1["oradbserv05 — Oracle Linux 8"]
-        N1GI["Grid Infrastructure 19c + ASMLib<br/>(DB software: 12.2.0.1)"]
-        N1DB["DB instance: apexdb1<br/>(General Purpose, non-CDB)"]
-        N1DNS["BIND — primary NS"]
+    subgraph APP["Application Layer — NestWise"]
+        APEX["APEX + ORDS<br/>(Oracle-native app)"]
+        MONGO["MongoDB<br/>(NestWise v2 — later phase)"]
     end
 
-    subgraph N2["oradbserv06 — Oracle Linux 8"]
-        N2GI["Grid Infrastructure 19c + ASMLib<br/>(DB software: 12.2.0.1)"]
-        N2DB["DB instance: apexdb2<br/>(General Purpose, non-CDB)"]
-        N2DNS["BIND — secondary NS"]
+    subgraph CORE["Oracle MAA Core"]
+        direction TB
+        RAC["2-Node RAC<br/>GI 19c + DB 12.2.0.1"]
+        DG["Data Guard + Fast-Start Failover"]
+        GG["GoldenGate Classic"]
     end
 
-    subgraph ASM["Shared ASMLib Storage — 6x 50GB, EXTERNAL redundancy"]
-        DATA01[("DATA01 diskgroup<br/>2 disks, datafiles")]
-        DATA02[("DATA02 diskgroup<br/>2 disks, extra capacity")]
-        RECO01[("RECO01 diskgroup<br/>2 disks, Fast Recovery Area")]
+    subgraph MGMT["Management"]
+        OEM["Enterprise Manager 13.5<br/>(→ 24ai, later phase)"]
     end
 
-    SCAN{{"SCAN: scan-usatclust1.usat.com<br/>3 VIPs, round-robin via BIND"}}
-
-    subgraph OEM["oemserver01"]
-        CHRONY["chrony — local stratum-10 time master"]
-        EM["Enterprise Manager 13.5<br/>(→ 24ai, later phase)"]
-    end
-
-    subgraph FUTURE["Planned — later roadmap phases"]
-        STANDBY["Standby DB<br/>Data Guard + Fast-Start Failover"]
-        GG["GoldenGate<br/>Classic → Microservices"]
-        APEXAPP["APEX + ORDS + WebLogic 14<br/>test application"]
-    end
-
-    N1GI <--> |cluster interconnect| N2GI
-    N1GI --- DATA01
-    N2GI --- DATA01
-    N1GI --- DATA02
-    N2GI --- DATA02
-    N1GI --- RECO01
-    N2GI --- RECO01
-    N1 --- SCAN
-    N2 --- SCAN
-    N1DNS -. zone transfer .-> N2DNS
-    CHRONY -. NTP .-> N1
-    CHRONY -. NTP .-> N2
-    N1DB -.-> STANDBY
-    N1DB -.-> GG
+    APEX --> RAC
+    RAC --> DG
+    RAC --> GG
+    MONGO -.-> APEX
+    OEM --> RAC
+    OEM --> DG
 
     classDef built fill:#1b5e3a,stroke:#0d3d26,color:#ffffff
+    classDef next fill:#7a5c00,stroke:#4d3900,color:#ffffff
     classDef planned fill:#4a4a4a,stroke:#888888,color:#dddddd,stroke-dasharray: 4 4
-    class N1GI,N1DB,N1DNS,N2GI,N2DB,N2DNS,DATA01,DATA02,RECO01,SCAN,CHRONY built
-    class STANDBY,GG,APEXAPP,EM planned
+    class RAC,OEM built
+    class DG next
+    class APEX,MONGO,GG planned
 ```
 
-🟩 **Solid green** = built and working today. ⬜ **Dashed gray** = planned, not built yet — see the roadmap before assuming otherwise.
+🟩 Built &nbsp;&nbsp; 🟨 In progress — up next &nbsp;&nbsp; ⬜ Planned
 
-Single VirtualBox host (32 vCPU / 128GB RAM), Oracle Linux 8 throughout — chosen deliberately because it's the one OS certified for both 12.2.0.1 today *and* 26ai at the end of this roadmap, so the project never needs a mid-build OS migration. Node 1 is built and verified by hand, then cloned via Ansible to produce node 2, rather than each node being configured independently — see [`phase-01-foundation-2node-rac-12cR2/docs/golden-image-and-cloning.md`](phase-01-foundation-2node-rac-12cR2/docs/golden-image-and-cloning.md). Full network/DNS/time-sync design (including the addressing already reserved for Phase 2's second RAC cluster, `usatclust2`) lives in [`phase-01-foundation-2node-rac-12cR2/docs/network-and-hosts.md`](phase-01-foundation-2node-rac-12cR2/docs/network-and-hosts.md).
+Single VirtualBox host (32 vCPU / 128GB RAM). RAC (Real Application Clusters) lets
+both nodes serve the same database at once, so losing one doesn't mean losing the
+database; ASM (Automatic Storage Management) is Oracle's own storage layer underneath
+it, in place of a generic filesystem. Node 1 (`oradbserv05`) is built and
+verified by hand, then cloned via Ansible to produce node 2 (`oradbserv06`) — see
+[`phase-01-foundation-2node-rac-12cR2/docs/golden-image-and-cloning.md`](phase-01-foundation-2node-rac-12cR2/docs/golden-image-and-cloning.md).
+Grid Infrastructure runs 19c against a 12.2.0.1 database home — a deliberate,
+independently-versioned pairing, not a mismatch; see
+[`known-risks.md` #2](phase-01-foundation-2node-rac-12cR2/docs/known-risks.md). Full
+network/DNS/time-sync design lives in
+[`network-and-hosts.md`](phase-01-foundation-2node-rac-12cR2/docs/network-and-hosts.md).
 
 ---
 
-## How this repo is organized
+## What is NestWise?
 
-Two different audiences read this repo, so it's split two ways on purpose:
+NestWise is a small, complete application that helps someone pick a neighborhood to
+live in or stay in. It ships in two stages, and nothing below is built yet — this is
+the plan, tracked honestly as "next" and "later," not "done":
 
-- **Topic folders** (`installation/`, `maintenance/`, `monitoring/`, `high-availability/`, `backup-recovery/`, `performance-tuning/`) — the showcase side. Each one is a self-contained write-up: a detailed, SOP-style runbook plus a `screenshots/` folder of evidence. This is organized by **DBA skill area**, the way a hiring manager or another DBA would browse a portfolio — not by build order.
-- **`phase-NN-*/` folders** (e.g. `phase-01-foundation-2node-rac-12cR2/`) — the actual infrastructure-as-code (Ansible roles, silent-install response files, patch scripts) that builds the lab, one per roadmap phase. Kept separate from the topic folders because the code has real sequencing/dependency constraints a skill-area view doesn't need to expose.
+- **v1 (next up after Data Guard):** Oracle APEX + ORDS, pure Oracle end to end —
+  restaurant/neighborhood data and basic accounts, all in the RAC-protected database.
+- **v2 (later phase, after cross-database integration is built):** the same app
+  extended with MongoDB as a second data source — listings, weather, local-venue
+  data — proving the platform handles polyglot (relational + document) data, not
+  just Oracle.
 
-A single build phase can touch more than one topic — Phase 1, for example, is entirely about installation, but its ASM layout choices get referenced again later from `performance-tuning/`. Rather than duplicate content, the topic-folder SOPs link into the specific `phase-NN-*/` folder where the real commands and response files live.
+It stays intentionally simple. The point isn't the app — it's that a real
+application is what turns "a RAC cluster with failover configured" into "a RAC
+cluster that keeps an application up," which is the thing a company actually pays
+for.
 
-`planning/` holds the project-level docs: gap analysis, the full phase roadmap, and the showcase-post template used to draft each phase's write-up.
+---
+
+## Project status
+
+| Phase | Focus | Status | NestWise tie-in |
+|---|---|---|---|
+| 0/1 | Foundation + 2-node RAC (GI 19c, DB 12.2.0.1, ASM) | 🟩 Built | The platform NestWise runs on |
+| 2 | Data Guard (Broker + Fast-Start Failover) | 🟨 In progress | HA for NestWise before it goes live |
+| 3 | **NestWise v1** — APEX + ORDS application | ⬜ Next | The application itself |
+| 4 | GoldenGate Classic replication | ⬜ Planned | — |
+| 5 | Security + performance baseline (TDE, Unified Audit, AWR/ADDM) | ⬜ Planned | Hardens and tunes NestWise's backend |
+| 6 | Upgrade 12c → 19c (AutoUpgrade) | ⬜ Planned | Live upgrade with NestWise running on it |
+| 7 | OEM 13.5 → 24ai + Fleet Maintenance | ⬜ Planned | Full observability of NestWise |
+| 8 | GoldenGate Classic → Microservices | ⬜ Planned | — |
+| 9 | Upgrade 19c → 26ai | ⬜ Planned | AI-native features (Vector Search, Select AI) |
+| 10 | **NestWise v2** — MongoDB cross-database integration | ⬜ Planned | Hybrid relational + document data |
+| 11 | Automation & CI/CD wrap-up | ⬜ Planned | Fully rebuildable NestWise demo |
+| 12 | Capstone | ⬜ Planned | End-to-end OCM-style walkthrough |
+
+Full phase detail: [`02-roadmap-skeleton.md`](02-roadmap-skeleton.md).
+
+---
+
+## How the repo is organized
+
+- **Topic folders** (`installation/`, `high-availability/`, `performance-tuning/`,
+  `backup-recovery/`, `monitoring/`, `maintenance/`) — the showcase side, organized by
+  DBA skill area the way a hiring manager or another DBA would browse a portfolio.
+  Each is a self-contained SOP plus a `screenshots/`/real-output evidence trail.
+- **`phase-NN-*/` folders** (e.g. `phase-01-foundation-2node-rac-12cR2/`) — the actual
+  infrastructure-as-code (Ansible roles, silent-install response files, patch
+  scripts) that builds the lab, one per roadmap phase.
+- **NestWise** gets its own documentation once it's actually built (Phase 3) — this
+  README tracks the plan; it won't claim the app exists before it does.
 
 ```
 Oracle-DBA-POC/
@@ -99,25 +144,12 @@ Oracle-DBA-POC/
 ├── 01-gap-analysis-and-questions.md            planning: blueprint gap analysis
 ├── 02-roadmap-skeleton.md                      planning: full phased roadmap
 ├── 03-showcase-post-template.md                planning: post template
-├── 04-skill-content-draft.md                   planning: supporting notes
 ├── installation/                               🟩 built — SOP + screenshots
-│   ├── README.md
-│   └── screenshots/
-├── high-availability/                          ⬜ planned — Data Guard, RAC failover, Application Continuity
-│   ├── README.md
-│   └── screenshots/
+├── high-availability/                          ⬜ planned — Data Guard, GoldenGate, NestWise app
 ├── backup-recovery/                            ⬜ planned — RMAN, Data Pump
-│   ├── README.md
-│   └── screenshots/
 ├── performance-tuning/                         ⬜ planned — AWR/ADDM/SQL Tuning Advisor
-│   ├── README.md
-│   └── screenshots/
 ├── monitoring/                                 ⬜ planned — OEM 13.5→24ai, AHF/orachk
-│   ├── README.md
-│   └── screenshots/
 ├── maintenance/                                ⬜ planned — patching, AutoUpgrade, Fleet Maintenance
-│   ├── README.md
-│   └── screenshots/
 └── phase-01-foundation-2node-rac-12cR2/        the actual Ansible/scripts for Phase 1
     ├── README.md
     ├── docs/
@@ -126,53 +158,28 @@ Oracle-DBA-POC/
     └── scripts/
 ```
 
-Later phases get their own `phase-NN-*/` sibling folder as they're built (`phase-02-data-guard-goldengate/`, and so on) rather than everything piling into one folder.
-
----
-
-## Project status
-
-| Phase | Focus | Topic folder(s) | Status |
-|---|---|---|---|
-| 0/1 | Foundation, IaC, 2-node RAC + ASM, non-CDB database | [`installation/`](installation/) | 🟩 Built |
-| 2 | Data Guard (Broker + FSFO) + GoldenGate Classic | `high-availability/` | ⬜ Planned |
-| 3 | Security (TDE, Unified Audit, Data Redaction) + performance baseline | `performance-tuning/` | ⬜ Planned |
-| 4 | Upgrade 12c → 19c (AutoUpgrade) | `maintenance/` | ⬜ Planned |
-| 5 | OEM 13.5 → 24ai + Fleet Maintenance | `monitoring/` | ⬜ Planned |
-| 6 | GoldenGate Classic → Microservices | `high-availability/` | ⬜ Planned |
-| 7 | Upgrade 19c → 26ai | `maintenance/` | ⬜ Planned |
-| 8 | Cross-database integration (MongoDB, SQL Server) | — | ⬜ Planned |
-| 9 | APEX + ORDS + WebLogic test app | — | ⬜ Planned |
-| 10 | Automation & CI/CD wrap-up | — (spans all `phase-NN-*/` folders) | ⬜ Planned |
-| 11 | Capstone | — | ⬜ Planned |
-
-Full detail on every phase: `02-roadmap-skeleton.md`.
-
-**Note on this first push:** only Phase 0/1's actual build content is live —
-`installation/` (the SOP + screenshots) and `phase-01-foundation-2node-rac-12cR2/`
-(the Ansible/IaC that builds it). The other topic folders (`high-availability/`,
-`backup-recovery/`, `performance-tuning/`, `monitoring/`, `maintenance/`) are included
-too, but each is still just its "Status: Planned — not built yet" placeholder README —
-included now so the roadmap structure above is browsable end to end, not to imply
-they're built. They fill in with real SOPs and screenshots as each phase actually
-happens. The roadmap docs (`01`–`03-*.md`) are included as well; `04-skill-content-draft.md`
-is held back — it's working notes for this project's Claude skill configuration, not
-part of the lab itself.
-
 ---
 
 ## Standing toolkit
 
-A few tools show up across every phase rather than belonging to just one:
-
-- **Swingbench** — load generation, so HA/DR claims ("failover barely interrupted the app") have an actual throughput chart behind them, not just a log line.
-- **Oracle Autonomous Health Framework (AHF)** — compliance checks (the modern home of `orachk`) run before and after every patch/upgrade, diffed as evidence.
+- **Swingbench** — drives real, sustained load so HA/DR claims have an actual
+  throughput chart behind them, not just a log line saying "failover completed."
+  Once NestWise is live, this is what proves it barely noticed a switchover.
+- **Oracle Autonomous Health Framework (AHF)** — compliance checks (the modern home
+  of `orachk`) run before and after every patch/upgrade, diffed as evidence.
 - **SQL Developer** — everyday query/schema work across the estate.
 
-Two things shape the design without being tools themselves: this build follows Oracle's **Maximum Availability Architecture (MAA)** reference design, and its filesystem layout follows **Optimal Flexible Architecture (OFA)** conventions from Phase 0 onward.
+Two things shape the design without being tools themselves: this build follows
+Oracle's **Maximum Availability Architecture (MAA)** reference design, and its
+filesystem layout follows **Optimal Flexible Architecture (OFA)** conventions from
+Phase 0 onward.
 
 ---
 
 ## About
 
-Built and documented by James as a public, hands-on demonstration of Oracle DBA skills at OCM depth — installation, high availability, backup/recovery, performance, monitoring, and maintenance, all exercised on real infrastructure rather than described in the abstract.
+Built and documented in public by James as a hands-on demonstration of Oracle DBA
+skills at OCM depth — installation, high availability, backup/recovery, performance,
+monitoring, maintenance, and (starting Phase 3) a real application running on top of
+all of it. Not a collection of isolated demos: a living platform that gets an actual
+workload once NestWise goes live, and stays live through every upgrade after that.
