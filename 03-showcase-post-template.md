@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "PHASE TITLE — e.g. Same Server, Two Jobs: Data Guard and GoldenGate Side by Side"
-date: YYYY-MM-DD
+date: 2026-08-12
 categories: [oracle, ocm, dba]
 tags: [dataguard, goldengate, rac, oem, oracle-linux]
 ---
