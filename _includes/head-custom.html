@@ -1,0 +1,13 @@
+<!--
+  Loads Mermaid.js so any `<pre class="mermaid">...</pre>` block on the page
+  renders as an actual diagram instead of plain text. Harmless on pages with
+  no mermaid content — mermaid.js just finds nothing to render.
+
+  minima's own _includes/head.html includes this file automatically if it
+  exists in the site (documented theme customization point) — no need to
+  override head.html itself.
+-->
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true });
+</script>
