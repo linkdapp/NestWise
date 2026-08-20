@@ -1,0 +1,13 @@
+{
+  "name": "nestwise-mongo-proxy",
+  "version": "1.0.0",
+  "description": "Thin read-only REST proxy fronting MongoDB for NestWise APEX pages (see docs/architecture.md).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mongodb": "^6.8.0"
+  }
+}

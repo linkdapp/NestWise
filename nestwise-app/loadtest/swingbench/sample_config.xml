@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  NestWise — sample_config.xml
+  Custom Swingbench benchmark definition, hand-authored against NestWise's
+  actual PL/SQL packages (see workload_notes.md for why this path was chosen
+  over a bundled SOE/SH run). This is a STARTING POINT, not a drop-in file —
+  Swingbench's exact XML schema varies slightly by version; validate it opens
+  cleanly in the Swingbench "Benchmark Wizard" / "Load Generator" for your
+  installed version before a real run, and adjust element names if needed.
+
+  Connect string points at the RAC SCAN listener deliberately, so this run
+  exercises the cluster the same way the real APEX app does.
+-->
+<Benchmark name="NestWiseBenchmark" xmlns="http://www.dominicgiles.com/swingbench">
+
+  <ConnectionPool>
+    <ConnectString>//&lt;scan-name&gt;:1521/&lt;service_name&gt;</ConnectString>
+    <Username>nestwise</Username>
+    <Password>{use a Swingbench-encrypted password or prompt at runtime}</Password>
+    <MinConnections>10</MinConnections>
+    <MaxConnections>100</MaxConnections>
+  </ConnectionPool>
+
+  <RunTime>
+    <RampUpSeconds>60</RampUpSeconds>
+    <DurationSeconds>600</DurationSeconds>
+    <MinThinkTimeMs>500</MinThinkTimeMs>
+    <MaxThinkTimeMs>2000</MaxThinkTimeMs>
+  </RunTime>
+
+  <!-- Users stepped externally via the CLI: -uc 10, then 25, 50, 100, per
+       workload_notes.md. Set a starting point here for a single run. -->
+  <Users>
+    <MinUsers>10</MinUsers>
+    <MaxUsers>100</MaxUsers>
+  </Users>
+
+  <Transactions>
+
+    <!-- 25% — Neighborhood Explorer, default landing state -->
+    <Transaction id="BrowseNeighborhoods" weight="25">
+      <SQLStatement type="PLSQL_BLOCK">
+        <![CDATA[
+          DECLARE
+            v_cursor SYS_REFCURSOR;
+          BEGIN
+            v_cursor := nbhd_pkg.list_neighborhoods(p_city => 'San Francisco', p_search => NULL);
+            CLOSE v_cursor;
+          END;
+        ]]>
+      </SQLStatement>
+    </Transaction>
+
+    <!-- 10% — Neighborhood Explorer with a search term -->
+    <Transaction id="SearchNeighborhoods" weight="10">
+      <SQLStatement type="PLSQL_BLOCK" bindVariables="search_term">
+        <![CDATA[
+          DECLARE
+            v_cursor SYS_REFCURSOR;
+          BEGIN
+            v_cursor := nbhd_pkg.list_neighborhoods(p_city => 'San Francisco', p_search => :search_term);
+            CLOSE v_cursor;
+          END;
+        ]]>
+        <!-- :search_term drawn at runtime from a small pool: 'Mission','Hayes',
+             'North','SoMa','Castro','Noe','Richmond','Marina' -->
+      </SQLStatement>
+    </Transaction>
+
+    <!-- 25% — Restaurant Finder's dominant filter query -->
+    <Transaction id="FilterRestaurants" weight="25">
+      <SQLStatement type="PLSQL_BLOCK" bindVariables="cuisine,price_range,min_rating">
+        <![CDATA[
+          DECLARE
+            v_cursor SYS_REFCURSOR;
+          BEGIN
+            v_cursor := restaurant_pkg.search(
+                p_cuisine     => :cuisine,
+                p_price_range => :price_range,
+                p_min_rating  => :min_rating
+            );
+            CLOSE v_cursor;
+          END;
+        ]]>
+        <!-- :cuisine drawn from restaurant_pkg.list_cuisines' output set,
+             :price_range from ('$','$$','$$$','$$$$'), :min_rating from
+             (0, 3.5, 4.0, 4.5) -->
+      </SQLStatement>
+    </Transaction>
+
+    <!-- 15% — favorite toggle, the write transaction -->
+    <Transaction id="ToggleFavorite" weight="15">
+      <SQLStatement type="PLSQL_BLOCK" bindVariables="app_user,neighborhood_id">
+        <![CDATA[
+          BEGIN
+            nbhd_pkg.toggle_favorite(p_app_user => :app_user, p_neighborhood_id => :neighborhood_id);
+          END;
+        ]]>
+        <!-- :app_user drawn from a 10-20 row pool of synthetic users
+             pre-inserted into user_preferences; :neighborhood_id random 1-8 -->
+      </SQLStatement>
+    </Transaction>
+
+    <!-- 15% — the heaviest read: full-table scored recommendation sort -->
+    <Transaction id="RecommendRestaurants" weight="15">
+      <SQLStatement type="PLSQL_BLOCK" bindVariables="app_user">
+        <![CDATA[
+          DECLARE
+            v_cursor SYS_REFCURSOR;
+          BEGIN
+            v_cursor := restaurant_pkg.recommend_for_user(p_app_user => :app_user);
+            CLOSE v_cursor;
+          END;
+        ]]>
+      </SQLStatement>
+    </Transaction>
+
+    <!-- 10% — Neighborhood Detail page's Oracle half -->
+    <Transaction id="GetNeighborhoodStats" weight="10">
+      <SQLStatement type="PLSQL_BLOCK" bindVariables="neighborhood_id">
+        <![CDATA[
+          DECLARE
+            v_cursor SYS_REFCURSOR;
+          BEGIN
+            v_cursor := nbhd_pkg.get_stats(p_neighborhood_id => :neighborhood_id);
+            CLOSE v_cursor;
+          END;
+        ]]>
+      </SQLStatement>
+    </Transaction>
+
+  </Transactions>
+
+</Benchmark>

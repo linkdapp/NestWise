@@ -117,7 +117,7 @@ for.
 |---|---|---|---|
 | 0/1 | [Foundation + 2-node RAC](installation/README.md) (GI 19c, DB 12.2.0.1, ASM) | 🟩 Built | The platform NestWise runs on |
 | 2 | [Data Guard](high-availability/README.md) (Active DG, Broker, Fast-Start Failover, post-checks) | 🟩 Built | HA for NestWise before it goes live |
-| 3 | **NestWise v1** — APEX + ORDS application | ⬜ Next | The application itself |
+| 3 | **[NestWise](nestwise-app/docs/architecture.md)** — APEX + ORDS + MongoDB hybrid application | 🟨 In progress — scaffold built, not yet deployed/run | The application itself |
 | 4 | GoldenGate Classic replication | ⬜ Planned | — |
 | 5 | Security + performance baseline (TDE, Unified Audit, AWR/ADDM) | ⬜ Planned | Hardens and tunes NestWise's backend |
 | 6 | Upgrade 12c → 19c (AutoUpgrade) | ⬜ Planned | Live upgrade with NestWise running on it |
@@ -149,8 +149,11 @@ Full phase detail: [`02-roadmap-skeleton.md`](02-roadmap-skeleton.md).
 - **`phase-NN-*/` folders** (e.g. `phase-01-foundation-2node-rac-12cR2/`) — the actual
   infrastructure-as-code (Ansible roles, silent-install response files, patch
   scripts) that builds the lab, one per roadmap phase.
-- **NestWise** gets its own documentation once it's actually built (Phase 3) — this
-  README tracks the plan; it won't claim the app exists before it does.
+- **[`nestwise-app/`](nestwise-app/docs/architecture.md)** — the application itself (Phase 3):
+  Oracle schema/packages, MongoDB seed data, ORDS REST modules, a thin Node proxy
+  fronting MongoDB, the APEX page plan, and a custom Swingbench workload. Scaffold is
+  complete; this README won't claim it's deployed and running until that's confirmed
+  against the real cluster, same standard as every other phase here.
 
 ```
 Oracle-DBA-POC/
