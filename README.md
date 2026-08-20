@@ -21,14 +21,16 @@ It's deliberately small. What matters isn't its feature list; it's that it's a r
 app, taking real traffic, depending on the platform underneath it actually staying up.
 
 Where things stand right now: the database cluster is built and running a real
-database. Automatic failover protection (Data Guard) is next. NestWise goes live on
-top of that. From there the platform keeps growing — replication, security
+database, and automatic failover protection (Data Guard — broker, Fast-Start
+Failover, and a real Swingbench-driven switchover test with a genuine throughput
+dip and recovery) is confirmed. NestWise (v1) is next, going live on top of that
+foundation. From there the platform keeps growing — replication, security
 hardening, live version upgrades across two major Oracle releases, and eventually a
 second data source (MongoDB) feeding into the same app.
 
 Every step gets documented as it actually happened — including the parts that broke
 first. [`known-risks.md`](phase-01-foundation-2node-rac-12cR2/docs/known-risks.md) alone
-currently runs to 45 real, numbered issues hit and
+currently runs to 47 real, numbered issues hit and
 fixed during the build so far. That's the point: this isn't a polished diagram of
 what Oracle HA is supposed to look like, it's a record of building it.
 
@@ -64,9 +66,9 @@ flowchart TB
     classDef built fill:#1b5e3a,stroke:#0d3d26,color:#ffffff
     classDef next fill:#7a5c00,stroke:#4d3900,color:#ffffff
     classDef planned fill:#4a4a4a,stroke:#888888,color:#dddddd,stroke-dasharray: 4 4
-    class RAC,OEM built
-    class DG next
-    class APEX,MONGO,GG planned
+    class RAC,OEM,DG built
+    class APEX next
+    class MONGO,GG planned
 ```
 
 🟩 Built &nbsp;&nbsp; 🟨 In progress — up next &nbsp;&nbsp; ⬜ Planned
@@ -109,8 +111,8 @@ for.
 
 | Phase | Focus | Status | NestWise tie-in |
 |---|---|---|---|
-| 0/1 | Foundation + 2-node RAC (GI 19c, DB 12.2.0.1, ASM) | 🟩 Built | The platform NestWise runs on |
-| 2 | Data Guard (Broker + Fast-Start Failover) | 🟨 In progress | HA for NestWise before it goes live |
+| 0/1 | [Foundation + 2-node RAC](installation/README.md) (GI 19c, DB 12.2.0.1, ASM) | 🟩 Built | The platform NestWise runs on |
+| 2 | [Data Guard](high-availability/README.md) (Active DG, Broker, Fast-Start Failover, post-checks) | 🟩 Built | HA for NestWise before it goes live |
 | 3 | **NestWise v1** — APEX + ORDS application | ⬜ Next | The application itself |
 | 4 | GoldenGate Classic replication | ⬜ Planned | — |
 | 5 | Security + performance baseline (TDE, Unified Audit, AWR/ADDM) | ⬜ Planned | Hardens and tunes NestWise's backend |
@@ -128,10 +130,18 @@ Full phase detail: [`02-roadmap-skeleton.md`](02-roadmap-skeleton.md).
 
 ## How the repo is organized
 
-- **Topic folders** (`installation/`, `high-availability/`, `performance-tuning/`,
-  `backup-recovery/`, `monitoring/`, `maintenance/`) — the showcase side, organized by
-  DBA skill area the way a hiring manager or another DBA would browse a portfolio.
-  Each is a self-contained SOP plus a `screenshots/`/real-output evidence trail.
+- **Topic folders** — the showcase side, organized by DBA skill area the way a hiring
+  manager or another DBA would browse a portfolio. Each is a self-contained SOP plus a
+  `screenshots/`/real-output evidence trail:
+  - [`installation/`](installation/README.md) — 🟩 built
+  - [`high-availability/`](high-availability/README.md) — 🟩 built:
+    [Part 1: Active Data Guard](high-availability/part1-active-data-guard.md) 🟩,
+    [Part 2: Broker, FSFO, Observer](high-availability/part2-broker-fsfo-observer.md) 🟩,
+    [Part 3: Post checks](high-availability/part3-post-checks.md) 🟩
+  - [`backup-recovery/`](backup-recovery/README.md) — ⬜ planned
+  - [`performance-tuning/`](performance-tuning/README.md) — ⬜ planned
+  - [`monitoring/`](monitoring/README.md) — ⬜ planned
+  - [`maintenance/`](maintenance/README.md) — ⬜ planned
 - **`phase-NN-*/` folders** (e.g. `phase-01-foundation-2node-rac-12cR2/`) — the actual
   infrastructure-as-code (Ansible roles, silent-install response files, patch
   scripts) that builds the lab, one per roadmap phase.
@@ -145,7 +155,7 @@ Oracle-DBA-POC/
 ├── 02-roadmap-skeleton.md                      planning: full phased roadmap
 ├── 03-showcase-post-template.md                planning: post template
 ├── installation/                               🟩 built — SOP + screenshots
-├── high-availability/                          ⬜ planned — Data Guard, GoldenGate, NestWise app
+├── high-availability/                          🟩 built — all 3 parts confirmed
 ├── backup-recovery/                            ⬜ planned — RMAN, Data Pump
 ├── performance-tuning/                         ⬜ planned — AWR/ADDM/SQL Tuning Advisor
 ├── monitoring/                                 ⬜ planned — OEM 13.5→24ai, AHF/orachk

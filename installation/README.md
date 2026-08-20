@@ -1240,6 +1240,19 @@ Expected: both instances (`apexdb1`, `apexdb2`) `OPEN`, `CDB=NO`, `DATA01`/`RECO
 *(Full output captured above — `srvctl config all`, `gv$instance` showing both
 instances OPEN, `CDB=NO`. No separate screenshot for this step.)*
 
+**Ongoing monitoring, after this one-time validation.** A cluster this size needs
+routine log/incident hygiene, not just a one-time health check —
+[`cluster_log_monitor.sh`](../high-availability/scripts/cluster_log_monitor.sh)
+covers that: ADRCI purging (15-day retention), OS-level trace/cdump/incident
+cleanup (`-mtime +2`), weekly alert-log rotation and compression, and a pattern
+scan (`ORA-[0-9]{5}|FATAL|CORRUPTION`) across the database, CRS, ASM, and listener
+alert logs, emailing on anything found. Built for cron — its own header documents
+`*/15 * * * *` as a starting interval. It lives under
+`high-availability/scripts/` rather than here because it was written alongside
+this project's Data Guard monitoring scripts, but its actual job (RAC/GI log
+housekeeping) starts as soon as the cluster in this section is up — nothing about
+it is Data Guard-specific.
+
 ---
 
 ## 15. Screenshot checklist and naming convention
