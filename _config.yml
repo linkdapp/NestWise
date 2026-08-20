@@ -1,13 +1,38 @@
 theme: minima
 title: NestWise
 description: Oracle DBA POC and learning resources
- 
+
+# Curated top-nav. Without this, minima defaults to listing every markdown file
+# in the repo that Jekyll treats as a page (GitHub Pages auto-derives a title from
+# each file's first heading via jekyll-titles-from-headings even with no front
+# matter), which was dumping internal drafts and a literal post-template placeholder
+# into the public nav alongside real docs. Each entry below is a real, built entry
+# point; each one links out to its own sub-pages (HA parts 1-3, phase-01's docs/
+# subsection files) rather than flattening everything into the global bar.
+header_pages:
+  - installation/README.md
+  - high-availability/README.md
+  - phase-01-foundation-2node-rac-12cR2/README.md
+  - phase-01-foundation-2node-rac-12cR2/docs/known-risks.md
+  - tools/swingbench/README.md
+
 # Keep Jekyll from parsing/publishing the Ansible automation. These files
 # start with "---" (plain YAML document markers) and contain Jinja2 syntax
 # (e.g. `| join(',')`, `{% if not loop.last %}`) that Jekyll's Liquid engine
 # misreads as front matter + template tags, which breaks the whole Pages build.
+#
+# Also excludes root-level working/draft files (gap analysis, roadmap skeleton,
+# skill-content draft, rebrand notes, and the showcase-post template) so they
+# don't get swept into site.pages and appear in the nav — they're planning
+# documents, not published pages. The showcase-post template in particular has
+# `layout: post` and a literal placeholder title; it belongs in _posts/ once
+# real posts exist, not at the repo root.
 exclude:
   - phase-01-foundation-2node-rac-12cR2/ansible
   - phase-01-foundation-2node-rac-12cR2/response-files
   - phase-01-foundation-2node-rac-12cR2/scripts
- 
+  - 01-gap-analysis-and-questions.md
+  - 02-roadmap-skeleton.md
+  - 03-showcase-post-template.md
+  - 04-skill-content-draft.md
+  - 05-repo-rebrand-and-metadata.md
