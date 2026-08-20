@@ -1,0 +1,1348 @@
+---
+# Data Guard Phase 6 — Convert the single-instance standby (apexdb_stby) to a
+# 2-node RAC standby, matching the primary's own RAC configuration. Runs
+# after Phase 5 (dataguard_srl_cleanup) — the SRL de-multiplexing is basic
+# housekeeping on the single-instance standby and doesn't need CRS
+# registration first, so it's sequenced before this phase.
+#
+# IMPORTANT — what this phase is NOT: it does not install or configure Grid
+# Infrastructure on oradbserv10. usatclust2 has been a real, fully-formed
+# 2-node GI cluster since Section 9 (grid_silent_install) — crsctl stat res -t
+# already shows both oradbserv09 and oradbserv10 online for every cluster
+# resource. The only thing that was ever single-instance was the DATABASE
+# itself (apexdb_stby), because RMAN DUPLICATE ... FOR STANDBY (Phase 4)
+# necessarily creates one instance first. This phase is "register the
+# database with CRS and add the second instance," not "build a cluster."
+#
+# Deliberately NOT using rconfig: Oracle's documented rconfig XML converter
+# (ConvertToRAC_AdminManaged.xml) targets a plain single-instance PRIMARY
+# database — it doesn't understand a database already in the physical
+# standby role and doesn't touch managed recovery at all. The real,
+# standby-specific procedure is manual: stop MRP, add per-instance
+# thread/instance_number/undo_tablespace parameters, register with srvctl,
+# start each instance in MOUNT (never OPEN — it's a physical standby), then
+# restart managed recovery. Confirmed against a real-world writeup of this
+# exact scenario (Jason Brown, "Convert a single instance standby (dataguard)
+# into a RAC Standby", jasonbrownsite.wordpress.com, 2017) and cross-checked
+# against Oracle's own 19c RAC Administration and Deployment Guide chapter,
+# "Converting Single-Instance Oracle Databases to Oracle RAC and Oracle RAC
+# One Node" — see docs/known-risks.md #114 for the full reasoning and why
+# this project's situation is simpler than the generic guide: the PRIMARY
+# (usatclust1) has been 2-node RAC since Phase 0, so thread 2 and a second
+# undo tablespace already exist as real, physical objects on the standby —
+# RMAN DUPLICATE ... FROM ACTIVE DATABASE copied them over already. Nothing
+# new is created here, existing objects are just pointed at correctly.
+#
+# hosts: localhost + delegate_to per task — same pattern as
+# dataguard_standby_prep and gi_db_home_clone, needed here because this role
+# genuinely coordinates two different standby nodes in sequence (node1's
+# already-running instance first, node2's brand-new one second). Deliberately
+# no `connection: local` at the play level — see gi_db_home_clone's own
+# comment and known-risks.md #48's third update for why that breaks
+# delegate_to.
+#
+# Idempotency: NOT a single check-then-act gate for the whole role (that was
+# the original design, and known-risks.md #125/#126 both found real gaps in
+# it after real runs). CRS registration (does srvctl already know about
+# apexdb_stby as a 2-instance database?) still gates sections 1-5, which
+# must never re-run once registered — but registration succeeding partway
+# through a run doesn't mean the whole role finished, so sections 6-9 each
+# check their own actual state independently (is the password file/spfile
+# really the ASM copy this role creates; are the instances actually
+# running) rather than trusting the one top-level flag. Same check-then-act
+# idiom as the rest of this project's Data Guard roles, just applied at a
+# finer grain here after real runs showed the coarse version wasn't enough.
+
+- name: "Preflight: fail loudly if sys_password was never overridden (known-risks.md #113's same fix, same reasoning)"
+  assert:
+    that: sys_password != "CHANGE_ME_sys_password"
+    fail_msg: >
+      sys_password is still the group_vars/all.yml placeholder
+      ("CHANGE_ME_sys_password") — pass the real value explicitly:
+      -e sys_password='...'. This role uses it for the local password file
+      it creates for apexdb2 on oradbserv10.
+  run_once: true
+
+- name: "Ensure the SQL staging directory exists on {{ dg_convert_rac_node1 }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  file:
+    path: "{{ staging_dir }}/sql"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0750"
+
+# --- Preflight: is CRS itself actually healthy on BOTH nodes -----------------
+# Real, live incident (known-risks.md #129): a real run's very first
+# `srvctl config database` check returned `CRS-0184: Cannot communicate
+# with the CRS daemon` — crsd was down on oradbserv09 — but the role's
+# error handling only ever distinguished "registered" from "not
+# registered," so a CRS-daemon-unreachable error was silently treated the
+# same as "not registered yet, first-time conversion" and the run
+# proceeded to shut down apexdb1 anyway. Registration then failed too
+# (crsd still unreachable), leaving apexdb1 down, apexdb_stby
+# half-registered, and CRS broken on oradbserv09 — a strictly worse state
+# than before the run started, entirely avoidable. `CRS-0184`/an
+# unreachable crsd is a fundamentally different condition from "database
+# not registered" (that one looks like `PRCD-1120`/`PRCR-1001`, seen
+# earlier this project when checking a genuinely-unregistered database by
+# hand) and has to be caught explicitly, before ANY other task in this
+# role — not inferred from a downstream command's error text.
+- name: "Preflight: verify CRS is actually healthy (crsd reachable) on both standby nodes before touching anything"
+  become: true
+  become_user: "{{ grid_user }}"
+  delegate_to: "{{ item }}"
+  command: "{{ grid_home }}/bin/crsctl check crs"
+  register: dg_convert_rac_crs_health
+  changed_when: false
+  failed_when: false
+  loop:
+    - "{{ dg_convert_rac_node1 }}"
+    - "{{ dg_convert_rac_node2 }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: "Fail loudly and immediately if CRS is not fully healthy on either node — do not shut down apexdb1 or touch CRS registration while crsd is unreachable anywhere"
+  fail:
+    msg: >
+      CRS is not healthy on {{ item.item }} — `crsctl check crs` said:
+      {{ item.stdout | trim }}
+      This role refuses to proceed. Shutting down apexdb1 and registering
+      it with CRS while crsd is unreachable on any node makes things worse,
+      not better — known-risks.md #129 is exactly this happening for real:
+      apexdb1 got shut down, `srvctl add database` then failed with
+      CRS-0184, leaving apexdb1 down and CRS broken on oradbserv09 at the
+      same time. Fix CRS on the affected node first — check
+      $GRID_HOME/log/<hostname>/crsd/crsd.log and .../ohasd/ohasd.log for
+      the actual failure, confirm ASM diskgroups are mounted there
+      (`asmcmd lsdg` from that node's own ASM instance), and get
+      `crsctl check crs` reporting CRS-4537 (Cluster Ready Services is
+      online) on BOTH nodes — before re-running this role.
+  loop: "{{ dg_convert_rac_crs_health.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: "'CRS-4537' not in item.stdout"
+
+# --- Preflight: has this phase already run? ---------------------------------
+# srvctl config database succeeding (rc=0) and listing both instance names
+# means apexdb_stby is already CRS-registered as a 2-instance database — this
+# phase already completed on a prior run. Check-then-act, not error-text
+# matching, same idiom as dataguard_duplicate's own already-done gate.
+- name: "Check whether apexdb_stby is already registered with CRS"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl config database -db {{ dg_standby_db_unique_name }}"
+  register: dg_convert_rac_srvctl_check
+  changed_when: false
+  failed_when: false
+
+- name: "Set fact: already converted to RAC (both instances registered)"
+  set_fact:
+    dg_convert_rac_already_done: >-
+      {{ dg_convert_rac_srvctl_check.rc == 0 and
+         (sid_prefix + '1') in dg_convert_rac_srvctl_check.stdout and
+         (sid_prefix + '2') in dg_convert_rac_srvctl_check.stdout }}
+
+# "Registered with CRS" and "the password file / spfile srvctl points at are
+# actually the ASM copies this role is supposed to create" are DIFFERENT,
+# independently-true-or-false conditions — known-risks.md #126 found both
+# already out of sync on a real run: registration (section 5) succeeded,
+# but the role then died on the asmcmd mkdir -p bug (#124) before the ASM
+# password file copy or the srvctl modify -pwfile call ever ran, AND
+# before an ASM spfile ever existed at all (the -spfile flag on `srvctl add
+# database` used whatever local path section 2 discovered, not an ASM
+# path). Because `dg_convert_rac_already_done` alone used to gate sections
+# 6-7 too, every later re-run skipped straight past that unfinished work
+# forever, since registration itself doesn't undo once it succeeds. These
+# two facts let sections 6-7 detect and finish specifically what's still
+# missing, independent of `dg_convert_rac_already_done` — same reasoning
+# already applied to instance-running state in #125.
+- name: "Set facts: is the registered spfile/password file already the ASM copy this role creates"
+  set_fact:
+    dg_convert_rac_spfile_registered_path: >-
+      {{ ((dg_convert_rac_srvctl_check.stdout_lines | default([]) | select('match', '^Spfile:') | list | first | default('Spfile:')) | regex_replace('^Spfile:\s*', '')) | trim }}
+    dg_convert_rac_pwfile_registered_path: >-
+      {{ ((dg_convert_rac_srvctl_check.stdout_lines | default([]) | select('match', '^Password file:') | list | first | default('Password file:')) | regex_replace('^Password file:\s*', '')) | trim }}
+
+- name: "Set facts: spfile-is-ASM / pwfile-is-registered / copy-source path"
+  set_fact:
+    dg_convert_rac_spfile_asm: "{{ dg_convert_rac_spfile_registered_path is match('^\\+') }}"
+    dg_convert_rac_pwfile_registered: "{{ dg_convert_rac_pwfile_registered_path | length > 0 }}"
+    # Copy source for the ASM spfile migration: whatever srvctl already has
+    # registered (even if it's the wrong local path — that's still a real,
+    # readable file) takes precedence, since it's the file CRS is actually
+    # using right now; only fall back to Oracle's own predictable default
+    # local-spfile naming ($ORACLE_HOME/dbs/spfile<SID>.ora) when nothing is
+    # registered yet at all (a true first-time run).
+    dg_convert_rac_spfile_copy_source: >-
+      {{ dg_convert_rac_spfile_registered_path
+         if dg_convert_rac_spfile_registered_path | length > 0
+         else (db_home + '/dbs/spfile' + sid_prefix + '1.ora') }}
+
+# --- 0b. Always show real state, and always pause for acknowledgment -------
+# James's direct feedback, twice now, after this role went silent on him:
+# it must never proceed without showing what it found and pausing to let
+# an operator review it — not just on a first-time run, and not just when
+# something is about to be started. This block runs unconditionally, before
+# ANY other task in this role, covering all three real states: first-time
+# (nothing registered), registered-but-down (the #125/#126 recovery path),
+# and fully done (registered and both instances already running — the one
+# path that used to produce zero output and zero pause at all, since
+# everything downstream of it was gated on `dg_convert_rac_needs_start`).
+#
+# Running state is computed here, up front, rather than down near the old
+# section 8 — needed here for the summary below, and this also means
+# running state is known and available for the rest of the role, not just
+# the start-instance section.
+- name: "Check whether apexdb1/apexdb2 are actually running right now (independent of CRS registration state)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl status database -db {{ dg_standby_db_unique_name }}"
+  register: dg_convert_rac_status_check
+  changed_when: false
+  failed_when: false
+
+- name: "Set facts: is each instance actually running right now, and does anything need starting"
+  set_fact:
+    dg_convert_rac_inst1_running: "{{ ('Instance ' + sid_prefix + '1 is running') in dg_convert_rac_status_check.stdout }}"
+    dg_convert_rac_inst2_running: "{{ ('Instance ' + sid_prefix + '2 is running') in dg_convert_rac_status_check.stdout }}"
+
+- name: "Set fact: does anything need starting (either instance down, regardless of why)"
+  set_fact:
+    dg_convert_rac_needs_start: "{{ (not dg_convert_rac_inst1_running) or (not dg_convert_rac_inst2_running) }}"
+
+- name: "Show current srvctl configuration for apexdb_stby (raw — 'not registered yet' is itself real information, not silence)"
+  debug:
+    msg: >-
+      {{ dg_convert_rac_srvctl_check.stdout_lines
+         if dg_convert_rac_srvctl_check.rc == 0
+         else ['apexdb_stby is NOT registered with CRS yet — srvctl config database said: '
+               + ((dg_convert_rac_srvctl_check.stdout + ' ' + dg_convert_rac_srvctl_check.stderr) | trim)
+               + ' — this will be treated as a first-time conversion.'] }}
+
+- name: "Show current running state for apexdb1/apexdb2, and ASM migration state"
+  debug:
+    msg:
+      - "Registered with CRS: {{ dg_convert_rac_already_done }}"
+      - "{{ sid_prefix }}1 (oradbserv09) running: {{ dg_convert_rac_inst1_running }}"
+      - "{{ sid_prefix }}2 (oradbserv10) running: {{ dg_convert_rac_inst2_running }}"
+      - "Password file already the ASM copy: {{ dg_convert_rac_pwfile_registered }}"
+      - "Spfile already the ASM copy: {{ dg_convert_rac_spfile_asm }}"
+
+- name: "Show what this run will do, given the state above"
+  debug:
+    msg: >-
+      {% if not dg_convert_rac_already_done %}
+      FIRST-TIME CONVERSION. apexdb_stby is not yet registered with CRS.
+      This run will do everything: stop managed recovery if running, create
+      an spfile from apexdb1's current pfile and restart onto it if it
+      isn't already using one (known-risks.md #128 — needed before any
+      scope=spfile parameter change can succeed), discover the undo
+      tablespace/spfile, set cluster_database=true and per-instance
+      parameters, shut down apexdb1, register apexdb_stby and both
+      instances with CRS, migrate the password file and spfile into ASM,
+      start both instances, and restart managed recovery.
+      {% elif dg_convert_rac_needs_start %}
+      apexdb_stby IS ALREADY REGISTERED WITH CRS, BUT AT LEAST ONE INSTANCE
+      IS DOWN RIGHT NOW ({{ sid_prefix }}1 running =
+      {{ dg_convert_rac_inst1_running }}, {{ sid_prefix }}2 running =
+      {{ dg_convert_rac_inst2_running }}). Because registration already
+      happened, the following checks will be SKIPPED this run and will NOT
+      be re-verified: stopping/checking managed recovery, the spfile-in-use
+      check/create/restart (known-risks.md #128), discovering the undo
+      tablespace and spfile, setting cluster_database and per-instance
+      parameters, shutting down apexdb1, and CRS registration itself. What
+      WILL run: the ASM password file migration if not already registered
+      (currently registered = {{ dg_convert_rac_pwfile_registered }}), the
+      ASM spfile migration if not already registered (currently registered
+      = {{ dg_convert_rac_spfile_asm }}), then starting whichever
+      instance(s) are down and restarting managed recovery. If you don't
+      already know why an instance is down, investigate before continuing —
+      docs/known-risks.md #125 documents one real way to land here (a prior
+      run failing partway through after shutdown but before restart).
+      {% else %}
+      apexdb_stby is already registered with CRS AND both instances are
+      already running. This run will make NO CHANGES to the database or
+      CRS — it will only re-run the final verification query at the end.
+      {% endif %}
+
+- name: "Pause for acknowledgment — review the real state and plan above before this role does anything"
+  pause:
+    prompt: >-
+      Press Enter to proceed with what's described above, or Ctrl+C then A
+      to abort and investigate first.
+
+# --- 1. Stop managed recovery before touching cluster_database --------------
+- name: "Write SQL script: check whether managed recovery is currently running"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_convert_rac_mrp_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off tab off
+      select process, status from v$managed_standby where process like 'MRP%';
+      exit;
+  when: not dg_convert_rac_already_done
+
+- name: "Check whether managed recovery is currently running"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_convert_rac_mrp_check.sql
+  register: dg_convert_rac_mrp_check
+  changed_when: false
+  when: not dg_convert_rac_already_done
+
+# `'MRP' in dg_convert_rac_mrp_check.stdout` was a real, if never-yet-fired,
+# bug — with `set echo on`, the echoed query text itself ("SQL> select ...
+# where process like 'MRP%';") contains the literal substring "MRP", so the
+# check was true unconditionally, regardless of whether any row was
+# actually returned. Found and fixed for real in dataguard_srl_cleanup
+# (known-risks.md #121, James's real run) — fixed here too, proactively,
+# same root cause. A real MRP result row is left-justified and starts with
+# "MRP" (e.g. "MRP0  APPLYING_LOG ..."); the echoed command line starts
+# with "SQL> select...". Matching `^MRP` against stdout_lines catches only
+# an actual row, never the echo.
+- name: "Set fact: is managed recovery actually running (parsed from a real result row, not the echoed query text)"
+  set_fact:
+    dg_convert_rac_mrp_running: "{{ (dg_convert_rac_mrp_check.stdout_lines | default([]) | select('match', '^MRP') | list | length) > 0 }}"
+  when: not dg_convert_rac_already_done
+
+- name: "Write SQL script: cancel managed recovery"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_convert_rac_mrp_cancel.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter database recover managed standby database cancel;
+      exit;
+  when: not dg_convert_rac_already_done and dg_convert_rac_mrp_running
+
+- name: "Cancel managed recovery (only if it was actually running)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_convert_rac_mrp_cancel.sql
+  register: dg_convert_rac_mrp_cancel
+  changed_when: "'Database altered' in dg_convert_rac_mrp_cancel.stdout"
+  when: not dg_convert_rac_already_done and dg_convert_rac_mrp_running
+
+# --- 1b. Ensure apexdb1 is actually USING an spfile, not just a plain -------
+#         pfile — confirmed live as a real, blocking bug (known-risks.md
+#         #128): section 3 below failed outright on every single `alter
+#         system ... scope=spfile` statement with `ORA-32001: write to
+#         SPFILE requested but no SPFILE is in use`. Root cause: Phase 3
+#         (dataguard_standby_prep) started apexdb1 with `startup nomount
+#         pfile='{{ staging_dir }}/standby/initapexdb.ora'`, and neither
+#         Phase 3 nor Phase 4's RMAN DUPLICATE ever switched the running
+#         instance onto an spfile — `v$parameter('spfile')` was genuinely
+#         blank. `scope=spfile` needs an spfile actually IN USE by the
+#         running instance, not merely present somewhere on disk, so this
+#         has to be fixed and the instance restarted onto it before section
+#         3 can succeed — not just worked around or documented as a
+#         limitation. James's own instruction: "If spfile is not in use
+#         then create it and use that spfile."
+- name: "Write SQL script: check whether apexdb1 is currently using an spfile"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_convert_rac_spfile_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off linesize 200 tab off pagesize 0
+      column value format a150
+      select value from v$parameter where name = 'spfile';
+      exit;
+  when: not dg_convert_rac_already_done
+
+- name: "Check whether apexdb1 is currently using an spfile"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_convert_rac_spfile_check.sql
+  register: dg_convert_rac_spfile_check
+  changed_when: false
+  when: not dg_convert_rac_already_done
+
+# A NULL v$parameter value prints as a blank/whitespace line here (heading
+# off, so the row itself is still present) — matching a real path (local
+# "/..." or ASM "+...") is what distinguishes "in use" from "blank row" or
+# the echoed SQL> text, same left-anchored-real-content idiom used
+# throughout this role and dataguard_srl_cleanup (known-risks.md #121/#122).
+- name: "Set fact: is an spfile currently in use"
+  set_fact:
+    dg_convert_rac_spfile_in_use: >-
+      {{ (dg_convert_rac_spfile_check.stdout_lines | default([])
+          | select('match', '^[/+]') | list | length) > 0 }}
+  when: not dg_convert_rac_already_done
+
+- name: "Write SQL script: create an spfile from the exact pfile Phase 3 started apexdb1 with"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_convert_rac_create_spfile.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      create spfile='{{ db_home }}/dbs/spfile{{ sid_prefix }}1.ora' from pfile='{{ staging_dir }}/standby/initapexdb.ora';
+      exit;
+  when: not dg_convert_rac_already_done and not dg_convert_rac_spfile_in_use
+
+- name: "Create the spfile (apexdb1 was still running on a plain pfile — this only creates the file, it does not make the running instance use it yet)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_convert_rac_create_spfile.sql
+  register: dg_convert_rac_create_spfile
+  changed_when: "'File created' in dg_convert_rac_create_spfile.stdout"
+  failed_when: >
+    dg_convert_rac_create_spfile.rc != 0 or
+    ('ORA-' in dg_convert_rac_create_spfile.stdout and 'File created' not in dg_convert_rac_create_spfile.stdout)
+  when: not dg_convert_rac_already_done and not dg_convert_rac_spfile_in_use
+
+# Creating the file doesn't change what a RUNNING instance is using —
+# `v$parameter('spfile')` is only set at STARTUP time. A plain `STARTUP`
+# (no PFILE=/SPFILE= clause) auto-discovers spfile<SID>.ora in $ORACLE_HOME
+# /dbs first, ahead of a plain pfile — Oracle's own documented default
+# search order — so no explicit clause is needed here; it will pick up the
+# file just created above automatically. MRP was already confirmed
+# stopped/canceled above (section 1), so this restart is clean. MOUNT, not
+# OPEN — apexdb1 is a physical standby.
+- name: "Write SQL script: restart apexdb1 in MOUNT so it actually picks up and uses the new spfile"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_convert_rac_spfile_restart.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      shutdown immediate;
+      startup mount;
+      exit;
+  when: not dg_convert_rac_already_done and not dg_convert_rac_spfile_in_use
+
+- name: "Restart apexdb1 in MOUNT onto the new spfile"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_convert_rac_spfile_restart.sql
+  register: dg_convert_rac_spfile_restart
+  changed_when: true
+  failed_when: dg_convert_rac_spfile_restart.rc != 0
+  when: not dg_convert_rac_already_done and not dg_convert_rac_spfile_in_use
+
+- name: Show spfile-creation/restart output
+  debug:
+    var: dg_convert_rac_spfile_restart.stdout_lines
+  when: dg_convert_rac_spfile_restart is not skipped
+
+# Verify, don't assume — same reasoning as everywhere else in this role:
+# fail loudly here, with a clear message, rather than let section 3's
+# scope=spfile calls hit the exact same ORA-32001 a second time with a
+# much less obvious error trail.
+- name: "Re-verify apexdb1 is now actually using the spfile just created"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_convert_rac_spfile_check.sql
+  register: dg_convert_rac_spfile_reverify
+  changed_when: false
+  when: not dg_convert_rac_already_done and not dg_convert_rac_spfile_in_use
+
+- name: "Fail loudly if apexdb1 still isn't using an spfile after the restart"
+  fail:
+    msg: >
+      apexdb1 was restarted after creating
+      {{ db_home }}/dbs/spfile{{ sid_prefix }}1.ora, but
+      v$parameter('spfile') still shows no spfile in use. Something is
+      wrong with the create/restart sequence above — read the raw output
+      shown just above by hand before re-running; do not retry blindly.
+  when: >
+    not dg_convert_rac_already_done and not dg_convert_rac_spfile_in_use and
+    (dg_convert_rac_spfile_reverify.stdout_lines | default([]) | select('match', '^[/+]') | list | length) == 0
+
+# --- 2. Discover the real undo tablespace for thread 2, and the current -----
+#        spfile path — queried, not guessed. Both objects already exist
+#        physically (copied over by Phase 4's DUPLICATE FROM ACTIVE DATABASE,
+#        since the primary is already 2-node RAC) — this just finds their
+#        real names/paths rather than assuming a naming convention.
+#        The discovered spfile path here is informational/pause-review only
+#        as of #126 — it is NOT used to register `-spfile` with CRS anymore
+#        (that used the current LOCAL spfile path directly, which was wrong:
+#        James's original spec was always an ASM path). Section 6 now copies
+#        the spfile into ASM and registers that ASM path instead, using
+#        `dg_convert_rac_spfile_copy_source` (set unconditionally near the
+#        top of this role from srvctl's own registered value, so it's still
+#        correct on a re-run where this section is skipped).
+- name: "Write SQL script: discover the thread-2 undo tablespace name and current spfile path"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_convert_rac_discover.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off linesize 200 tab off pagesize 0
+      column name format a30
+      column value format a150
+      select name from v$tablespace where name like 'UNDOTBS%' order by name;
+      select value from v$parameter where name = 'spfile';
+      exit;
+  when: not dg_convert_rac_already_done
+
+- name: "Discover the thread-2 undo tablespace name and current spfile path"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_convert_rac_discover.sql
+  register: dg_convert_rac_discover
+  changed_when: false
+  when: not dg_convert_rac_already_done
+
+- name: Show discovery output (undo tablespaces + current spfile path)
+  debug:
+    var: dg_convert_rac_discover.stdout_lines
+  when: not dg_convert_rac_already_done
+
+- name: "Set facts: thread-2 undo tablespace name and real spfile path (parsed from the discovery query above, not assumed)"
+  set_fact:
+    # apexdb1 is only ever MOUNTED here (a physical standby is never OPEN),
+    # so dba_tablespaces — a dictionary view — is not queryable and throws
+    # ORA-01219. v$tablespace is a control-file-backed fixed view, so it
+    # works while MOUNTED; it lists tablespace NAME but not CONTENTS, so we
+    # match on the UNDOTBS naming convention instead of contents='UNDO'.
+    # That convention is also this project's own existing fallback default
+    # below, so it's not a new assumption. Lists one per line, name order —
+    # the second line is thread 2's. If the primary ever used a different
+    # undo tablespace naming/count than exactly two (UNDOTBS1/2), this line
+    # is wrong and the task above's raw output must be read by hand instead
+    # of trusted blindly.
+    dg_convert_rac_undo_ts1: "{{ (dg_convert_rac_discover.stdout_lines | select('match', '^UNDO') | list)[0] | default('UNDOTBS1') | trim }}"
+    dg_convert_rac_undo_ts2: "{{ (dg_convert_rac_discover.stdout_lines | select('match', '^UNDO') | list)[1] | default('UNDOTBS2') | trim }}"
+    # `show parameter spfile` wraps its VALUE onto a second physical line at
+    # its own narrow internal width, independent of linesize — the wrapped
+    # continuation was silently lost. Querying v$parameter directly with an
+    # explicit `column value format a150` avoids that wrap entirely, so the
+    # full path prints on one line. Match on a line starting with "/" (the
+    # spfile here is a local filesystem path under $ORACLE_HOME/dbs, not
+    # ASM) to skip the echoed SQL> text and any blank lines.
+    dg_convert_rac_spfile_path: "{{ (dg_convert_rac_discover.stdout_lines | select('match', '^/') | list | last | default('')) | trim }}"
+  when: not dg_convert_rac_already_done
+
+- name: "Pause for review — confirm the discovered undo tablespace and spfile path before this role sets cluster_database=true"
+  pause:
+    prompt: |
+      Discovered thread-1 undo tablespace: {{ dg_convert_rac_undo_ts1 | default('(not set)') }}
+      Discovered thread-2 undo tablespace: {{ dg_convert_rac_undo_ts2 | default('(not set)') }}
+      Discovered current spfile path:      {{ dg_convert_rac_spfile_path | default('(not set)') }}
+      Confirm both look real (not blank, not a leftover default) against the
+      raw discovery output shown above before continuing.
+
+      This is the SECOND of three pauses in this role — the first (right at
+      the top, before section 1) already covered the spfile-in-use
+      check/create/restart if that was needed (known-risks.md #128).
+      Pressing Enter here authorizes the entire rest of the sequence up to
+      (but not including) actually starting either instance, which gets its
+      own separate pause (section 8) later: set cluster_database=true, shut
+      down apexdb1, register apexdb_stby and both instances with CRS
+      (`srvctl add database`/`add instance` x2), then migrate the password
+      file and spfile into ASM and point CRS at them. None of those later
+      steps pause individually — there is no confirmation prompt between
+      "shut down" and "register with CRS," they run back to back. Press
+      Enter to continue, or Ctrl+C then A to abort and investigate first.
+  when: not dg_convert_rac_already_done
+
+# --- 3. Set cluster_database + per-instance parameters (spfile, not dynamic) -
+- name: "Write SQL script: set cluster_database=true and per-instance thread/instance_number/undo_tablespace"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_convert_rac_set_params.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter system set cluster_database=true scope=spfile sid='*';
+      alter system set instance_number=1 scope=spfile sid='{{ sid_prefix }}1';
+      alter system set thread=1 scope=spfile sid='{{ sid_prefix }}1';
+      alter system set undo_tablespace='{{ dg_convert_rac_undo_ts1 }}' scope=spfile sid='{{ sid_prefix }}1';
+      alter system set instance_number=2 scope=spfile sid='{{ sid_prefix }}2';
+      alter system set thread=2 scope=spfile sid='{{ sid_prefix }}2';
+      alter system set undo_tablespace='{{ dg_convert_rac_undo_ts2 }}' scope=spfile sid='{{ sid_prefix }}2';
+      exit;
+  when: not dg_convert_rac_already_done
+
+- name: "Set cluster_database=true and per-instance parameters (requires a restart to take effect — scope=spfile only)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_convert_rac_set_params.sql
+  register: dg_convert_rac_set_params
+  changed_when: "'System altered' in dg_convert_rac_set_params.stdout"
+  failed_when: >
+    dg_convert_rac_set_params.rc != 0 or
+    ('ORA-' in dg_convert_rac_set_params.stdout and 'System altered' not in dg_convert_rac_set_params.stdout)
+  when: not dg_convert_rac_already_done
+
+- name: Show set-parameters output
+  debug:
+    var: dg_convert_rac_set_params.stdout_lines
+  when: not dg_convert_rac_already_done
+
+# --- 4. Shut down the manually-started apexdb1 — CRS starts it from here on -
+- name: "Write SQL script: shutdown immediate"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_convert_rac_shutdown.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      shutdown immediate;
+      exit;
+  when: not dg_convert_rac_already_done
+
+- name: "Shut down apexdb1 (manually-managed instance goes away — CRS/srvctl owns it from here)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_convert_rac_shutdown.sql
+  register: dg_convert_rac_shutdown
+  changed_when: true
+  when: not dg_convert_rac_already_done
+
+- name: Show shutdown output
+  debug:
+    var: dg_convert_rac_shutdown.stdout_lines
+  when: not dg_convert_rac_already_done
+
+# --- 5. Register the database + both instances with CRS ---------------------
+# James's own srvctl syntax, long-form flags throughout — several are
+# genuine corrections over the original short-form command, not just style:
+#
+#   -dbname {{ db_name }} (apexdb) — REQUIRED here, not optional. -db is the
+#   db_unique_name (apexdb_stby); without -dbname explicitly set, srvctl
+#   defaults the CRS resource's DB_NAME attribute to match -db, which would
+#   be wrong — the real DB_NAME baked into apexdb_stby's control file is
+#   "apexdb" (same as the primary; DB_NAME has to match on both sides of a
+#   physical standby). The original command omitted this entirely.
+#
+#   -policy MANUAL, not -y AUTOMATIC — James's direct call. AUTOMATIC means
+#   CRS restarts the database resource on its own after a node reboot or a
+#   CRS bounce, no operator action needed (the same policy the PRIMARY runs
+#   under). MANUAL means CRS will NOT auto-start it — an operator has to run
+#   `srvctl start database` (and separately resume managed recovery)
+#   themselves before it comes back. For a standby specifically, that's a
+#   deliberate checkpoint: a node reboot won't silently resume redo apply
+#   without a DBA reviewing state first. Worth knowing the trade-off if this
+#   is ever reconsidered: MANUAL also means an unattended cluster restart
+#   leaves the standby down until someone starts it by hand.
+#
+#   -diskgroup "{{ asm_diskgroup_data }},{{ asm_diskgroup_reco }}" — new,
+#   wasn't in the original command at all. Registers apexdb_stby's real ASM
+#   dependencies with CRS (both diskgroups the database's files actually
+#   live in) so CRS models the startup dependency correctly and monitors it.
+#   Bare diskgroup names, no leading "+" — that's srvctl's own documented
+#   format for this option (unlike every ASM path elsewhere in this project,
+#   which does use "+"), corrected from James's own pasted example, which
+#   had a stray "+" on the first name only.
+#
+#   No -spfile here (deliberately, as of #126) — same reasoning as -pwfile
+#   below: the ASM spfile doesn't exist yet at this point in the role
+#   (section 6 creates it), so it's registered afterward via a dedicated
+#   `srvctl modify database -spfile` call instead of guessed here. The
+#   original version of this task passed the discovered LOCAL spfile path
+#   straight through, which is exactly the bug James caught by hand:
+#   `srvctl config database` showed `Spfile:
+#   /u01/.../dbs/spfileapexdb1.ora` instead of an ASM path.
+- name: "Register apexdb_stby with CRS as a PHYSICAL_STANDBY database"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: >
+    {{ db_home }}/bin/srvctl add database -db {{ dg_standby_db_unique_name }}
+    -oraclehome {{ db_home }} -dbname {{ db_name }} -role PHYSICAL_STANDBY
+    -startoption MOUNT -policy MANUAL
+    -diskgroup "{{ asm_diskgroup_data }},{{ asm_diskgroup_reco }}"
+  register: dg_convert_rac_add_db
+  changed_when: dg_convert_rac_add_db.rc == 0
+  failed_when: dg_convert_rac_add_db.rc != 0
+  when: not dg_convert_rac_already_done
+
+- name: "Register apexdb1 as an instance of apexdb_stby on {{ dg_convert_rac_node1 }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: >
+    {{ db_home }}/bin/srvctl add instance -db {{ dg_standby_db_unique_name }}
+    -i {{ sid_prefix }}1 -n {{ dg_convert_rac_node1 }}
+  register: dg_convert_rac_add_inst1
+  changed_when: dg_convert_rac_add_inst1.rc == 0
+  failed_when: dg_convert_rac_add_inst1.rc != 0
+  when: not dg_convert_rac_already_done
+
+- name: "Register apexdb2 as an instance of apexdb_stby on {{ dg_convert_rac_node2 }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: >
+    {{ db_home }}/bin/srvctl add instance -db {{ dg_standby_db_unique_name }}
+    -i {{ sid_prefix }}2 -n {{ dg_convert_rac_node2 }}
+  register: dg_convert_rac_add_inst2
+  changed_when: dg_convert_rac_add_inst2.rc == 0
+  failed_when: dg_convert_rac_add_inst2.rc != 0
+  when: not dg_convert_rac_already_done
+
+# --- 6. Migrate the password file AND the spfile into ASM, now that ---------
+#        apexdb_stby has a CRS resource — James's direct question about the
+#        password file, and his own original srvctl syntax
+#        (`-spfile +DATA01/apexdb_stby/PARAMETERFILE/spfileapexdb.ora`) for
+#        the spfile — the reason both are viable now when they weren't
+#        before: known-risks.md #108/#112 already tried an ASM-tagged
+#        password file for apexdb_stby and found it couldn't work
+#        pre-CRS-registration (`asmcmd pwcreate --dbuniquename apexdb_stby`
+#        needs a CRS resource to tag against, which didn't exist until the
+#        two tasks just above created one). That blocker is gone as of this
+#        point in the role. This is also the more correct, RAC-idiomatic
+#        design going forward — the PRIMARY's own password file already
+#        lives in ASM this same way (confirmed directly: `asmcmd pwget
+#        --dbuniquename apexdb` on oradbserv05 returns a real ASM path, not a
+#        local file — known-risks.md #116), shared and CRS-managed rather
+#        than copied out to each node's local filesystem by hand.
+#
+#        Password-file source is apexdb1's local orapwapexdb1 file —
+#        already checksum-verified against the primary's own password file
+#        by the copy_from_primary logic below (#116), so it's a known-good
+#        source, not a fresh generation. Local per-node files (orapwapexdb1
+#        on oradbserv09, orapwapexdb2 on oradbserv10) are left in place
+#        afterward, not deleted — same "keep the old working method as an
+#        explicit fallback" precedent this project already follows for
+#        `dg_pwfile_method: orapwd`.
+#
+#        Spfile source is `dg_convert_rac_spfile_copy_source` (set near the
+#        top of this role) — `asmcmd cp` is Oracle's documented method for
+#        moving an existing spfile into ASM directly (CREATE SPFILE only
+#        supports FROM PFILE or FROM MEMORY, not FROM SPFILE, so a straight
+#        spfile-to-spfile move needs either a PFILE round-trip or a plain
+#        file copy; `asmcmd cp` handles ASM's file-type metadata correctly
+#        for this the same way `pwcopy` does for password files). Target
+#        filename is spfile{{ db_name }}.ora, not per-instance named — one
+#        shared spfile for the whole cluster, matching James's own spec and
+#        RAC's normal convention, registered via a dedicated
+#        `srvctl modify database -spfile` call rather than passed to
+#        `srvctl add database` — see that task's own comment for why.
+#
+#        ASMCMD's `mkdir` has no `-p` flag — confirmed live: `-p` fails with
+#        `ASMCMD-9412: Invalid option: p` on this Grid Infrastructure home
+#        (#124). It also isn't idempotent the way Unix `mkdir -p` is: it
+#        errors on an existing directory rather than no-op'ing — but a
+#        separate `asmcmd ls`-based check-then-act guard turned out NOT to
+#        be a reliable way to detect that in practice either (#130: a real
+#        run's `ls` check reported "missing" for a directory that
+#        demonstrably already existed — `+DATA01/apexdb_stby` itself,
+#        created back in Phase 4 to hold DATAFILE/CONTROLFILE/ONLINELOG —
+#        letting `mkdir` run anyway and fail fatally on `ORA-15005: ...
+#        already used by an existing alias`, stopping the whole play before
+#        the spfile could ever be copied into ASM). The fix: don't check
+#        first at all — attempt `mkdir` directly and treat `ORA-15005`
+#        specifically as success (the directory is there, which is all
+#        this task ever wanted), the same idempotency James asked for in
+#        plain terms: "Ansible should be able to continue even if the
+#        directory is present. It should not fail."
+#
+#        Every task below is gated on `dg_convert_rac_pwfile_registered` /
+#        `dg_convert_rac_spfile_asm` specifically, NOT on
+#        `dg_convert_rac_already_done` — known-risks.md #126 found real
+#        drift between those: registration (section 5, above) can succeed
+#        while this section is left unfinished if a later task fails (the
+#        asmcmd mkdir -p bug, #124, did exactly this on James's own first
+#        real run), and once registered, `dg_convert_rac_already_done`
+#        alone would then skip this whole section on every future run
+#        forever, permanently leaving the password file unregistered and
+#        the spfile pointed at a local path — exactly what James caught by
+#        hand with `srvctl config database -d apexdb_stby`.
+- name: "Create the apexdb_stby ASM directory (idempotent — ORA-15005 'already exists' is a success, not a failure)"
+  become: true
+  become_user: "{{ grid_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  command: "{{ grid_home }}/bin/asmcmd mkdir +{{ asm_diskgroup_data }}/{{ dg_standby_db_unique_name }}"
+  register: dg_convert_rac_stbydir_mkdir
+  changed_when: dg_convert_rac_stbydir_mkdir.rc == 0
+  failed_when: >
+    dg_convert_rac_stbydir_mkdir.rc != 0 and
+    'ORA-15005' not in dg_convert_rac_stbydir_mkdir.stderr
+  when: (not dg_convert_rac_pwfile_registered) or (not dg_convert_rac_spfile_asm)
+
+# --- 6a. Password file --------------------------------------------------
+- name: "Create the ASM PASSWORD subdirectory for apexdb_stby (idempotent — ORA-15005 'already exists' is a success, not a failure)"
+  become: true
+  become_user: "{{ grid_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  command: "{{ grid_home }}/bin/asmcmd mkdir +{{ asm_diskgroup_data }}/{{ dg_standby_db_unique_name }}/PASSWORD"
+  register: dg_convert_rac_pwdir_mkdir
+  changed_when: dg_convert_rac_pwdir_mkdir.rc == 0
+  failed_when: >
+    dg_convert_rac_pwdir_mkdir.rc != 0 and
+    'ORA-15005' not in dg_convert_rac_pwdir_mkdir.stderr
+  when: not dg_convert_rac_pwfile_registered
+
+- name: "Copy apexdb1's local (already-verified) password file into ASM as apexdb_stby's shared password file"
+  become: true
+  become_user: "{{ grid_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  command: >
+    {{ grid_home }}/bin/asmcmd pwcopy
+    {{ db_home }}/dbs/orapw{{ sid_prefix }}1
+    +{{ asm_diskgroup_data }}/{{ dg_standby_db_unique_name }}/PASSWORD/pwd{{ dg_standby_db_unique_name }}
+  register: dg_convert_rac_pwfile_asm_copy
+  changed_when: dg_convert_rac_pwfile_asm_copy.rc == 0
+  failed_when: dg_convert_rac_pwfile_asm_copy.rc != 0
+  when: not dg_convert_rac_pwfile_registered
+
+# Explicit registration, not asmcmd --dbuniquename tagging — `srvctl modify
+# database -pwfile` is what CRS itself actually reads to find the password
+# file at startup for a CRS-managed instance, so pointing it there directly
+# is the authoritative fix regardless of whether ASM's own --dbuniquename
+# auto-discovery would also have found it.
+- name: "Register the ASM password file with CRS (srvctl modify database -pwfile)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: >
+    {{ db_home }}/bin/srvctl modify database -db {{ dg_standby_db_unique_name }}
+    -pwfile +{{ asm_diskgroup_data }}/{{ dg_standby_db_unique_name }}/PASSWORD/pwd{{ dg_standby_db_unique_name }}
+  register: dg_convert_rac_pwfile_modify
+  changed_when: dg_convert_rac_pwfile_modify.rc == 0
+  failed_when: dg_convert_rac_pwfile_modify.rc != 0
+  when: not dg_convert_rac_pwfile_registered
+
+# --- 6b. Spfile — James's original spec, missed by the first version of ----
+#         this role, which registered whatever local path section 2's
+#         discovery happened to find instead of migrating it into ASM first.
+- name: "Create the ASM PARAMETERFILE subdirectory for apexdb_stby (idempotent — ORA-15005 'already exists' is a success, not a failure)"
+  become: true
+  become_user: "{{ grid_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  command: "{{ grid_home }}/bin/asmcmd mkdir +{{ asm_diskgroup_data }}/{{ dg_standby_db_unique_name }}/PARAMETERFILE"
+  register: dg_convert_rac_pfiledir_mkdir
+  changed_when: dg_convert_rac_pfiledir_mkdir.rc == 0
+  failed_when: >
+    dg_convert_rac_pfiledir_mkdir.rc != 0 and
+    'ORA-15005' not in dg_convert_rac_pfiledir_mkdir.stderr
+  when: not dg_convert_rac_spfile_asm
+
+- name: "Copy the current spfile into ASM as apexdb_stby's shared spfile (asmcmd cp)"
+  become: true
+  become_user: "{{ grid_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  command: >
+    {{ grid_home }}/bin/asmcmd cp
+    {{ dg_convert_rac_spfile_copy_source }}
+    +{{ asm_diskgroup_data }}/{{ dg_standby_db_unique_name }}/PARAMETERFILE/spfile{{ db_name }}.ora
+  register: dg_convert_rac_spfile_asm_copy
+  changed_when: dg_convert_rac_spfile_asm_copy.rc == 0
+  failed_when: dg_convert_rac_spfile_asm_copy.rc != 0
+  when: not dg_convert_rac_spfile_asm
+
+# Same reasoning as the password file above: `-spfile` on `srvctl modify
+# database` is what CRS actually reads at startup, so this is the
+# authoritative fix. Deliberately a `modify`, not passed to `add database`
+# above — this also means it self-heals a previously-wrong registration
+# (James's real, observed bug) on any future run, not just a first-time one.
+- name: "Register the ASM spfile with CRS (srvctl modify database -spfile)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: >
+    {{ db_home }}/bin/srvctl modify database -db {{ dg_standby_db_unique_name }}
+    -spfile +{{ asm_diskgroup_data }}/{{ dg_standby_db_unique_name }}/PARAMETERFILE/spfile{{ db_name }}.ora
+  register: dg_convert_rac_spfile_modify
+  changed_when: dg_convert_rac_spfile_modify.rc == 0
+  failed_when: dg_convert_rac_spfile_modify.rc != 0
+  when: not dg_convert_rac_spfile_asm
+
+# --- 7. Everything apexdb2 needs on oradbserv10, mirroring Phase 3's fixes --
+# Same two gaps Phase 3 hit and fixed for oradbserv09 (known-risks.md #100
+# audit_file_dest, #108 local password file) — duplicated here rather than
+# assumed already covered, same "self-sufficient under a narrow --tags run"
+# reasoning dataguard_duplicate uses for its own password-file preflight.
+#
+# No `dg_convert_rac_already_done` gate on this section at all, as of #126 —
+# same reasoning as section 6: this section runs after CRS registration in
+# file order, so it's exactly as exposed to "registration succeeded, this
+# didn't" as section 6 was, and every task here already carries its own real
+# idempotency condition (a `stat` check, a checksum comparison, or
+# `lineinfile`'s own inherent idempotency) rather than depending on the
+# coarse top-level flag. Gated only on `dg_pwfile_method` where relevant.
+- name: "Check whether the audit file destination already exists on {{ dg_convert_rac_node2 }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node2 }}"
+  stat:
+    path: "{{ oracle_base }}/admin/{{ db_unique_name }}/adump"
+  register: dg_convert_rac_adump_stat
+
+- name: "Create the audit file destination on {{ dg_convert_rac_node2 }} if missing"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node2 }}"
+  file:
+    path: "{{ oracle_base }}/admin/{{ db_unique_name }}/adump"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0750"
+  when: not dg_convert_rac_adump_stat.stat.exists
+
+# copy_from_primary (default, known-risks.md #116) vs orapwd (fallback,
+# #108) — same two methods dataguard_standby_prep/dataguard_duplicate use
+# for apexdb1 on oradbserv09, mirrored here for apexdb2 on oradbserv10.
+# James's manual example that established this method explicitly named
+# BOTH standby nodes/SIDs as targets (orapwapexdb1 on oradbserv09,
+# orapwapexdb2 on oradbserv10) — this is that second target.
+- name: "Check whether a local password file already exists for apexdb2 on {{ dg_convert_rac_node2 }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node2 }}"
+  stat:
+    path: "{{ db_home }}/dbs/orapw{{ sid_prefix }}2"
+    checksum_algorithm: sha1
+  register: dg_convert_rac_pwfile_stat
+
+# --- copy_from_primary (default) ------------------------------------------
+# Only attempted at all if apexdb2 doesn't already have a local password
+# file — James's direct question, "What happens if the password file is
+# already there?", pointed at a real design gap (known-risks.md #131): this
+# entire discover/export/fetch/compare round-trip through the PRIMARY's ASM
+# ran unconditionally on every pass, purely to checksum-compare against
+# what might already be sitting on oradbserv10 — expensive and, as a real
+# run showed, fragile (asmcmd pwget returned an empty path for reasons not
+# yet root-caused, and nothing checked for that, so pwcopy got called with
+# a blank source argument and failed on its own usage text instead of a
+# clear error). The answer to James's question, with this fix: if a local
+# password file already exists for apexdb2, NONE of this chain runs at
+# all — existence is treated as good enough, the same idempotency
+# philosophy this project already applies to the ASM password/spfile
+# migration in section 6a/6b (registered/present is sufficient, not
+# byte-for-byte re-verified every run). This is a reasonable trade because
+# this local per-node file was always documented as a fallback/convenience
+# copy (see section 6a's own header comment) — the file CRS/srvctl actually
+# uses to start apexdb2 is the ASM-registered one from section 6a, not this
+# one.
+- name: "Discover the primary's real password file path in its own ASM (asmcmd pwget)"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ grid_user }}"
+  command: "{{ grid_home }}/bin/asmcmd pwget --dbuniquename {{ db_unique_name }}"
+  register: dg_convert_rac_pwfile_asm_path
+  changed_when: false
+  when: dg_pwfile_method == 'copy_from_primary' and not dg_convert_rac_pwfile_stat.stat.exists
+
+# Verify, don't assume — same lesson as #121/#122/#125/#126: a command
+# returning rc=0 is not the same as it returning something usable. A real
+# run had `asmcmd pwget` succeed with EMPTY stdout, which silently produced
+# a malformed `pwcopy <dest_only>` command downstream and failed on
+# pwcopy's own usage text instead of a clear, actionable error. James's own
+# call on what should happen instead (known-risks.md #132): "if the
+# password check didn't return a value it should then create a password
+# file because one does not exist" — fall back to `orapwd`, this role's
+# own already-proven alternate method, rather than hard-fail. The rest of
+# the copy_from_primary chain below is skipped in this case.
+- name: "Set fact: did the primary-ASM password file lookup come back empty (fall back to orapwd rather than fail)"
+  set_fact:
+    dg_convert_rac_pwfile_asm_empty: >-
+      {{ dg_pwfile_method == 'copy_from_primary' and
+         not dg_convert_rac_pwfile_stat.stat.exists and
+         (dg_convert_rac_pwfile_asm_path.stdout | default('') | trim | length) == 0 }}
+
+- name: "Report: primary-ASM password file lookup returned nothing — falling back to orapwd instead of failing"
+  debug:
+    msg: >
+      asmcmd pwget --dbuniquename {{ db_unique_name }} on
+      {{ groups['rac_node1'][0] }} returned no path. Falling back to
+      generating a fresh local password file via orapwd for apexdb2
+      instead of copying the primary's (known-risks.md #131/#132) — this
+      won't carry the primary's exact SYS hash or any other
+      privileged-user grants beyond what orapwd itself creates, only
+      matters if something relies on that. If it does, check
+      `asmcmd pwget --dbuniquename {{ db_unique_name }}` by hand on
+      {{ groups['rac_node1'][0] }} to see why the lookup came back empty.
+  when: dg_convert_rac_pwfile_asm_empty
+
+- name: "Remove any stale staging copy on the primary before re-exporting (asmcmd pwcopy refuses an existing destination)"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/standby/orapwd{{ db_unique_name }}"
+    state: absent
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_convert_rac_pwfile_stat.stat.exists
+    and not dg_convert_rac_pwfile_asm_empty
+
+- name: "Ensure {{ staging_dir }}/standby exists on the primary"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  file:
+    path: "{{ staging_dir }}/standby"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0770"
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_convert_rac_pwfile_stat.stat.exists
+    and not dg_convert_rac_pwfile_asm_empty
+
+- name: "Export the primary's real password file from ASM to a local staging file (asmcmd pwcopy)"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ grid_user }}"
+  command: >
+    {{ grid_home }}/bin/asmcmd pwcopy
+    {{ dg_convert_rac_pwfile_asm_path.stdout | trim }}
+    {{ staging_dir }}/standby/orapwd{{ db_unique_name }}
+  register: dg_convert_rac_pwfile_export
+  changed_when: dg_convert_rac_pwfile_export.rc == 0
+  failed_when: dg_convert_rac_pwfile_export.rc != 0
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_convert_rac_pwfile_stat.stat.exists
+    and not dg_convert_rac_pwfile_asm_empty
+
+- name: "Fetch the exported password file to the control node"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  fetch:
+    src: "{{ staging_dir }}/standby/orapwd{{ db_unique_name }}"
+    dest: "{{ dg_convert_rac_local_dir }}/orapwd{{ db_unique_name }}"
+    flat: true
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_convert_rac_pwfile_stat.stat.exists
+    and not dg_convert_rac_pwfile_asm_empty
+
+- name: "Copy the primary's password file onto {{ dg_convert_rac_node2 }} as orapw{{ sid_prefix }}2 (nothing was there before this chain ran, so no checksum comparison is needed)"
+  delegate_to: "{{ dg_convert_rac_node2 }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    src: "{{ dg_convert_rac_local_dir }}/orapwd{{ db_unique_name }}"
+    dest: "{{ db_home }}/dbs/orapw{{ sid_prefix }}2"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_convert_rac_pwfile_stat.stat.exists
+    and not dg_convert_rac_pwfile_asm_empty
+
+- name: "Clean up the staging copy on the primary (contained real password material)"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/standby/orapwd{{ db_unique_name }}"
+    state: absent
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_convert_rac_pwfile_stat.stat.exists
+    and not dg_convert_rac_pwfile_asm_empty
+
+- name: "Clean up the staging copy on the control node (contained real password material)"
+  file:
+    path: "{{ dg_convert_rac_local_dir }}/orapwd{{ db_unique_name }}"
+    state: absent
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_convert_rac_pwfile_stat.stat.exists
+    and not dg_convert_rac_pwfile_asm_empty
+
+# --- orapwd (fallback — known-risks.md #108) -------------------------------
+- name: "Create the local password file for apexdb2 if missing (orapwd fallback — same mechanism as known-risks.md #108, mirrored onto node 2; also fires when copy_from_primary's ASM lookup came back empty — known-risks.md #132)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node2 }}"
+  no_log: true
+  command: >
+    {{ db_home }}/bin/orapwd file={{ db_home }}/dbs/orapw{{ sid_prefix }}2
+    password={{ sys_password }} entries=10 format=12
+  when: >
+    not dg_convert_rac_pwfile_stat.stat.exists and
+    (dg_pwfile_method == 'orapwd' or dg_convert_rac_pwfile_asm_empty | default(false))
+
+- name: "Ensure /etc/oratab has an entry for apexdb2 on {{ dg_convert_rac_node2 }}"
+  become: true
+  delegate_to: "{{ dg_convert_rac_node2 }}"
+  lineinfile:
+    path: /etc/oratab
+    line: "{{ sid_prefix }}2:{{ db_home }}:N"
+    regexp: "^{{ sid_prefix }}2:"
+    create: true
+    owner: root
+    group: oinstall
+    mode: "0664"
+
+# --- 8. Confirm the CRS configuration before starting anything -------------
+# Instance-running state (`dg_convert_rac_inst1_running`/`_inst2_running`/
+# `_needs_start`) was already computed unconditionally at the very top of
+# this role (section 0b), before section 1 — nothing between there and here
+# starts either instance, so those facts are still accurate; no need to
+# re-check. James's request — review srvctl's own view of the database
+# resource (oracle home, DB_NAME, role, spfile, password file, policy,
+# diskgroup dependencies, both instances and their nodes) before this role
+# starts either instance for real, not just the SQL-level discovery output
+# from section 2, and not just the raw config already shown once at the top
+# — this is the up-to-date config, after any registration/ASM-migration
+# sections 5-6 just did. Gated on `dg_convert_rac_needs_start`, not
+# `dg_convert_rac_already_done` — this review-and-pause must still happen
+# on a "registered but down" re-run, not just on a true first-time run;
+# skipping it there was exactly the gap James caught (#125).
+- name: "Check the CRS configuration for apexdb_stby (srvctl config database)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl config database -db {{ dg_standby_db_unique_name }}"
+  register: dg_convert_rac_config_check
+  changed_when: false
+  when: dg_convert_rac_needs_start
+
+- name: "Show the CRS configuration for apexdb_stby"
+  debug:
+    var: dg_convert_rac_config_check.stdout_lines
+  when: dg_convert_rac_needs_start
+
+- name: "Pause for review — confirm the CRS configuration and instance state above before starting/restarting apexdb1 and/or apexdb2"
+  pause:
+    prompt: |
+      Review srvctl's own configuration for apexdb_stby above — expect
+      Database unique name: {{ dg_standby_db_unique_name }}, Database name:
+      {{ db_name }}, Oracle home: {{ db_home }}, Database role:
+      PHYSICAL_STANDBY, Start options: MOUNT, Management policy: MANUAL,
+      Disk Groups: {{ asm_diskgroup_data }},{{ asm_diskgroup_reco }},
+      Password file: the ASM path from the previous step, and both
+      {{ sid_prefix }}1/oradbserv09 and {{ sid_prefix }}2/oradbserv10 listed
+      as instances.
+
+      Current state right now: {{ sid_prefix }}1 running =
+      {{ dg_convert_rac_inst1_running }}, {{ sid_prefix }}2 running =
+      {{ dg_convert_rac_inst2_running }}.
+      {% if dg_convert_rac_already_done %}
+      NOTE: apexdb_stby was ALREADY registered with CRS before this run
+      started — this is not first-time setup, this role is about to
+      start whichever instance(s) are down above. -policy MANUAL means
+      CRS never auto-starts these, so "registered but down" isn't
+      automatically alarming after a reboot — but it can also mean a
+      prior run failed partway through after shutting apexdb1 down and
+      before restarting it (see docs/known-risks.md #125 for exactly
+      this scenario), or that something crashed. If you're not sure why
+      it's down, check the alert logs on oradbserv09/oradbserv10 before
+      continuing.
+      {% endif %}
+      Press Enter to continue: start whichever instance(s) are down above.
+      Ctrl+C then A aborts this run instead.
+  when: dg_convert_rac_needs_start
+
+# --- 9. Start both instances via srvctl (CRS-managed from here on), MRP first
+# Sequencing matches the real-world writeup this role is based on: start
+# instance 1 in MOUNT, restart managed recovery, confirm MRP0 is actually
+# running, THEN bring instance 2 up — not both at once. Note (worth stating
+# plainly, not just implied): even once apexdb2 is up, redo APPLY still runs
+# on a single designated instance in a standard physical standby — every
+# instance can transport/forward redo, but only one applies it at a time.
+# Bringing instance 2 up here is about role services, session distribution,
+# and readiness for a future RAC switchover — not parallel apply.
+- name: "Start apexdb1 via srvctl, in MOUNT (never OPEN — this is a physical standby)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl start instance -db {{ dg_standby_db_unique_name }} -i {{ sid_prefix }}1 -o mount"
+  register: dg_convert_rac_start_inst1
+  changed_when: dg_convert_rac_start_inst1.rc == 0
+  failed_when: dg_convert_rac_start_inst1.rc != 0
+  when: not dg_convert_rac_inst1_running
+
+- name: "Write SQL script: restart managed recovery"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_convert_rac_start_mrp.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter database recover managed standby database disconnect from session;
+      exit;
+  when: not dg_convert_rac_inst1_running
+
+- name: "Restart managed recovery on apexdb1, now CRS-managed"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_convert_rac_start_mrp.sql
+  register: dg_convert_rac_start_mrp
+  changed_when: "'Database altered' in dg_convert_rac_start_mrp.stdout"
+  failed_when: >
+    dg_convert_rac_start_mrp.rc != 0 or
+    ('ORA-' in dg_convert_rac_start_mrp.stdout and 'Database altered' not in dg_convert_rac_start_mrp.stdout)
+  when: not dg_convert_rac_inst1_running
+
+- name: "Start apexdb2 via srvctl, in MOUNT, on {{ dg_convert_rac_node2 }} (after MRP is confirmed running on apexdb1, per the real-world procedure this role follows)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl start instance -db {{ dg_standby_db_unique_name }} -i {{ sid_prefix }}2 -o mount"
+  register: dg_convert_rac_start_inst2
+  changed_when: dg_convert_rac_start_inst2.rc == 0
+  failed_when: dg_convert_rac_start_inst2.rc != 0
+  when: not dg_convert_rac_inst2_running
+
+# --- 10. Final verification — both instances, transport/apply status --------
+- name: "Write SQL script: confirm both instances are up and RAC-aware"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_convert_rac_verify.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 tab off pagesize 100
+      column instance_number format 999
+      column dbid format 9999999999
+      column name format a9
+      column log_mode format a12
+      column open_mode format a10
+      column instance_name format a12
+      column host_name format a15
+      column version format a12
+      column status format a10
+      column startup_time format a19
+      SELECT
+          i.instance_number,
+          d.dbid,
+          d.name,
+          d.log_mode,
+          d.open_mode,
+          i.instance_name,
+          i.host_name,
+          i.version,
+          i.status,
+          TO_CHAR(i.startup_time, 'YYYY-MM-DD HH24:MI:SS') AS startup_time
+      FROM   gv$instance i CROSS JOIN v$database d
+      ORDER BY i.instance_number;
+      column process format a8
+      column status format a14
+      select process, status, thread#, sequence#, block#, blocks from gv$managed_standby order by inst_id, process;
+      exit;
+
+- name: "Confirm both instances are up and RAC-aware (expect apexdb1/apexdb2 both MOUNTED, PHYSICAL STANDBY)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_convert_rac_node1 }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_convert_rac_verify.sql
+  register: dg_convert_rac_verify
+  changed_when: false
+
+- name: Show final RAC-conversion verification output
+  debug:
+    var: dg_convert_rac_verify.stdout_lines
+
+- name: "Reminder — Phase 4's own 8.3.5 gap (known-risks.md — see high-availability/README.md Section 10) should be independently reconfirmed here too"
+  debug:
+    msg: >
+      This role verifies both instances are up and MOUNTED — it does not
+      re-check the primary's log_archive_dest_2 status. Re-run Phase 4's
+      8.3.5 query (v$archive_dest_status where dest_id=2, from the primary)
+      after this phase, not just once after Phase 4 — a second CRS-managed
+      instance changes what's listening where.

@@ -1,0 +1,301 @@
+---
+# Clones the already-installed, already-patched GI (19c) and DB (12.2.0.1) Oracle
+# Homes from oradbserv05 (usatclust1, primary) onto oradbserv09/oradbserv10
+# (usatclust2, standby) — skips re-running the silent install + RU/OJVM patch cycle
+# entirely, since the source home is already patched.
+#
+# Follows Oracle's OFFICIALLY DOCUMENTED 19c procedure for "Creating a Cluster by
+# Cloning Oracle Clusterware" (Clusterware Administration and Deployment Guide,
+# ch. 7 — confirmed against current docs.oracle.com, not assumed): tar the source
+# home with node-specific files excluded, deploy (untar) onto ONE destination node
+# only, then run gridSetup.sh in the normal software-install-then-configure flow
+# against that deployed copy (handled by grid_silent_install, reused for standby via
+# --tags standby_grid_infrastructure — see known-risks.md #65). Applied by the same
+# tar-and-deploy logic to the DB Oracle Home too (no equivalent official chapter for
+# RDBMS homes, but the same technique is standard DBA practice, and db_silent_install
+# uses the identical single-node-launch mechanism — see known-risks.md #66).
+#
+# DEPLOYS TO clone_target_nodes[0] ONLY, NOT every target node — CORRECTED
+# 2026-08-14, see known-risks.md #66. Both gridSetup.sh (GI) and runInstaller (DB)
+# use Oracle Universal Installer's own node-propagation mechanism: launched from
+# ONE node with a cluster node list in the response file, OUI copies the software to
+# every OTHER listed node itself, over the same grid/oracle SSH equivalence this
+# project already built — exactly how grid_silent_install/db_silent_install already
+# stage software ONLY on node1 for the PRIMARY cluster (confirmed by reading both
+# roles' own code: their extraction/copy tasks are run_once + delegate_to node1
+# only). This role originally deployed the tarball to EVERY target node, which
+# produced a real, confirmed failure: `[FATAL] [INS-44002] The Oracle home location
+# contains directories or files on following remote nodes: [oradbserv10]` —
+# gridSetup.sh refused to propagate to a node whose target directory wasn't empty,
+# and silently dropped it from cluster participation instead of erroring
+# cleanly. Fixed by deploying to node1 only; os_prep already leaves an EMPTY,
+# correctly-owned grid_home/db_home on the other node (its own OFA-directory-
+# creation task, unrelated to this role), which is exactly the state gridSetup.sh
+# expects to find there.
+#
+# CLUSTERWARE ON THE SOURCE IS STOPPED FIRST, PER JAMES'S DECISION (overrides this
+# role's earlier "leave it live" approach — see known-risks.md #46's update). Oracle's
+# documented procedure itself says to stop Clusterware before cloning a
+# fully-configured GI home; the earlier version of this role deliberately deviated
+# from that because oradbserv05 is live, hosting usatclust1's only database (apexdb).
+# James chose to mitigate the risk directly instead: stop Clusterware on oradbserv05
+# (crsctl stop crs) before running this role, accepting the apexdb outage for the
+# duration of the tar, and bring it back up (crsctl start crs) once the tarballs are
+# captured. This is a MANUAL step, not automated by this role — stopping/starting
+# Clusterware on a live production-pattern node isn't something to hide behind a
+# playbook flag; see high-availability/README.md Section 6 for the exact commands.
+# The preflight task below hard-fails if Clusterware is still up on the source when
+# this role runs, so a forgotten manual step is caught before any tar happens, not
+# after. The tar's own exclusion list (log/<hostname>, gpnp/<hostname>, cdata, crf,
+# network/admin/*.ora, root.sh*, crsconfig_params, oraInst.loc) is unchanged — still
+# correct, and still needed, since it's the same node-specific/runtime state Oracle's
+# own doc says to strip regardless of whether the source is running or stopped.
+
+- name: "Assert this role is only ever run intentionally (source node is live production, not a lab throwaway)"
+  assert:
+    that: clone_source_node is defined and clone_target_nodes is defined
+    fail_msg: "clone_source_node and clone_target_nodes must be passed explicitly — no silent defaults for a role that tars a live node's Oracle Homes."
+
+- name: "Preflight: confirm Clusterware is actually stopped on {{ clone_source_node }} before tarring (James stops it manually first — see header comment)"
+  become: true
+  delegate_to: "{{ clone_source_node }}"
+  run_once: true
+  command: "{{ grid_home }}/bin/crsctl check crs"
+  register: crs_check
+  changed_when: false
+  failed_when: false
+  # Plain root (become's default), NOT become_user: grid — an earlier version of this
+  # task became grid instead, which hit a real, documented Ansible limitation:
+  # "Failed to set permissions on the temporary files Ansible needs to create when
+  # becoming an unprivileged user ... chmod: invalid mode: 'A+user:grid:rx:allow'"
+  # (Ansible tries NFSv4/macOS-style ACL chmod syntax to hand the become_from user's
+  # temp file to an unprivileged become_user; this target's GNU chmod doesn't support
+  # that syntax at all — see
+  # https://docs.ansible.com/ansible-core/2.16/playbook_guide/playbooks_privilege_escalation.html#risks-of-becoming-an-unprivileged-user).
+  # Root doesn't hit this code path at all (nothing to hand off — root can already
+  # read anything), and every other task in this role already runs as plain root
+  # successfully — per James's explicit direction, this role now tars/checks/untars
+  # everything as root and doesn't fight Ansible's unprivileged-become permission
+  # model at all. See known-risks.md #48's second update.
+
+- name: "Fail if Clusterware is still online on {{ clone_source_node }}, or if the check itself couldn't run — stop it correctly before re-running this role"
+  fail:
+    msg: >
+      {% if crs_check.stdout is not defined %}
+      crsctl check crs on {{ clone_source_node }} didn't return normal output — this
+      looks like a connection/become failure, not a Clusterware state, so failing
+      closed rather than assuming it's safe to proceed. Raw result:
+      {{ crs_check.module_stderr | default(crs_check.module_stdout | default(crs_check.msg | default(crs_check))) }}
+      Re-run with -vvv if this doesn't show the real error text.
+      {% else %}
+      Clusterware still appears to be running on {{ clone_source_node }}:
+      {{ crs_check.stdout }}
+      NOTE: `crsctl stop cluster -all` is NOT the same as `crsctl stop crs` —
+      `stop cluster` only stops CRSD-managed resources (ASM, listeners, databases)
+      and deliberately leaves Oracle High Availability Services (OHASD) running,
+      which is exactly the "CRS-4638: ... is online" you're seeing. Run
+      `crsctl stop crs` instead — root/sudo required, no `-all` flag (it only
+      affects the local node, so run it once on EACH of oradbserv05 and
+      oradbserv06) — then confirm with `crsctl check crs` before re-running this
+      role. See high-availability/README.md Section 6.
+      {% endif %}
+  when: crs_check.stdout is not defined or 'is online' in crs_check.stdout
+
+- name: "Preflight: confirm os_prep has already run on every target node (checks {{ inventory_loc }}, NOT /etc/oraInst.loc — see comment below)"
+  become: true
+  delegate_to: "{{ item }}"
+  loop: "{{ clone_target_nodes }}"
+  stat:
+    path: "{{ inventory_loc }}"
+  register: orainst_loc_check
+  failed_when: not (orainst_loc_check.stat.exists and orainst_loc_check.stat.isdir)
+  # Was /etc/oraInst.loc originally — wrong check, caught on the first real run
+  # against fresh nodes (oradbserv09/10 correctly failed this, since they'd genuinely
+  # never had it, and the whole run stopped here rather than tarring anything). That
+  # FILE only gets written by an actual Oracle installer run (OUI, via -invPtrLoc) —
+  # os_prep never touches it (confirmed: no match anywhere in roles/os_prep). Since
+  # this role's entire point is to clone Oracle Homes WITHOUT ever running an
+  # installer on the target nodes, /etc/oraInst.loc will never exist here before
+  # gridSetup.sh runs in the not-yet-built cluster-configuration step — checking for
+  # it was checking for something this role can never satisfy. {{ inventory_loc }}
+  # (e.g. /u01/app/oraInventory) is the right signal instead — os_prep's own "Create
+  # OFA directory structure" task creates that directory (owner grid:oinstall)
+  # directly, unconditionally, every run — see known-risks.md #49.
+
+- name: "Preflight: confirm the oracle/grid OS users exist on every target node"
+  become: true
+  delegate_to: "{{ item }}"
+  loop: "{{ clone_target_nodes }}"
+  # GNU coreutils `id` only ever takes ONE username operand — `id oracle grid` isn't
+  # "check both users", it's a syntax error ("id: extra operand 'grid'"), caught on
+  # the first real run. `shell` + `&&` runs both as separate id invocations and still
+  # fails the task (nonzero rc, shell/command modules fail on that by default) if
+  # either user is missing — see known-risks.md #49's update.
+  shell: "id {{ oracle_user }} && id {{ grid_user }}"
+  register: id_check
+  changed_when: false
+
+# --- Source side: tar GI_HOME and DB_HOME, excluding node-specific/runtime files ---
+
+- name: "Ensure {{ staging_dir }}/clone exists on source and on {{ clone_target_nodes[0] }} (the only target node this role deploys to — see header comment)"
+  become: true
+  delegate_to: "{{ item }}"
+  loop: "{{ [clone_source_node, clone_target_nodes[0]] }}"
+  file:
+    path: "{{ staging_dir }}/clone"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0775"
+
+- name: "Create GI home tarball on {{ clone_source_node }} (excludes node-specific files per Oracle's documented cloning exclusion list)"
+  become: true
+  delegate_to: "{{ clone_source_node }}"
+  run_once: true
+  shell: >
+    tar -czf {{ staging_dir }}/clone/gi_home.tgz -C {{ grid_home }}
+    --exclude='log/*' --exclude='gpnp/*' --exclude='cdata/*' --exclude='crf/*'
+    --exclude='network/admin/*.ora' --exclude='crs/install/crsconfig_params'
+    --exclude='crs/install/crsconfig_addparams' --exclude='crs/install/crsgenconfig_params'
+    --exclude='root.sh*' --exclude='cfgtoollogs/*' --exclude='rdbms/audit/*'
+    --exclude='rdbms/log/*' --exclude='inventory/backup/*' --exclude='oraInst.loc'
+    --exclude='*.ouibak' --exclude='*.ouibak.1' .
+  args:
+    creates: "{{ staging_dir }}/clone/gi_home.tgz"
+
+- name: "Create DB home tarball on {{ clone_source_node }} (same exclusion logic, RDBMS-relevant subset)"
+  become: true
+  delegate_to: "{{ clone_source_node }}"
+  run_once: true
+  shell: >
+    tar -czf {{ staging_dir }}/clone/db_home.tgz -C {{ db_home }}
+    --exclude='cfgtoollogs/*' --exclude='rdbms/audit/*' --exclude='rdbms/log/*'
+    --exclude='network/admin/*.ora' --exclude='inventory/backup/*'
+    --exclude='install/*.rsp' --exclude='*.ouibak' --exclude='*.ouibak.1' .
+  args:
+    creates: "{{ staging_dir }}/clone/db_home.tgz"
+
+- name: "Ensure both tarballs are readable by the ansible connection user (scp pulls them as ansible, not root — don't assume oradbserv05's root umask leaves them world-readable)"
+  become: true
+  delegate_to: "{{ clone_source_node }}"
+  run_once: true
+  file:
+    path: "{{ staging_dir }}/clone/{{ item }}"
+    mode: "0644"
+  loop:
+    - gi_home.tgz
+    - db_home.tgz
+
+# --- Move both tarballs through the control node to each target node ---
+# Plain scp, NOT the fetch module. `fetch` internally uses the `slurp` module, which
+# base64-encodes the ENTIRE remote file into a single JSON payload held in memory —
+# fine for small files, but a real run against multi-GB GI/DB home tarballs got
+# `rc: 137` ("Killed") on oradbserv05: the OOM killer took out the slurp process
+# mid-transfer. Shelling out to scp streams the file instead, using the same SSH
+# identity/known_hosts Ansible's own connection already relies on for every other
+# task in this project. See known-risks.md #50.
+
+- name: "Copy tarballs from {{ clone_source_node }} to the control node via scp (deliberately NOT delegated — must run on the control node itself, the scp client side)"
+  become: false
+  command: >
+    scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new
+    {{ hostvars[clone_source_node].ansible_user | default('ansible') }}@{{ hostvars[clone_source_node].ansible_host }}:{{ staging_dir }}/clone/{{ item }}
+    /tmp/{{ item }}
+  loop:
+    - gi_home.tgz
+    - db_home.tgz
+  args:
+    creates: "/tmp/{{ item }}"
+
+- name: "Ensure GI home directory exists on {{ clone_target_nodes[0] }}, correct ownership, before extraction"
+  become: true
+  delegate_to: "{{ clone_target_nodes[0] }}"
+  file:
+    path: "{{ grid_home }}"
+    state: directory
+    owner: "{{ grid_user }}"
+    group: oinstall
+    mode: "0775"
+
+- name: "Ensure DB home directory exists on {{ clone_target_nodes[0] }}, correct ownership, before extraction"
+  become: true
+  delegate_to: "{{ clone_target_nodes[0] }}"
+  file:
+    path: "{{ db_home }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0775"
+
+- name: "Copy GI home tarball to {{ clone_target_nodes[0] }}"
+  become: true
+  delegate_to: "{{ clone_target_nodes[0] }}"
+  copy:
+    src: "/tmp/gi_home.tgz"
+    dest: "{{ staging_dir }}/clone/gi_home.tgz"
+
+- name: "Copy DB home tarball to {{ clone_target_nodes[0] }}"
+  become: true
+  delegate_to: "{{ clone_target_nodes[0] }}"
+  copy:
+    src: "/tmp/db_home.tgz"
+    dest: "{{ staging_dir }}/clone/db_home.tgz"
+
+- name: "Extract GI home tarball on {{ clone_target_nodes[0] }}"
+  become: true
+  delegate_to: "{{ clone_target_nodes[0] }}"
+  unarchive:
+    src: "{{ staging_dir }}/clone/gi_home.tgz"
+    dest: "{{ grid_home }}"
+    remote_src: true
+    owner: "{{ grid_user }}"
+    group: oinstall
+
+- name: "Extract DB home tarball on {{ clone_target_nodes[0] }}"
+  become: true
+  delegate_to: "{{ clone_target_nodes[0] }}"
+  unarchive:
+    src: "{{ staging_dir }}/clone/db_home.tgz"
+    dest: "{{ db_home }}"
+    remote_src: true
+    owner: "{{ oracle_user }}"
+    group: oinstall
+
+# known-risks.md #107: the tar-then-unarchive clone above does NOT reliably
+# preserve the setuid bit on {{ db_home }}/bin/oracle. On a normal silent
+# install, root.sh (via rootadd_rdbms.sh) sets this explicitly — this role
+# bypasses that entire install flow by design (it clones an already-built
+# home instead), so nothing ever re-asserts it on the cloned copy. Confirmed
+# for real on oradbserv09/oradbserv10: both came out of this role's
+# extraction step as -rwxr-x--x (no setuid), while oradbserv05 (the
+# original, installer-built source, never touched by this role) was
+# correctly -rwsr-s--x. The practical symptom was severe and easy to
+# misdiagnose as a listener/TNS config problem: the grid-owned LISTENER
+# process can find and route to a statically-registered SID fine, but
+# can't actually exec/hand off to a non-setuid oracle binary it doesn't
+# own, producing TNS-12518 ("listener could not hand off client
+# connection") + TNS-12547 ("lost contact") + TNS-12560 ("protocol adapter
+# error") on every connection attempt — this is exactly what blocked
+# dataguard_duplicate's AUXILIARY connection until this was found and
+# fixed by hand first, then folded back into this role here.
+- name: "Re-assert the setuid bit on {{ db_home }}/bin/oracle after cloning (known-risks.md #107 — unarchive does not reliably preserve it)"
+  become: true
+  delegate_to: "{{ clone_target_nodes[0] }}"
+  file:
+    path: "{{ db_home }}/bin/oracle"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "6751"
+
+- name: Report clone status
+  debug:
+    msg: >
+      GI and DB Oracle Homes cloned from {{ clone_source_node }} onto
+      {{ clone_target_nodes[0] }} ONLY — {{ clone_target_nodes[1:] | join(', ') }}
+      deliberately untouched by this role (empty grid_home/db_home already left
+      there by os_prep). BOTH homes deliberately left UNregistered — gridSetup.sh
+      (GI) and, later, a db_silent_install-based standby DB configuration step
+      (RDBMS) each register their own home via their normal single-node-launch +
+      OUI-propagation flow, the same mechanism the primary cluster's install
+      already uses. No cluster exists yet; this role only deployed binaries onto
+      the node that flow will launch from. See known-risks.md #65/#66.

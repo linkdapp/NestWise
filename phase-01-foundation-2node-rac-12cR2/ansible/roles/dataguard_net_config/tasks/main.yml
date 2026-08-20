@@ -1,0 +1,616 @@
+---
+# Data Guard Phase 2 — Oracle Net configuration (SOP standby_dataguard_creation.txt
+# section 6). Runs against dg_db_nodes (rac_nodes + standby_nodes together, see
+# inventory/hosts.ini) because both halves of this role are inherently cross-cluster:
+# every DB node on either side needs the SAME tnsnames.ora (both clusters' SCAN
+# aliases), and each node needs its OWN static listener.ora entry — now carrying
+# BOTH SID_DESC entries (plain service, and _DGMGRL) pointing at its own local
+# instance.
+#
+# Naming follows docs/known-risks.md #76: apexdb (not the SOP's proposed apexdb_pri)
+# for the primary, apexdb_stby for the standby — group_vars/all.yml's dg_* block is
+# the single source of truth for every alias/service name used below.
+#
+# Update (Phase 7, Data Guard Broker build): the redo-transport TNS aliases were
+# renamed from apexdb_dg/apexdb_stby_dg to apexdb_DGMGRL/apexdb_stby_DGMGRL —
+# James's own call. "_dg" was too easy to confuse with dg_broker_config_name
+# ("apexdb_dg" in group_vars/all.yml — the BROKER CONFIGURATION's name, a
+# completely different namespace from a TNS alias) once a real Broker
+# configuration entered the picture. "_DGMGRL" also now matches exactly the
+# GLOBAL_DBNAME the static listener SID_DESC below registers, so the alias name
+# and the listener entry it resolves to read as the same thing. And the static
+# _DGMGRL SID_DESC deferred by #135 is now added for real (see 6.2 below) — Phase
+# 7 (roles/dataguard_broker) is the configuration that finally gives it something
+# to connect to.
+
+- name: "Determine this node's local Oracle SID (apexdb1/apexdb2, cluster-agnostic — same nodes-based pattern grid_silent_install and dataguard_primary_prep already use)"
+  set_fact:
+    dg_local_sid: "{{ sid_prefix }}{{ (nodes | map(attribute='name') | list).index(inventory_hostname) + 1 }}"
+  tags: always
+
+- name: "Ensure the database home's network/admin directory exists"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ db_home }}/network/admin"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0755"
+
+# dataguard_primary_prep creates {{ staging_dir }}/sql, but that role only ever
+# runs on rac_node1 (oradbserv05) — dataguard_net_config runs on all of
+# dg_db_nodes and writes its connectivity-test .sql scripts into this same
+# directory further down, so it needs to guarantee the directory itself exists
+# on every node, not assume another role already created it elsewhere. Missing
+# this is exactly what broke the connectivity-test write tasks on
+# oradbserv06/09/10 (copy can't create a missing parent directory) while
+# oradbserv05 — the one host that happened to already have it — worked fine.
+- name: "Ensure the SQL script staging directory exists on this node"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/sql"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0750"
+
+- name: "Ensure the grid home's network/admin directory exists"
+  become: true
+  become_user: "{{ grid_user }}"
+  file:
+    path: "{{ grid_home }}/network/admin"
+    state: directory
+    owner: "{{ grid_user }}"
+    group: oinstall
+    mode: "0755"
+
+# --- 6.1 Dedicated TNS entries for redo transport (SOP 6.1) --------------------
+# UR=A lets Broker/RMAN connect even when the database isn't open yet — SOP's
+# own reasoning, unchanged. apexdb/apexdb_DGMGRL (primary) connect via SCAN —
+# usatclust1 is a real, CRS-registered 2-node RAC database, so dynamic PMON
+# registration across the SCAN listeners has always worked correctly there.
+#
+# apexdb_stby/apexdb_stby_DGMGRL (standby) target is now DECIDED AT RUN TIME,
+# not hardcoded — check-then-act, same idiom as every other "is this thing
+# actually ready" fact in this project. Before apexdb_stby is CRS-registered
+# (Phase 6, dataguard_convert_rac, hasn't run yet), SCAN dynamic registration
+# genuinely doesn't work for it — nothing has told usatclust2's SCAN
+# listeners this service exists — so the standby's own plain node hostname
+# is the only thing that resolves (known-risks.md #105/#106/#115). This is
+# also the version that matters most for Phase 4's RMAN AUXILIARY connection
+# — hostname avoids depending on SCAN registration that doesn't exist yet at
+# that point in the build.
+#
+# Once Phase 6 has actually run and apexdb_stby is a real, CRS-registered,
+# dynamically-PMON-registered 2-node RAC database, staying on the node1
+# hostname is actively wrong: James's own live test proved it — killing
+# oradbserv09 broke redo shipping to apexdb_stby entirely instead of failing
+# over to oradbserv10, because log_archive_dest_2 (and this tnsnames.ora
+# entry) only ever knew about one node. Re-running `--tags
+# dataguard_net_config` after Phase 6 now detects the CRS registration and
+# switches this block to `scan-usatclust2.usat.com`, restoring real
+# RAC-level redo-transport failover. See docs/known-risks.md #134.
+- name: "Check whether apexdb_stby is CRS-registered yet (decides SCAN vs node-hostname for the standby TNS block below) — delegated to the standby's own node1, since only usatclust2's own CRS/OCR knows this; the primary nodes are a genuinely separate cluster and can't query it"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  command: "{{ db_home }}/bin/srvctl config database -d {{ dg_standby_db_unique_name }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+  register: dg_net_config_standby_srvctl_check
+  changed_when: false
+  failed_when: false
+
+- name: "Set fact: is apexdb_stby CRS-registered, and which host the standby TNS aliases should target this run"
+  set_fact:
+    dg_net_config_standby_is_rac: "{{ dg_net_config_standby_srvctl_check.rc == 0 }}"
+    dg_net_config_standby_host: "{{ dg_standby_scan_fqdn if (dg_net_config_standby_srvctl_check.rc == 0) else dg_standby_node1_fqdn }}"
+
+- name: "Report which target the standby TNS aliases will use this run, and why"
+  debug:
+    msg: >-
+      apexdb_stby {{ 'IS' if dg_net_config_standby_is_rac else 'is NOT yet' }}
+      CRS-registered (srvctl config database -d {{ dg_standby_db_unique_name }}
+      {{ 'succeeded' if dg_net_config_standby_is_rac else 'failed, rc=' ~ dg_net_config_standby_srvctl_check.rc }}
+      on {{ groups['standby_nodes'][0] }}). apexdb_stby/apexdb_stby_DGMGRL will
+      target {{ dg_net_config_standby_host }}
+      {{ '(SCAN — real RAC-level redo-transport failover between both standby nodes)' if dg_net_config_standby_is_rac else '(the standby node1 hostname — SCAN would not resolve a service yet)' }}.
+      See known-risks.md #134.
+
+# --- One-time cleanup: remove the legacy, non-blockinfile-managed TNS block ---
+# James caught this directly from a real run's own output: tnsnames.ora
+# already had a PRE-EXISTING TNS alias block, predating this role's own
+# blockinfile management, with the OLD apexdb_dg/apexdb_stby_dg alias names
+# still in it. Root cause, confirmed from the actual pasted text: that
+# legacy block's own BEGIN/END comment lines are internally inconsistent —
+# "# BEGIN primary DB - Data Guard TNS aliases" (lowercase "primary") paired
+# with "# End Primary DB  - Data Guard TNS aliases" (capital "Primary",
+# "End" not "END", an extra space before the dash) — not something
+# blockinfile itself would ever produce (its BEGIN/END lines always share
+# identical surrounding text). This was hand-typed at some point, not
+# Ansible-managed. Because blockinfile requires an EXACT marker-line match
+# to recognize a block as "its own," it could never see this legacy block
+# as manageable — every run just appended a fresh, correctly-marked block
+# below it instead of replacing it in place, producing real duplicates (2x
+# apexdb, 2x of the primary UR=A alias, 2x apexdb_stby, 2x of the standby
+# UR=A alias — the exact thing James flagged).
+#
+# Fix: remove the legacy block by its exact, verbatim text (taken directly
+# from James's own real run output) via a targeted sed range-delete.
+# Naturally idempotent — checked first via grep, sed only runs where the
+# legacy marker is actually still present, so a clean node (or a node
+# already cleaned up by a prior run) is untouched.
+- name: "Check for the legacy (pre-Ansible, non-blockinfile-managed) TNS alias blocks — exact text confirmed from a real run's output"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: "grep -c '^{{ item.begin }}$' {{ db_home }}/network/admin/tnsnames.ora || true"
+  loop:
+    - { name: "primary",  begin: "# BEGIN primary DB - Data Guard TNS aliases", end: "# End Primary DB  - Data Guard TNS aliases" }
+    - { name: "standby",  begin: "# Begin Standby DB - Data Guard TNS aliases", end: "# End Standby DB - Data Guard TNS aliases" }
+  loop_control:
+    label: "{{ item.name }}"
+  register: dg_tns_legacy_check
+  changed_when: false
+
+- name: Show legacy TNS block check results (count > 0 means that node still has the old, non-canonical block)
+  debug:
+    msg: "{{ inventory_hostname }} -> legacy {{ item.item.name }} block present: {{ (item.stdout | trim | int) > 0 }}"
+  loop: "{{ dg_tns_legacy_check.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+
+- name: "Remove the legacy TNS alias block (exact verbatim match, only where the check above found it)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: "sed -i '/^{{ item.item.begin }}$/,/^{{ item.item.end }}$/d' {{ db_home }}/network/admin/tnsnames.ora"
+  loop: "{{ dg_tns_legacy_check.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: (item.stdout | trim | int) > 0
+  register: dg_tns_legacy_remove
+
+- name: Show which legacy blocks were actually removed this run
+  debug:
+    msg: "{{ inventory_hostname }} -> removed legacy {{ item.item.item.name }} block"
+  loop: "{{ dg_tns_legacy_remove.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.name | default('n/a') }}"
+  when: dg_tns_legacy_remove.results is defined
+
+- name: "Add primary DB TNS aliases to tnsnames.ora (apexdb, apexdb_DGMGRL)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  blockinfile:
+    path: "{{ db_home }}/network/admin/tnsnames.ora"
+    marker: "# {mark} Primary DB - Data Guard TNS aliases"
+    create: true
+    backup: true
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    block: |
+      apexdb =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ dg_primary_scan_fqdn }})(PORT = {{ scan_port }}))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = apexdb)
+          )
+        )
+
+      apexdb_DGMGRL =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ dg_primary_scan_fqdn }})(PORT = {{ scan_port }}))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = apexdb)
+            (UR = A)
+          )
+        )
+  register: dg_tnsnames_primary_result
+
+- name: "Add standby DB TNS aliases to tnsnames.ora (apexdb_stby, apexdb_stby_DGMGRL) — target is dg_net_config_standby_host, decided above"
+  become: true
+  become_user: "{{ oracle_user }}"
+  blockinfile:
+    path: "{{ db_home }}/network/admin/tnsnames.ora"
+    marker: "# {mark} Standby DB - Data Guard TNS aliases"
+    create: true
+    backup: true
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    block: |
+      apexdb_stby =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ dg_net_config_standby_host }})(PORT = {{ scan_port }}))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = apexdb_stby)
+            (UR = A)
+          )
+        )
+
+      apexdb_stby_DGMGRL =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ dg_net_config_standby_host }})(PORT = {{ scan_port }}))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = apexdb_stby)
+            (UR = A)
+          )
+        )
+  register: dg_tnsnames_standby_result
+
+- name: "Show tnsnames.ora backup location (blockinfile's own backup: true — only set when an existing file actually got modified, nothing to back up on first creation)"
+  debug:
+    msg:
+      primary_block: "{{ dg_tnsnames_primary_result.backup_file | default('no backup taken — tnsnames.ora did not exist yet, nothing to preserve') }}"
+      standby_block: "{{ dg_tnsnames_standby_result.backup_file | default('no backup taken — block unchanged or file did not exist yet') }}"
+
+- name: "Show rendered tnsnames.ora"
+  become: true
+  become_user: "{{ oracle_user }}"
+  command: "cat {{ db_home }}/network/admin/tnsnames.ora"
+  register: dg_tnsnames_show
+  changed_when: false
+
+- name: Show tnsnames.ora content
+  debug:
+    var: dg_tnsnames_show.stdout_lines
+
+- name: "Verify no duplicate alias definitions remain — each of apexdb, apexdb_DGMGRL, apexdb_stby, apexdb_stby_DGMGRL should appear exactly once (direct check for the exact duplication bug James caught)"
+  shell: |
+    for alias in apexdb apexdb_DGMGRL apexdb_stby apexdb_stby_DGMGRL; do
+      count=$(grep -cE "^${alias} =" {{ db_home }}/network/admin/tnsnames.ora)
+      echo "${alias}: ${count}"
+    done
+  register: dg_tns_dup_check
+  changed_when: false
+
+- name: "Show duplicate-alias verification (each line should read ': 1')"
+  debug:
+    var: dg_tns_dup_check.stdout_lines
+
+- name: "Fail if any TNS alias still appears more than once (cleanup above didn't fully resolve it — investigate by hand, don't re-run blindly)"
+  fail:
+    msg: >-
+      Duplicate TNS alias definitions still present in
+      {{ db_home }}/network/admin/tnsnames.ora on {{ inventory_hostname }}:
+      {{ dg_tns_dup_check.stdout_lines | select('search', ': [2-9]') | list }}
+  when: "dg_tns_dup_check.stdout_lines | select('search', ': [2-9]') | list | length > 0"
+
+# --- 6.2 Static listener entry, plain service only (SOP 6.2, scope trimmed) ---
+# The LISTENER resource is grid-owned in this project (confirmed via crsctl stat
+# res -t — ora.LISTENER.lsnr — Section 9), so this edits grid_home's listener.ora,
+# not db_home's. ORACLE_HOME inside the SID_DESC still points at db_home — that's
+# correct and standard: it tells the listener which Oracle binaries own that SID,
+# independent of which home the listener process itself runs from.
+#
+# The plain (no-suffix) SID_DESC earns its place independent of Broker: it's
+# needed so a normal SYS connection — e.g. RMAN's AUXILIARY connection during
+# DUPLICATE ... FROM ACTIVE DATABASE — can reach this instance via TNS (apexdb/
+# apexdb_stby aliases, SERVICE_NAME=apexdb/apexdb_stby) BEFORE the database is
+# MOUNTED. Dynamic PMON registration for the plain service name only happens
+# once an instance reaches MOUNT; before that (exactly the NOMOUNT window
+# dataguard_standby_prep leaves the standby in, waiting for Phase 4's RMAN
+# DUPLICATE), nothing has registered that service with the listener at all —
+# a real ORA-12514 James hit directly on the first live Phase 4 run. Static
+# entries don't need PMON/dynamic registration; that's the whole point of
+# adding this one here rather than waiting. See docs/known-risks.md #103.
+#
+# Update (Phase 7, Data Guard Broker build): #135 originally deferred the
+# _DGMGRL SID_DESC because it would have been dead configuration with nothing
+# to connect to. That's no longer true — roles/dataguard_broker now builds a
+# real DGMGRL configuration that needs exactly this entry to reach every
+# instance regardless of open mode (DGMGRL's own connections use UR=A-style
+# "any state" semantics, same reasoning as the TNS aliases above). Both
+# SID_DESC stanzas now live in the SAME managed block below, inside the SAME
+# single SID_LIST_LISTENER stanza — Oracle only supports one SID_LIST_LISTENER
+# per listener name (the preflight check right above this comment exists
+# specifically to catch a second, conflicting one), so this can never be two
+# separate blockinfile-managed blocks; it has to be one block with two
+# SID_DESC entries. GLOBAL_DBNAME for the second entry (dg_local_db_unique_name
+# + "_DGMGRL") matches the apexdb_DGMGRL/apexdb_stby_DGMGRL TNS alias
+# SERVICE_NAME convention 1:1 — see the renamed aliases above.
+#
+# Known limitation, flagged rather than silently left as a trap: this role
+# (dataguard_net_config) now owns the _DGMGRL SID_DESC, not dataguard_broker —
+# blockinfile content is whatever the last role to touch this marker wrote. If
+# dataguard_net_config is ever re-run with --tags dataguard_net_config alone
+# after this, it still writes both SID_DESCs (the second one isn't
+# conditional on Broker actually existing), so there's no regression risk from
+# re-running it. The only real constraint is: don't add a THIRD, independently
+# marker-scoped listener block anywhere else — always extend this one.
+# Update (real-run finding, James's pasted `cat listener.ora` from
+# oradbserv09/10): the preflight check below failed on both nodes even
+# though the SID_LIST_LISTENER stanza it found was ALREADY exactly the
+# two-SID_DESC content this role wants — both GLOBAL_DBNAMEs, both
+# SID_NAMEs, correct. Root cause: its own marker line reads "# BEGIN
+# ANSIBLE MANAGED BLOCK - Data Guard static DGMGRL listener entry" — this
+# role's marker text was missing the word "DGMGRL", so the check's own grep
+# for the (wrong) marker text found zero matches and treated a
+# fully-correct, already-managed block as a foreign stanza. Same marker-
+# drift bug class as the tnsnames.ora one James caught earlier in this
+# build — some earlier version of this role's marker included "DGMGRL" and
+# actually ran against the live boxes; the marker text changed since, but
+# the live boxes were never re-run to pick up the rename. Fixed by
+# restoring "DGMGRL" to the marker text (both here and in the blockinfile
+# task below) and reordering the block content to match live order exactly
+# (_DGMGRL SID_DESC first, plain second) — no destructive cleanup needed
+# here, unlike tnsnames.ora, since the live content was already correct;
+# this just makes blockinfile recognize it as its own.
+- name: "Check listener.ora for any pre-existing SID_LIST_LISTENER stanza (safety check before the managed block below — Oracle only supports ONE SID_LIST_LISTENER per listener name)"
+  become: true
+  become_user: "{{ grid_user }}"
+  shell: |
+    grep -c 'SID_LIST_LISTENER' {{ grid_home }}/network/admin/listener.ora || true
+    grep -c 'ANSIBLE MANAGED BLOCK - Data Guard static DGMGRL listener entry' {{ grid_home }}/network/admin/listener.ora || true
+  register: dg_listener_sidlist_check
+  changed_when: false
+
+- name: "Fail if listener.ora already has a SID_LIST_LISTENER stanza this role didn't add (merge the static SID_DESC in by hand instead of risking a second, conflicting stanza)"
+  fail:
+    msg: >
+      {{ grid_home }}/network/admin/listener.ora on {{ inventory_hostname }} already
+      contains a SID_LIST_LISTENER entry that isn't this role's managed block.
+      Oracle only supports one SID_LIST_LISTENER stanza per listener name — add the
+      SID_DESC to the existing stanza by hand rather than letting this task
+      create a conflicting second one.
+  when:
+    - (dg_listener_sidlist_check.stdout_lines[0] | int) > 0
+    - (dg_listener_sidlist_check.stdout_lines[1] | int) == 0
+
+- name: "Add the static listener entries for this node's local instance — plain service (pre-MOUNT connectivity) AND _DGMGRL (Broker, any-state connectivity) — same single SID_LIST_LISTENER stanza"
+  become: true
+  become_user: "{{ grid_user }}"
+  blockinfile:
+    path: "{{ grid_home }}/network/admin/listener.ora"
+    marker: "# {mark} ANSIBLE MANAGED BLOCK - Data Guard static DGMGRL listener entry"
+    create: true
+    backup: true
+    owner: "{{ grid_user }}"
+    group: oinstall
+    mode: "0644"
+    block: |
+      SID_LIST_LISTENER =
+        (SID_LIST =
+          (SID_DESC =
+            (GLOBAL_DBNAME = {{ dg_local_db_unique_name }}_DGMGRL)
+            (ORACLE_HOME = {{ db_home }})
+            (SID_NAME = {{ dg_local_sid }})
+          )
+          (SID_DESC =
+            (GLOBAL_DBNAME = {{ dg_local_db_unique_name }})
+            (ORACLE_HOME = {{ db_home }})
+            (SID_NAME = {{ dg_local_sid }})
+          )
+        )
+  register: dg_listener_block_result
+
+- name: "Show listener.ora backup location (blockinfile's own backup: true — only set when an existing file actually got modified)"
+  debug:
+    msg: "{{ dg_listener_block_result.backup_file | default('no backup taken — listener.ora did not exist yet, nothing to preserve') }}"
+
+- name: "Show rendered listener.ora"
+  become: true
+  become_user: "{{ grid_user }}"
+  command: "cat {{ grid_home }}/network/admin/listener.ora"
+  register: dg_listener_show
+  changed_when: false
+
+- name: Show listener.ora content
+  debug:
+    var: dg_listener_show.stdout_lines
+
+- name: "Reload the local listener to pick up the static entry (only when the file actually changed)"
+  become: true
+  become_user: "{{ grid_user }}"
+  command: "{{ grid_home }}/bin/lsnrctl reload"
+  environment:
+    ORACLE_HOME: "{{ grid_home }}"
+    TNS_ADMIN: "{{ grid_home }}/network/admin"
+  register: dg_listener_reload
+  changed_when: "'completed successfully' in dg_listener_reload.stdout"
+  when: dg_listener_block_result.changed
+
+- name: Show listener reload output
+  debug:
+    var: dg_listener_reload.stdout_lines
+  when: dg_listener_block_result.changed
+
+- name: "Verify the static plain-service entry is now registered"
+  become: true
+  become_user: "{{ grid_user }}"
+  command: "{{ grid_home }}/bin/lsnrctl services"
+  environment:
+    ORACLE_HOME: "{{ grid_home }}"
+    TNS_ADMIN: "{{ grid_home }}/network/admin"
+  register: dg_listener_services
+  changed_when: false
+
+- name: Show lsnrctl services output (confirm BOTH static entries appear — plain and _DGMGRL — status "UNKNOWN" is CORRECT/expected for a static SID_LIST entry, not a fault; see docs/known-risks.md #87. "READY" only applies to dynamically PMON-registered services like apexdb itself)
+  debug:
+    var: dg_listener_services.stdout_lines
+
+# --- 6.3 Test connectivity (SOP 6.3) -------------------------------------------
+# tnsping only proves the listener at that SCAN address answers on the alias's
+# host/port — it does NOT require the SERVICE_NAME to be registered, so all 4
+# aliases can legitimately succeed here even before the standby database exists.
+#
+# Run from EVERY node in dg_db_nodes, not just one — James caught that the first
+# version of this section only ran run_once (from whichever host happened to be
+# first in the play, oradbserv05), so oradbserv06/09/10 never actually proved
+# THEY could reach anything. A clean result from oradbserv05 alone says nothing
+# about oradbserv09/10's own path to the primary (the exact direction #86's
+# /etc/hosts bug broke) or oradbserv06's. No run_once anywhere in this section now.
+- name: "tnsping every Data Guard TNS alias, from every node"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/tnsping {{ item }}
+  loop:
+    - apexdb
+    - apexdb_stby
+    - apexdb_DGMGRL
+    - apexdb_stby_DGMGRL
+  loop_control:
+    label: "{{ item }}"
+  register: dg_tnsping_result
+  changed_when: false
+  failed_when: false
+
+- name: Show tnsping results (per node)
+  debug:
+    msg: "{{ inventory_hostname }} -> {{ item.item }}: {{ 'OK' if item.rc == 0 else 'FAILED (rc=' ~ item.rc ~ ')' }}"
+  loop: "{{ dg_tnsping_result.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# A real sqlplus login (not just tnsping) proves the alias resolves to a live,
+# authenticated database — this needs a real password over the wire, unlike
+# every other SQL step in this project's Data Guard roles which uses OS
+# authentication (`/ as sysdba`) locally. sys_password follows the same
+# never-defaulted, runtime-supplied convention already established in
+# group_vars/all.yml (`-e sys_password=...` or ansible-vault) — see that file's
+# comment block. The password is written into a 0600 script file (no_log on the
+# write itself) and never appears on a command line/in argv, so the execution
+# task and its output below are safe to show in full, same as every other step
+# in this build — only the "write the script" task is no_log.
+#
+# Tests BOTH primary aliases (apexdb and apexdb_DGMGRL — the plain connect alias
+# and the redo-transport alias with UR=A), from EVERY node in dg_db_nodes — not
+# just apexdb, and not just run_once from oradbserv05. James caught both gaps: a
+# clean result from oradbserv05 alone doesn't prove oradbserv06, oradbserv09, or
+# oradbserv10 can actually reach the primary — oradbserv09/10 reaching it at all
+# is exactly the direction #86's /etc/hosts bug broke, and apexdb_DGMGRL is the
+# alias log_archive_dest_2/RMAN/Broker actually use, not apexdb itself.
+- name: "Write connectivity-test SQL scripts for the primary TNS aliases (apexdb, apexdb_DGMGRL)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_net_test_{{ item }}.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      whenever sqlerror exit failure
+      connect sys/{{ sys_password }}@{{ item }} as sysdba
+      select 'CONNECT OK: name=' || name || ' role=' || database_role || ' open_mode=' || open_mode from v$database;
+      exit;
+  loop:
+    - apexdb
+    - apexdb_DGMGRL
+  loop_control:
+    label: "{{ item }}"
+
+- name: "Show what each primary connectivity test is actually attempting (non-secret — password itself is never printed anywhere)"
+  debug:
+    msg: "{{ inventory_hostname }} -> CONNECT sys/<sys_password> @ {{ item }} (scan-usatclust1.usat.com:1521, primary) AS SYSDBA — sys_password comes from group_vars/all.yml's never-defaulted var, overridden at runtime via -e sys_password=... or ansible-vault; this run used whatever value was in effect (the CHANGE_ME_sys_password placeholder if no -e/vault was supplied)."
+  loop:
+    - apexdb
+    - apexdb_DGMGRL
+  loop_control:
+    label: "{{ item }}"
+
+- name: "Test network connectivity + auth to the primary via apexdb and apexdb_DGMGRL, from this node"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s /nolog @{{ staging_dir }}/sql/dg_net_test_{{ item }}.sql
+  loop:
+    - apexdb
+    - apexdb_DGMGRL
+  loop_control:
+    label: "{{ item }}"
+  register: dg_net_test_primary
+  changed_when: false
+  failed_when: false
+
+- name: Show primary connectivity test output (apexdb + apexdb_DGMGRL, this node)
+  debug:
+    msg: "{{ inventory_hostname }} -> {{ item.item }}: {{ item.stdout_lines }}"
+  loop: "{{ dg_net_test_primary.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Summarize primary connectivity results for this node (apexdb + apexdb_DGMGRL)
+  debug:
+    msg: "{{ inventory_hostname }} -> {{ item.item }}: {{ 'OK' if item.rc == 0 else 'FAILED (rc=' ~ item.rc ~ ')' }}"
+  loop: "{{ dg_net_test_primary.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: "Remove the primary connectivity-test scripts (contained a live password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_net_test_{{ item }}.sql"
+    state: absent
+  loop:
+    - apexdb
+    - apexdb_DGMGRL
+  loop_control:
+    label: "{{ item }}"
+
+# Expected to fail at this stage — SOP section 6.3 says so directly: the standby
+# database doesn't exist yet (that's Phase 4). This proves the alias/listener path
+# is correctly wired now, so Phase 4's RMAN AUXILIARY connection has one less
+# variable to debug later.
+- name: "Write connectivity-test SQL script for the apexdb_stby (standby) TNS alias"
+  become: true
+  become_user: "{{ oracle_user }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_net_test_standby.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      whenever sqlerror exit failure
+      connect sys/{{ sys_password }}@apexdb_stby as sysdba
+      select 'CONNECT OK: name=' || name || ' role=' || database_role || ' open_mode=' || open_mode from v$database;
+      exit;
+  run_once: true
+
+- name: "Show what this connectivity test is actually attempting (non-secret — password itself is never printed anywhere)"
+  debug:
+    msg: "CONNECT sys/<sys_password> @ apexdb_stby ({{ dg_net_config_standby_host }}:1521, standby — {{ 'SCAN, apexdb_stby is CRS-registered' if dg_net_config_standby_is_rac else 'node1 hostname, not SCAN yet' }}, per known-risks.md #115/#134) AS SYSDBA — before Phase 4 this is expected to fail with ORA-12514 (listener reachable, but no service named apexdb_stby registered yet). A wrong password would instead show ORA-01017, same as the primary test above when sys_password isn't the real value."
+  run_once: true
+
+- name: "Test network connectivity to the standby via the apexdb_stby TNS alias (EXPECTED TO FAIL — no standby database yet)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s /nolog @{{ staging_dir }}/sql/dg_net_test_standby.sql
+  register: dg_net_test_standby
+  run_once: true
+  changed_when: false
+  failed_when: false
+
+- name: Show apexdb_stby connectivity test output (a listener/TNS-resolution error here is fine; anything else is worth a second look)
+  debug:
+    var: dg_net_test_standby.stdout_lines
+  run_once: true
+
+- name: "Remove the standby connectivity-test script (contained a live password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_net_test_standby.sql"
+    state: absent
+  run_once: true
+
+- name: "Summarize standby connectivity result (apexdb_stby, from oradbserv05 only — the standby database doesn't exist yet, so testing every node adds nothing new here)"
+  debug:
+    msg: "apexdb_stby (standby): {{ 'CONNECTED (unexpected — standby should not exist yet)' if dg_net_test_standby.rc == 0 else 'FAILED as expected (rc=' ~ dg_net_test_standby.rc ~ ') — standby database does not exist until Phase 4' }}"
+  run_once: true

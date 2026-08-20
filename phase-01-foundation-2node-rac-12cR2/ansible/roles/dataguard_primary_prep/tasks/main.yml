@@ -1,0 +1,581 @@
+---
+# Phase 2 Data Guard build — Phase 1 of the uploaded SOP
+# (standby_dataguard_creation.txt sections 5.1-5.7): prepare the PRIMARY
+# database (apexdb on usatclust1) before any standby-side work begins. Runs
+# from rac_node1 only (oradbserv05) — every task here talks to the whole RAC
+# database via SQL*Plus/SPFILE, not per-node filesystem work, same reasoning
+# dbca_noncdb already uses for its own single-node scope.
+#
+# DB_UNIQUE_NAME stays "apexdb" (see group_vars/all.yml's dg_* comment block
+# and docs/known-risks.md #76) — the SOP's proposed apexdb_pri rename is
+# deliberately NOT implemented; James confirmed keeping the existing name
+# rather than take on a full srvctl remove/re-add cycle for a naming
+# preference alone.
+#
+# Every SQL block below is written out as its own .sql file under
+# {{ staging_dir }}/sql/ and run via `sqlplus / as sysdba @file.sql`, NOT fed
+# through a heredoc on stdin. This isn't cosmetic — SET ECHO ON only echoes
+# the commands SQL*Plus is executing when they're read from a script via
+# @/@@/START; it has no effect on input redirected/piped straight to stdin
+# (confirmed against Oracle's own SQL*Plus documentation and community
+# references — see docs/known-risks.md #82). The heredoc form James flagged
+# was printing the SQL> prompts and PL/SQL continuation-line numbers (2, 3,
+# 4...) but never the actual statement text, which is why "Verify Current
+# Configuration" and the standby-redo-log PL/SQL block showed blank command
+# lines. Running via @file.sql fixes that: every statement now appears
+# exactly as written, immediately before its result, matching a real
+# interactive transcript. Every task that runs SQL is still followed by its
+# own `debug` task showing the full captured output.
+- name: "Ensure the SQL script staging directory exists (needed so SET ECHO ON actually echoes commands — see known-risks.md #82)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/sql"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0750"
+
+- name: "Write SQL script: verify current primary configuration"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_verify_primary.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 tab off pagesize 100
+      column name format a10
+      column db_unique_name format a15
+      column database_role format a16
+      column open_mode format a15
+      column force_logging format a13
+      column flashback_on format a12
+      column log_mode format a10
+      select name, db_unique_name, database_role, open_mode, force_logging, flashback_on, log_mode from v$database;
+      column thread# format 999
+      column group# format 999
+      column size_mb format 9999
+      column members format 999
+      column status format a16
+      select thread#, group#, bytes/1024/1024 size_mb, members, status from v$log order by 1,2;
+      select group#, thread#, bytes/1024/1024 size_mb, status from v$standby_log order by 1;
+      exit;
+
+- name: "Verify current primary configuration (informational — read-only)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_verify_primary.sql
+  register: dg_verify_primary
+  changed_when: false
+
+- name: Show current primary configuration
+  debug:
+    var: dg_verify_primary.stdout_lines
+
+# --- Safety net: back up the current spfile before any of the changes below ----
+- name: "Ensure the spfile backup directory exists"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/backups"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0750"
+
+- name: "Write SQL script: back up current spfile"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_spfile_backup.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      create pfile='{{ staging_dir }}/backups/spfile_{{ db_unique_name }}_{{ ansible_date_time.epoch }}.ora' from spfile;
+      exit;
+
+- name: "Back up current spfile to a timestamped pfile (safety net — SOP section 5.3 note, run BEFORE any of the alter system/alter database changes below)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_spfile_backup.sql
+  register: dg_spfile_backup
+  changed_when: "'File created' in dg_spfile_backup.stdout"
+  failed_when: "dg_spfile_backup.rc != 0 or 'ORA-' in dg_spfile_backup.stdout"
+
+- name: Show spfile backup output
+  debug:
+    var: dg_spfile_backup.stdout_lines
+
+# --- FORCE LOGGING (SOP 5.2) — idempotent -------------------------------------
+- name: "Write SQL script: check FORCE LOGGING state"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_force_logging_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off
+      select force_logging from v$database;
+      exit;
+
+- name: "Check current FORCE LOGGING state"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_force_logging_check.sql
+  register: dg_force_logging_check
+  changed_when: false
+
+- name: Show current FORCE LOGGING state
+  debug:
+    var: dg_force_logging_check.stdout_lines
+
+- name: "Write SQL script: enable FORCE LOGGING"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_force_logging_enable.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter database force logging;
+      exit;
+  when: "'YES' not in dg_force_logging_check.stdout"
+
+- name: "Enable FORCE LOGGING (only if not already on)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_force_logging_enable.sql
+  register: dg_force_logging_result
+  when: "'YES' not in dg_force_logging_check.stdout"
+  changed_when: true
+  failed_when: "dg_force_logging_result.rc != 0 or 'ORA-' in dg_force_logging_result.stdout"
+
+- name: Show FORCE LOGGING change output
+  debug:
+    var: dg_force_logging_result.stdout_lines
+  when: "'YES' not in dg_force_logging_check.stdout"
+
+# --- Flashback Database (SOP 5.3) — idempotent, recommended for FSFO reinstate -
+- name: "Write SQL script: check Flashback Database state"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_flashback_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off
+      select flashback_on from v$database;
+      exit;
+
+- name: "Check current Flashback Database state"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_flashback_check.sql
+  register: dg_flashback_check
+  changed_when: false
+
+- name: Show current Flashback Database state
+  debug:
+    var: dg_flashback_check.stdout_lines
+
+- name: "Write SQL script: enable Flashback Database"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_flashback_enable.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter system set db_flashback_retention_target={{ dg_flashback_retention_minutes }} scope=both sid='*';
+      alter database flashback on;
+      exit;
+  when: "'YES' not in dg_flashback_check.stdout"
+
+- name: "Set flashback retention target and enable Flashback Database (only if not already on)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_flashback_enable.sql
+  register: dg_flashback_result
+  when: "'YES' not in dg_flashback_check.stdout"
+  changed_when: true
+  failed_when: "dg_flashback_result.rc != 0 or 'ORA-' in dg_flashback_result.stdout"
+
+- name: Show Flashback Database change output
+  debug:
+    var: dg_flashback_result.stdout_lines
+  when: "'YES' not in dg_flashback_check.stdout"
+
+# Retention target is checked/set independently of the enable-if-off block
+# above — that block only ever runs the FIRST time flashback gets turned on,
+# so a later change to dg_flashback_retention_minutes (James raised this from
+# 1440/24h to 4320/3 days after Phase 4, by hand — known-risks.md #115) would
+# otherwise never reach an already-flashback-enabled primary on a re-run.
+# Real check-then-act idempotency, same idiom as force_logging/flashback_on
+# above, not just re-running ALTER SYSTEM unconditionally every time.
+- name: "Write SQL script: check current flashback retention target"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_flashback_retention_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off
+      select value from v$parameter where name = 'db_flashback_retention_target';
+      exit;
+
+- name: "Check current flashback retention target"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_flashback_retention_check.sql
+  register: dg_flashback_retention_check
+  changed_when: false
+
+- name: Show current flashback retention target
+  debug:
+    var: dg_flashback_retention_check.stdout_lines
+
+# Audit fix (known-risks.md #117): the query runs with `set echo on`, so
+# .stdout is the WHOLE transcript ("SQL> select value from v$parameter...",
+# then the value, then "SQL> exit;") — not just the number. Feeding that
+# whole multi-line blob through `| int` doesn't raise an error, it silently
+# returns 0 (Jinja2's `int` filter falls back to its default on anything it
+# can't parse as a plain integer), which would have made this check always
+# report a "mismatch" and always run the update — defeating the whole point
+# of checking first. Pull out just the line that's purely digits instead,
+# same `select('match', ...)` idiom dataguard_convert_rac's spfile-path
+# discovery already uses for the same "extract one value from an echoed
+# SQL*Plus transcript" problem.
+# Second fix to this same line (known-risks.md #122): '^[0-9]+$' requires
+# the WHOLE line to be nothing but digits, but VALUE is VARCHAR2(4000) with
+# no explicit `column ... format`, so SQL*Plus pads it to its default
+# column width — the real line has trailing spaces after "4320", not just
+# "4320" alone. The old regex never matched that either, so this fact was
+# ALSO silently falling back to the '-1' default the whole time — the
+# original #117 fix looked right and matched the established idiom, but was
+# never actually verified against a real SQL*Plus transcript until a
+# different role's identical pattern was, for real, by James
+# (dataguard_srl_cleanup's remaining-count parsing, same session). `\s*` on
+# both sides tolerates leading OR trailing padding either way.
+- name: "Set fact: current flashback retention target, parsed from the transcript above"
+  set_fact:
+    dg_flashback_retention_current: "{{ (dg_flashback_retention_check.stdout_lines | select('match', '^\\s*[0-9]+\\s*$') | list | first | default('-1')) | int }}"
+
+- name: "Write SQL script: update flashback retention target"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_flashback_retention_set.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter system set db_flashback_retention_target={{ dg_flashback_retention_minutes }} scope=both sid='*';
+      exit;
+  when: dg_flashback_retention_current != (dg_flashback_retention_minutes | int)
+
+- name: "Update flashback retention target to {{ dg_flashback_retention_minutes }} minutes (only if it doesn't already match)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_flashback_retention_set.sql
+  register: dg_flashback_retention_set
+  when: dg_flashback_retention_current != (dg_flashback_retention_minutes | int)
+  changed_when: "'System altered' in dg_flashback_retention_set.stdout"
+  failed_when: "dg_flashback_retention_set.rc != 0 or 'ORA-' in dg_flashback_retention_set.stdout"
+
+- name: Show flashback retention target update output
+  debug:
+    var: dg_flashback_retention_set.stdout_lines
+  when: dg_flashback_retention_current != (dg_flashback_retention_minutes | int)
+
+# --- Standby Redo Logs (SOP 5.5) — MAA formula, idempotent per-group ----------
+# (max ORL groups/thread + 1) x threads = dg_srl_groups_per_thread x 2 total,
+# single-member, on {{ dg_srl_diskgroup }} only (see group_vars/all.yml). The
+# PL/SQL block below checks each group# individually before adding it, so a
+# partial prior run (or a re-run after this role already succeeded) is safe —
+# it only ever adds whichever specific groups are still missing.
+- name: "Write SQL script: set STANDBY_FILE_MANAGEMENT=MANUAL"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_srl_manual.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter system set standby_file_management=manual scope=both sid='*';
+      exit;
+
+- name: "Set STANDBY_FILE_MANAGEMENT=MANUAL before adding standby redo logs (per SOP 5.5)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_srl_manual.sql
+  register: dg_srl_manual_result
+  changed_when: true
+
+- name: Show STANDBY_FILE_MANAGEMENT=MANUAL output
+  debug:
+    var: dg_srl_manual_result.stdout_lines
+
+- name: "Write SQL script: add missing standby redo log groups"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_srl_add.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on serveroutput on
+      DECLARE
+        v_cnt NUMBER;
+      BEGIN
+        FOR i IN {{ dg_srl_group_start }}..{{ dg_srl_group_end }} LOOP
+          SELECT COUNT(*) INTO v_cnt FROM v$standby_log WHERE group# = i;
+          IF v_cnt = 0 THEN
+            EXECUTE IMMEDIATE 'ALTER DATABASE ADD STANDBY LOGFILE THREAD ' ||
+              CASE WHEN i < {{ dg_srl_thread2_start }} THEN '1' ELSE '2' END ||
+              ' GROUP ' || i || ' (''+{{ dg_srl_diskgroup }}'') SIZE {{ dg_srl_size_mb }}M';
+            DBMS_OUTPUT.PUT_LINE('Added standby logfile group ' || i);
+          ELSE
+            DBMS_OUTPUT.PUT_LINE('Standby logfile group ' || i || ' already exists — skipped');
+          END IF;
+        END LOOP;
+      END;
+      /
+      exit;
+
+- name: "Add any missing standby redo log groups ({{ dg_srl_group_start }}-{{ dg_srl_group_end }}, {{ dg_srl_size_mb }}MB, single-member, +{{ dg_srl_diskgroup }})"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_srl_add.sql
+  register: dg_srl_result
+  changed_when: "'Added standby logfile group' in dg_srl_result.stdout"
+  failed_when: "dg_srl_result.rc != 0 or 'ORA-' in dg_srl_result.stdout"
+
+- name: Show standby redo log creation output
+  debug:
+    var: dg_srl_result.stdout_lines
+
+- name: "Write SQL script: set STANDBY_FILE_MANAGEMENT=AUTO"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_srl_auto.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter system set standby_file_management=auto scope=both sid='*';
+      exit;
+
+- name: "Set STANDBY_FILE_MANAGEMENT back to AUTO (per SOP 5.5)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_srl_auto.sql
+  register: dg_srl_auto_result
+  changed_when: true
+
+- name: Show STANDBY_FILE_MANAGEMENT=AUTO output
+  debug:
+    var: dg_srl_auto_result.stdout_lines
+
+- name: "Write SQL script: confirm standby redo log layout"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_srl_verify.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 tab off pagesize 100
+      column group# format 999
+      column thread# format 999
+      column size_mb format 9999
+      column status format a12
+      column member format a60
+      select sl.group#, sl.thread#, sl.bytes/1024/1024 size_mb, sl.status, lf.member
+      from v$standby_log sl, v$logfile lf where sl.group#=lf.group# order by sl.thread#, sl.group#;
+      exit;
+
+- name: "Confirm standby redo log layout"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_srl_verify.sql
+  register: dg_srl_verify
+  changed_when: false
+
+- name: Show standby redo log layout
+  debug:
+    var: dg_srl_verify.stdout_lines
+
+# --- Role-aware initialization parameters (SOP 5.6) ---------------------------
+# Confirm the ASM directories dg_broker_config_file1/2 point into already exist
+# (they should — DBCA already created +{{ asm_diskgroup_data }}/{{ db_unique_name
+# | upper }}/... when apexdb was first created, since db_unique_name was never
+# renamed) rather than assume; asmcmd mkdir is a harmless no-op if the path is
+# already there.
+- name: "Check whether the ASM broker-config directory already exists under each diskgroup"
+  become: true
+  become_user: "{{ grid_user }}"
+  command: "{{ grid_home }}/bin/asmcmd ls +{{ item }}/{{ db_unique_name }}"
+  loop:
+    - "{{ asm_diskgroup_data }}"
+    - "{{ dg_srl_diskgroup }}"
+  loop_control:
+    label: "+{{ item }}/{{ db_unique_name }}"
+  register: dg_asm_dir_check
+  changed_when: false
+  failed_when: false
+
+- name: Show ASM broker-config directory check output
+  debug:
+    var: dg_asm_dir_check.results
+
+- name: "Create the ASM broker-config directory under each diskgroup (only where the check above didn't find it)"
+  become: true
+  become_user: "{{ grid_user }}"
+  command: "{{ grid_home }}/bin/asmcmd mkdir +{{ item.item }}/{{ db_unique_name }}"
+  loop: "{{ dg_asm_dir_check.results }}"
+  loop_control:
+    label: "+{{ item.item }}/{{ db_unique_name }}"
+  when: item.rc != 0
+
+# --- Broker config file locations MUST be set BEFORE dg_broker_start=true -----
+# Confirmed the hard way (see docs/known-risks.md #81): DMON (the broker
+# background process) starts as soon as dg_broker_start=true takes effect
+# (scope=both applies immediately, not just on next restart) and immediately
+# owns/locks whatever dg_broker_config_file1/2 already point at — even their
+# Oracle-supplied DEFAULT local-disk paths. Any later attempt to change those
+# file locations while DMON already considers a configuration "enabled" fails
+# with ORA-02097/ORA-16573. This block sets the file locations FIRST, and
+# explicitly forces dg_broker_start=false immediately before doing so —
+# self-healing even though a previous partial run of this same role already
+# left dg_broker_start=true live on this instance with the wrong (default)
+# file paths. Safe/idempotent either way: disabling an already-disabled
+# broker, or enabling an already-enabled one, are both no-ops.
+- name: "Write SQL script: set primary's role-aware Data Guard initialization parameters"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_params.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter system set log_archive_config='dg_config=({{ db_unique_name }},{{ dg_standby_db_unique_name }})' scope=both sid='*';
+      alter system set log_archive_dest_1='location=use_db_recovery_file_dest valid_for=(all_logfiles,all_roles) db_unique_name={{ db_unique_name }}' scope=both sid='*';
+      alter system set log_archive_dest_2='service={{ dg_standby_db_unique_name }} async valid_for=(online_logfiles,primary_role) db_unique_name={{ dg_standby_db_unique_name }}' scope=both sid='*';
+      alter system set log_archive_dest_state_1=enable scope=both sid='*';
+      alter system set log_archive_dest_state_2=enable scope=both sid='*';
+      alter system set fal_server='{{ dg_standby_db_unique_name }}' scope=both sid='*';
+      alter system set standby_file_management=auto scope=both sid='*';
+      alter system set dg_broker_start=false scope=both sid='*';
+      alter system set dg_broker_config_file1='+{{ asm_diskgroup_data }}/{{ db_unique_name }}/dr1{{ db_unique_name }}.dat' scope=both sid='*';
+      alter system set dg_broker_config_file2='+{{ dg_srl_diskgroup }}/{{ db_unique_name }}/dr2{{ db_unique_name }}.dat' scope=both sid='*';
+      alter system set dg_broker_start=true scope=both sid='*';
+      exit;
+
+- name: "Set primary's role-aware Data Guard initialization parameters"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_params.sql
+  register: dg_params_result
+  changed_when: true
+  failed_when: "dg_params_result.rc != 0 or 'ORA-' in dg_params_result.stdout"
+
+- name: Show Data Guard parameter changes
+  debug:
+    var: dg_params_result.stdout_lines
+
+# --- Password file (SOP 5.7) — check only, never auto-create ------------------
+# DBCA already creates a password file at database-creation time by default
+# (REMOTE_LOGIN_PASSWORDFILE=EXCLUSIVE) — apexdb was created via this project's
+# own dbca_noncdb role, so one should already exist. `orapwd ... force=y` is
+# destructive to the CURRENT working password file if run against a database
+# that already has one wired into live SYS/SYSBACKUP authentication — this task
+# only checks and reports; it never runs orapwd. If the check below comes back
+# empty, stop and investigate manually before creating one by hand.
+- name: "Check whether a password file is already registered for the primary"
+  become: true
+  become_user: "{{ oracle_user }}"
+  command: "{{ db_home }}/bin/srvctl config database -d {{ db_unique_name }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  register: dg_pwfile_check
+  changed_when: false
+  failed_when: false
+
+- name: Show full srvctl config database output
+  debug:
+    var: dg_pwfile_check.stdout_lines
+
+- name: Show password file registration status
+  debug:
+    msg: >
+      {{ 'Password file already registered: ' ~ (dg_pwfile_check.stdout_lines |
+      select('search', 'Password file') | list | first | default('(line not
+      found in srvctl output — check manually)')) if (dg_pwfile_check.stdout_lines
+      | select('search', 'Password file') | list | length > 0) else
+      'No "Password file:" line found in srvctl config output — a password file
+      may not be registered. Do NOT run orapwd automatically here (risk of
+      overwriting a working file); investigate manually (SOP section 5.7)
+      before continuing to Phase 2.' }}

@@ -1,0 +1,813 @@
+---
+# Data Guard Phase 9 — Fast-Start Failover and Observer (README.md Section 15,
+# known-risks.md #137's own "what's left" gap). Turns a Broker config that
+# requires a human to notice an outage and manually SWITCHOVER/FAILOVER (every
+# phase up to here) into one where a third-party Observer detects a real
+# primary outage and promotes apexdb_stby automatically — no DBA
+# intervention. This is the last piece of MAA's automatic-failover story;
+# everything before it (Broker, role-based services, the switchover test) was
+# building toward this.
+#
+# hosts: localhost + delegate_to per host, same pattern as
+# dataguard_broker/dataguard_role_services/dataguard_switchover_test — this
+# role genuinely coordinates THREE hosts (rac_node1, standby_node1,
+# oemserver01), not just two.
+#
+# --- oemserver01: a genuinely different host from everything else here ------
+# Every other Data Guard role in this project targets rac_nodes/standby_nodes
+# — cloned, identical-architecture 12.2.0.1 RAC nodes this project built from
+# scratch. oemserver01 is the pre-existing OEM 13.5 VM (README.md's own
+# baseline), never previously under this project's Ansible management (see
+# inventory/hosts.ini's [observer_nodes]/[time_master] comments) and running
+# its own unrelated 19.3.0 Oracle Client install (19.19 DGMGRL, confirmed
+# live). group_vars/all.yml defines dedicated variable names for it
+# (observer_oracle_home, fsfo_dir, fsfo_wallet_dir, dg_observer_name) rather
+# than reusing db_home/staging_dir — reusing those would be actively wrong
+# here (wrong version, wrong path). These live in all.yml, NOT a per-group
+# observer_nodes.yml file, despite being oemserver01-specific values — this
+# role is hosts: localhost + delegate_to, and group_vars/<group>.yml only
+# auto-loads for hosts actually IN that group; localhost isn't a member of
+# observer_nodes, so a first real run hit "'fsfo_dir' is undefined" on the
+# very first delegated task. See group_vars/observer_nodes.yml (now
+# deliberately empty) for the full explanation.
+#
+# Cross-version note: Oracle's own 19c Data Guard Broker Installation docs
+# state "an observer can be run from any platform that supports it, and that
+# platform can be different from the platform of the primary or target
+# standby database" — nothing found flags a hard version ceiling for a newer
+# DGMGRL client observing an older Broker config (client-newer-than-server is
+# the standard supported direction, same as SQL*Plus/RMAN). Not certified in
+# one single doc line; the first real SHOW CONFIGURATION against the 12.2.0.1
+# broker from this 19.19 client is the actual proof, watched for below.
+#
+# --- A real gap found while scoping this, not guessed -----------------------
+# dataguard_primary_prep enables Flashback Database on apexdb (SOP 5.3,
+# known-risks.md #77/#117) but dataguard_standby_prep never did the
+# equivalent on apexdb_stby — confirmed by reading the role, not assumed.
+# Flashback isn't required to ENABLE fast-start failover, but without it on
+# BOTH databases, a failed-over old primary can't be automatically
+# reinstated as the new standby — you'd have to manually flashback or
+# re-duplicate it instead. Fixed below (9.1) using the Broker-driven
+# apply-off / flashback on / apply-on sequence (not a raw OPEN/MOUNT dance —
+# that would trip the exact "opening a standby kills whatever managed-
+# recovery was running" problem known-risks.md #136 already documented).
+#
+# --- Wallet-based Observer auth, not an embedded password --------------------
+# Every other DGMGRL script in this project embeds `sys/{{ sys_password }}`
+# in a short-lived, deleted-after-use file — correct for a one-shot script,
+# wrong for a process meant to run indefinitely in the background and
+# reconnect on its own after losing contact. The Observer instead uses an
+# Oracle Wallet on oemserver01 (mkstore, real interactive prompts scripted
+# via stdin — no password ever appears in a command line or argv, matching
+# this project's existing sqlplus/RMAN/DGMGRL password-hygiene convention)
+# so `CONNECT /@apexdb_DGMGRL` and `START OBSERVER ... IN BACKGROUND` never
+# need a human, or a plaintext password, again after initial setup.
+# dg_observer_wallet_password (group_vars/all.yml, same placeholder-and-
+# assert convention as sys_password) protects the wallet itself.
+#
+# --- Deliberate deviation: scripts are NOT deleted, no_log is NOT set ------
+# James's own explicit call (extending the same exception already made for
+# dataguard_switchover_test's switchover script): every .dgc/.sql script
+# this role writes stays on disk after use instead of being deleted, and no
+# task hides its output behind no_log — so the exact commands run, and their
+# real output, are both directly visible in the ansible-playbook run itself
+# AND inspectable afterward by reading the files. The five scripts that DO
+# embed sys/{{ sys_password }} (apply-off, apply-on, show-status, enable,
+# verify) each get an explicit WARNING debug task right after use instead of
+# silent deletion — mode stays 0600, oracle:oinstall only, but the live
+# password persists in plaintext in those files until removed by hand.
+# mkstore's wallet-create/listCredential/createCredential tasks never had
+# no_log doing anything useful anyway (the password only ever went in via
+# stdin, never into the visible command/argv), so those are unchanged in
+# behavior, just no longer hidden from the run's own output either.
+#
+# --- FastStartFailoverThreshold ----------------------------------------------
+# dg_fsfo_threshold_seconds (group_vars/all.yml, default 30 — Oracle's own
+# documented default) — how long BOTH the Observer and the standby must
+# independently lose contact with the primary before auto-failover triggers.
+# Tunable without touching this role.
+#
+# --- Second observer deliberately out of scope -------------------------------
+# James's own original call: a second observer on oradbserv04 (future
+# APEX/ORDS app server) is planned for later, once that node exists. 12.2
+# supports up to 3 simultaneous observers (one master, others backup,
+# confirmed via search) — adding it later is additive to this role's output,
+# not a redesign. dg_observer_name is set explicitly now (not left
+# anonymous) so `SHOW OBSERVERS` can tell them apart from day one.
+#
+# --- The induced-failover test is a SEPARATE, standalone role ---------------
+# Same separation-of-concerns reasoning as dataguard_switchover_test: a real
+# induced primary outage is genuinely destructive and has no business being
+# reachable from this role's normal idempotent re-run path. Planned as
+# roles/dataguard_fsfo_test, --tags dataguard_fsfo_test — not built yet.
+#
+# --- Update — first real run: START OBSERVER syntax error -------------------
+# `start observer <name> in background file is '<path>' logfile is '<path>';`
+# — no CONNECT IDENTIFIER clause — failed with "Syntax error before or at
+# ';'". DGMGRL returned rc 0 anyway (no whenever-sqlerror equivalent, same
+# gap dataguard_broker's header already documents), so the task showed
+# "changed" while nothing actually started; SHOW FAST_START FAILOVER's own
+# "Observer: (none)" caught it. First fix attempt also dropped the quotes
+# around the file paths, guessing that was part of the problem — it wasn't:
+# James ran the command interactively by hand and confirmed the quoted form
+# works fine. The ONLY thing actually missing was an explicit
+# `CONNECT IDENTIFIER IS apexdb_DGMGRL` clause — not optional for a
+# backgrounded observer (it's how the detached process knows what to
+# reconnect to later, separate from the CONNECT that just opens the
+# authoring session). Quotes restored to match the confirmed-working real
+# transcript exactly. Also added a real success check (searches for
+# `Submitted command "START OBSERVER"` in stdout) instead of trusting rc, so
+# this class of false positive can't slip through silently again.
+
+- name: "Preflight: fail loudly if sys_password or dg_observer_wallet_password were never overridden"
+  run_once: true
+  assert:
+    that:
+      - sys_password != "CHANGE_ME_sys_password"
+      - dg_observer_wallet_password != "CHANGE_ME_observer_wallet_password"
+    fail_msg: >
+      sys_password and/or dg_observer_wallet_password are still the
+      group_vars/all.yml placeholders — pass real values explicitly:
+      -e sys_password='...' -e dg_observer_wallet_password='...'.
+
+# ============================================================================
+# 9.1 — Flashback Database on the standby (the gap found above). Broker-
+# driven apply-off / flashback on / apply-on — apexdb_stby stays in its
+# current open_mode throughout, only managed recovery pauses briefly.
+# ============================================================================
+- name: "Write SQL script: check Flashback Database state on apexdb_stby"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_fsfo_flashback_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off
+      select flashback_on from v$database;
+      exit;
+  run_once: true
+
+- name: "Check current Flashback Database state on apexdb_stby"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_fsfo_flashback_check.sql
+  register: dg_fsfo_flashback_check
+  changed_when: false
+  run_once: true
+
+- name: Show current Flashback Database state on apexdb_stby
+  debug:
+    msg:
+      - "Command (on {{ groups['standby_nodes'][0] }}): {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_fsfo_flashback_check.sql"
+      - "rc: {{ dg_fsfo_flashback_check.rc }}"
+      - "Output: {{ dg_fsfo_flashback_check.stdout_lines }}"
+  run_once: true
+
+- name: "Write DGMGRL script: pause redo apply on apexdb_stby (required before ALTER DATABASE FLASHBACK ON on an open standby)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_fsfo_apply_off.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      edit database {{ dg_standby_db_unique_name }} set state='apply-off';
+      show database {{ dg_standby_db_unique_name }};
+  when: "'YES' not in dg_fsfo_flashback_check.stdout"
+  run_once: true
+
+- name: "Run: pause redo apply on apexdb_stby"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_fsfo_apply_off.dgc
+  register: dg_fsfo_apply_off_result
+  when: "'YES' not in dg_fsfo_flashback_check.stdout"
+  run_once: true
+
+- name: Show apply-off command and output (password redacted)
+  debug:
+    msg:
+      - "Command (on {{ groups['rac_node1'][0] }}): {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_fsfo_apply_off.dgc"
+      - "Script content: connect sys/***@apexdb_DGMGRL as sysdba / edit database {{ dg_standby_db_unique_name }} set state='apply-off'; / show database {{ dg_standby_db_unique_name }};"
+      - "rc: {{ dg_fsfo_apply_off_result.rc }}"
+      - "Output: {{ (dg_fsfo_apply_off_result.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  when: "'YES' not in dg_fsfo_flashback_check.stdout"
+  run_once: true
+
+- name: "WARNING: dg_fsfo_apply_off.dgc was NOT removed (kept on disk by request) — it contains a live sys password in plaintext"
+  debug:
+    msg: >-
+      {{ staging_dir }}/sql/dg_fsfo_apply_off.dgc was intentionally left on
+      {{ groups['rac_node1'][0] }} (mode 0600, {{ oracle_user }}:oinstall
+      only). Remove it by hand once you no longer need it for reference —
+      it contains the real sys password used to connect.
+  when: "'YES' not in dg_fsfo_flashback_check.stdout"
+  run_once: true
+
+- name: "Write SQL script: enable Flashback Database on apexdb_stby"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_fsfo_flashback_enable.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter system set db_flashback_retention_target={{ dg_flashback_retention_minutes }} scope=both sid='*';
+      alter database flashback on;
+      exit;
+  when: "'YES' not in dg_fsfo_flashback_check.stdout"
+  run_once: true
+
+- name: "Enable Flashback Database on apexdb_stby (only if not already on)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_fsfo_flashback_enable.sql
+  register: dg_fsfo_flashback_result
+  when: "'YES' not in dg_fsfo_flashback_check.stdout"
+  failed_when: "dg_fsfo_flashback_result.rc != 0 or 'ORA-' in dg_fsfo_flashback_result.stdout"
+  run_once: true
+
+- name: Show Flashback Database change command and output on apexdb_stby
+  debug:
+    msg:
+      - "Command (on {{ groups['standby_nodes'][0] }}): {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_fsfo_flashback_enable.sql"
+      - "rc: {{ dg_fsfo_flashback_result.rc }}"
+      - "Output: {{ dg_fsfo_flashback_result.stdout_lines }}"
+  when: "'YES' not in dg_fsfo_flashback_check.stdout"
+  run_once: true
+
+- name: "Write DGMGRL script: resume redo apply on apexdb_stby"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_fsfo_apply_on.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      edit database {{ dg_standby_db_unique_name }} set state='apply-on';
+      show database {{ dg_standby_db_unique_name }};
+  when: "'YES' not in dg_fsfo_flashback_check.stdout"
+  run_once: true
+
+- name: "Run: resume redo apply on apexdb_stby"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_fsfo_apply_on.dgc
+  register: dg_fsfo_apply_on_result
+  when: "'YES' not in dg_fsfo_flashback_check.stdout"
+  run_once: true
+
+- name: Show apply-on command and output (password redacted)
+  debug:
+    msg:
+      - "Command (on {{ groups['rac_node1'][0] }}): {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_fsfo_apply_on.dgc"
+      - "Script content: connect sys/***@apexdb_DGMGRL as sysdba / edit database {{ dg_standby_db_unique_name }} set state='apply-on'; / show database {{ dg_standby_db_unique_name }};"
+      - "rc: {{ dg_fsfo_apply_on_result.rc }}"
+      - "Output: {{ (dg_fsfo_apply_on_result.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  when: "'YES' not in dg_fsfo_flashback_check.stdout"
+  run_once: true
+
+- name: "WARNING: dg_fsfo_apply_on.dgc was NOT removed (kept on disk by request) — it contains a live sys password in plaintext"
+  debug:
+    msg: >-
+      {{ staging_dir }}/sql/dg_fsfo_apply_on.dgc was intentionally left on
+      {{ groups['rac_node1'][0] }} (mode 0600, {{ oracle_user }}:oinstall
+      only). Remove it by hand once you no longer need it for reference —
+      it contains the real sys password used to connect.
+  when: "'YES' not in dg_fsfo_flashback_check.stdout"
+  run_once: true
+
+- name: "Report: apexdb_stby Flashback Database already on, nothing to do"
+  debug:
+    msg: "apexdb_stby already reports FLASHBACK_ON = YES — skipped the apply-off/enable/apply-on sequence."
+  when: "'YES' in dg_fsfo_flashback_check.stdout"
+  run_once: true
+
+# ============================================================================
+# 9.2 — oemserver01: directories, tnsnames.ora, sqlnet.ora
+# ============================================================================
+- name: "Ensure the Observer's state/log directory and wallet directory exist on oemserver01 (already created manually per James — file module is itself idempotent: skip if present, create if missing)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0750"
+  loop:
+    - "{{ fsfo_dir }}"
+    - "{{ fsfo_wallet_dir }}"
+  run_once: true
+
+- name: "Append apexdb_DGMGRL/apexdb_stby_DGMGRL TNS aliases to oemserver01's tnsnames.ora (James confirmed an existing entry there — blockinfile appends alongside it, never overwrites)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  blockinfile:
+    path: "{{ observer_oracle_home }}/network/admin/tnsnames.ora"
+    marker: "# {mark} ANSIBLE MANAGED BLOCK — Data Guard Observer TNS aliases (dataguard_fsfo)"
+    create: true
+    backup: true
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    block: |
+      apexdb_DGMGRL =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ dg_primary_scan_fqdn }})(PORT = {{ scan_port }}))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = apexdb)
+            (UR = A)
+          )
+        )
+
+      apexdb_stby_DGMGRL =
+        (DESCRIPTION =
+          (ADDRESS = (PROTOCOL = TCP)(HOST = {{ dg_standby_scan_fqdn }})(PORT = {{ scan_port }}))
+          (CONNECT_DATA =
+            (SERVER = DEDICATED)
+            (SERVICE_NAME = apexdb_stby)
+            (UR = A)
+          )
+        )
+  register: dg_fsfo_tnsnames_result
+  run_once: true
+
+- name: Show tnsnames.ora backup location (only set when an existing file actually got modified)
+  debug:
+    msg: "{{ dg_fsfo_tnsnames_result.backup_file | default('no backup taken — block unchanged or file did not exist yet') }}"
+  run_once: true
+
+- name: "Append wallet location + SQLNET.WALLET_OVERRIDE to oemserver01's sqlnet.ora (worth eyeballing once, live — this is a pre-existing box outside this project's build; confirm it doesn't collide with an existing EM agent wallet setting in the same file)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  blockinfile:
+    path: "{{ observer_oracle_home }}/network/admin/sqlnet.ora"
+    marker: "# {mark} ANSIBLE MANAGED BLOCK — Data Guard Observer wallet (dataguard_fsfo)"
+    create: true
+    backup: true
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    block: |
+      WALLET_LOCATION =
+        (SOURCE =
+          (METHOD = FILE)
+          (METHOD_DATA = (DIRECTORY = {{ fsfo_wallet_dir }}))
+        )
+
+      SQLNET.WALLET_OVERRIDE = TRUE
+  register: dg_fsfo_sqlnet_result
+  run_once: true
+
+- name: Show sqlnet.ora backup location (only set when an existing file actually got modified)
+  debug:
+    msg: "{{ dg_fsfo_sqlnet_result.backup_file | default('no backup taken — block unchanged or file did not exist yet') }}"
+  run_once: true
+
+# ============================================================================
+# 9.3 — Oracle Wallet: create (idempotent), add credentials (idempotent).
+# Every mkstore prompt is answered via stdin, never a command-line argument
+# — no secret ever appears in argv, `ps`, or shell history, same convention
+# as every other password-bearing task in this project.
+# ============================================================================
+- name: "Check whether the wallet already exists (cwallet.sso — mkstore -create produces both cwallet.sso and ewallet.p12 together)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  stat:
+    path: "{{ fsfo_wallet_dir }}/cwallet.sso"
+  register: dg_fsfo_wallet_stat
+  run_once: true
+
+- name: Show wallet-existence check
+  debug:
+    msg: "Checked (on {{ groups['observer_nodes'][0] }}): {{ fsfo_wallet_dir }}/cwallet.sso — exists: {{ dg_fsfo_wallet_stat.stat.exists }}"
+  run_once: true
+
+- name: "Create the wallet (mkstore -create — answers 'Enter password:' / 'Enter password again:' via stdin)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  command: "{{ observer_oracle_home }}/bin/mkstore -wrl {{ fsfo_wallet_dir }} -create"
+  args:
+    stdin: "{{ dg_observer_wallet_password }}\n{{ dg_observer_wallet_password }}\n"
+  register: dg_fsfo_wallet_create_result
+  when: not dg_fsfo_wallet_stat.stat.exists
+  run_once: true
+
+- name: Show wallet-create command and output
+  debug:
+    msg:
+      - "Command (on {{ groups['observer_nodes'][0] }}): {{ observer_oracle_home }}/bin/mkstore -wrl {{ fsfo_wallet_dir }} -create"
+      - "Stdin piped: <wallet password>\\n<wallet password>\\n (not shown — this is dg_observer_wallet_password, not echoed by the terminal either way)"
+      - "rc: {{ dg_fsfo_wallet_create_result.rc }}"
+      - "stdout: {{ dg_fsfo_wallet_create_result.stdout_lines }}"
+      - "stderr: {{ dg_fsfo_wallet_create_result.stderr_lines }}"
+  when: not dg_fsfo_wallet_stat.stat.exists
+  run_once: true
+
+- name: "Report: wallet already exists on oemserver01, skipped mkstore -create"
+  debug:
+    msg: "{{ fsfo_wallet_dir }}/cwallet.sso already exists on {{ groups['observer_nodes'][0] }} — skipped mkstore -create."
+  when: dg_fsfo_wallet_stat.stat.exists
+  run_once: true
+
+- name: "List existing wallet credentials (answers 'Enter wallet password:' via stdin) — drives which createCredential calls below are actually needed"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  command: "{{ observer_oracle_home }}/bin/mkstore -wrl {{ fsfo_wallet_dir }} -listCredential"
+  args:
+    stdin: "{{ dg_observer_wallet_password }}\n"
+  register: dg_fsfo_wallet_list
+  changed_when: false
+  run_once: true
+
+- name: Show listCredential command and output
+  debug:
+    msg:
+      - "Command (on {{ groups['observer_nodes'][0] }}): {{ observer_oracle_home }}/bin/mkstore -wrl {{ fsfo_wallet_dir }} -listCredential"
+      - "rc: {{ dg_fsfo_wallet_list.rc }}"
+      - "stdout: {{ dg_fsfo_wallet_list.stdout_lines }}"
+      - "stderr: {{ dg_fsfo_wallet_list.stderr_lines }}"
+  run_once: true
+
+- name: "Create wallet credential for apexdb_DGMGRL (answers secret / re-enter secret / wallet password via stdin — only if not already present)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  command: "{{ observer_oracle_home }}/bin/mkstore -wrl {{ fsfo_wallet_dir }} -createCredential apexdb_DGMGRL SYS"
+  args:
+    stdin: "{{ sys_password }}\n{{ sys_password }}\n{{ dg_observer_wallet_password }}\n"
+  register: dg_fsfo_cred_apexdb_result
+  when: "'apexdb_DGMGRL' not in dg_fsfo_wallet_list.stdout"
+  run_once: true
+
+- name: Show createCredential (apexdb_DGMGRL) command and output
+  debug:
+    msg:
+      - "Command (on {{ groups['observer_nodes'][0] }}): {{ observer_oracle_home }}/bin/mkstore -wrl {{ fsfo_wallet_dir }} -createCredential apexdb_DGMGRL SYS"
+      - "Stdin piped: <sys_password>\\n<sys_password>\\n<wallet password>\\n (not shown)"
+      - "rc: {{ dg_fsfo_cred_apexdb_result.rc }}"
+      - "stdout: {{ dg_fsfo_cred_apexdb_result.stdout_lines }}"
+      - "stderr: {{ dg_fsfo_cred_apexdb_result.stderr_lines }}"
+  when: "'apexdb_DGMGRL' not in dg_fsfo_wallet_list.stdout"
+  run_once: true
+
+- name: "Report: apexdb_DGMGRL credential already present, skipped createCredential"
+  debug:
+    msg: "apexdb_DGMGRL already appears in mkstore -listCredential's output — skipped."
+  when: "'apexdb_DGMGRL' in dg_fsfo_wallet_list.stdout"
+  run_once: true
+
+- name: "Create wallet credential for apexdb_stby_DGMGRL (answers secret / re-enter secret / wallet password via stdin — only if not already present)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  command: "{{ observer_oracle_home }}/bin/mkstore -wrl {{ fsfo_wallet_dir }} -createCredential apexdb_stby_DGMGRL SYS"
+  args:
+    stdin: "{{ sys_password }}\n{{ sys_password }}\n{{ dg_observer_wallet_password }}\n"
+  register: dg_fsfo_cred_apexdb_stby_result
+  when: "'apexdb_stby_DGMGRL' not in dg_fsfo_wallet_list.stdout"
+  run_once: true
+
+- name: Show createCredential (apexdb_stby_DGMGRL) command and output
+  debug:
+    msg:
+      - "Command (on {{ groups['observer_nodes'][0] }}): {{ observer_oracle_home }}/bin/mkstore -wrl {{ fsfo_wallet_dir }} -createCredential apexdb_stby_DGMGRL SYS"
+      - "Stdin piped: <sys_password>\\n<sys_password>\\n<wallet password>\\n (not shown)"
+      - "rc: {{ dg_fsfo_cred_apexdb_stby_result.rc }}"
+      - "stdout: {{ dg_fsfo_cred_apexdb_stby_result.stdout_lines }}"
+      - "stderr: {{ dg_fsfo_cred_apexdb_stby_result.stderr_lines }}"
+  when: "'apexdb_stby_DGMGRL' not in dg_fsfo_wallet_list.stdout"
+  run_once: true
+
+- name: "Report: apexdb_stby_DGMGRL credential already present, skipped createCredential"
+  debug:
+    msg: "apexdb_stby_DGMGRL already appears in mkstore -listCredential's output — skipped."
+  when: "'apexdb_stby_DGMGRL' in dg_fsfo_wallet_list.stdout"
+  run_once: true
+
+- name: "Test the wallet: connect via /@apexdb_DGMGRL and /@apexdb_stby_DGMGRL with no password — confirms the wallet actually works before anything (FSFO enable, START OBSERVER) depends on it"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ observer_oracle_home }}
+    echo "connect /@{{ item }} as sysdba
+    select 'WALLET_OK: {{ item }}' from dual;
+    exit;" | {{ observer_oracle_home }}/bin/sqlplus -s /nolog
+  loop:
+    - apexdb_DGMGRL
+    - apexdb_stby_DGMGRL
+  loop_control:
+    label: "{{ item }}"
+  register: dg_fsfo_wallet_test
+  changed_when: false
+  run_once: true
+
+- name: Show wallet connectivity test command and results
+  debug:
+    msg:
+      - "Command (on {{ groups['observer_nodes'][0] }}): sqlplus -s /nolog, piped 'connect /@{{ item.item }} as sysdba' then a SELECT"
+      - "rc: {{ item.rc }}"
+      - "Result: {{ 'OK' if 'WALLET_OK' in item.stdout else 'FAILED' }}"
+      - "stdout: {{ item.stdout_lines }}"
+  loop: "{{ dg_fsfo_wallet_test.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  run_once: true
+
+- name: "Fail loudly if either wallet connection test failed — do not proceed to START OBSERVER against a wallet that doesn't actually work"
+  fail:
+    msg: >-
+      Wallet connectivity test failed for {{ item.item }} — read the output
+      above. Common causes: SQLNET.WALLET_OVERRIDE not picked up (check
+      TNS_ADMIN/ORACLE_HOME match observer_oracle_home), wrong wallet
+      password, or the credential alias doesn't exactly match the
+      tnsnames.ora alias name.
+  loop: "{{ dg_fsfo_wallet_test.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: "'WALLET_OK' not in item.stdout"
+  run_once: true
+
+# ============================================================================
+# 9.4 — FastStartFailoverThreshold + ENABLE FAST_START FAILOVER (from
+# rac_node1, embedded sys_password like every other one-shot Broker script —
+# no wallet needed here, this script is deleted right after use)
+# ============================================================================
+- name: "Write DGMGRL script: check current Fast-Start Failover status"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_fsfo_show_status.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      show configuration;
+  run_once: true
+
+- name: "Run: check current Fast-Start Failover status"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_fsfo_show_status.dgc
+  register: dg_fsfo_status_check
+  changed_when: false
+  run_once: true
+
+- name: Show Fast-Start Failover status-check command and output (password redacted)
+  debug:
+    msg:
+      - "Command (on {{ groups['rac_node1'][0] }}): {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_fsfo_show_status.dgc"
+      - "Script content: connect sys/***@apexdb_DGMGRL as sysdba / show configuration;"
+      - "rc: {{ dg_fsfo_status_check.rc }}"
+      - "Output: {{ (dg_fsfo_status_check.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+
+- name: "WARNING: dg_fsfo_show_status.dgc was NOT removed (kept on disk by request) — it contains a live sys password in plaintext"
+  debug:
+    msg: >-
+      {{ staging_dir }}/sql/dg_fsfo_show_status.dgc was intentionally left
+      on {{ groups['rac_node1'][0] }} (mode 0600, {{ oracle_user }}:oinstall
+      only). Remove it by hand once you no longer need it for reference —
+      it contains the real sys password used to connect.
+  run_once: true
+
+- name: "Write DGMGRL script: set FastStartFailoverThreshold + ENABLE FAST_START FAILOVER"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_fsfo_enable.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      edit configuration set property FastStartFailoverThreshold={{ dg_fsfo_threshold_seconds }};
+      {{ 'enable fast_start failover;' if dg_fsfo_status_check.stdout is search('Fast-Start Failover: DISABLED') else '-- already enabled, skipped' }}
+      show configuration;
+      show fast_start failover;
+  run_once: true
+
+- name: "Run: set threshold + enable Fast-Start Failover"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_fsfo_enable.dgc
+  register: dg_fsfo_enable_result
+  run_once: true
+
+- name: Show Fast-Start Failover enable command and output (password redacted)
+  debug:
+    msg:
+      - "Command (on {{ groups['rac_node1'][0] }}): {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_fsfo_enable.dgc"
+      - "Script content: connect sys/***@apexdb_DGMGRL as sysdba / edit configuration set property FastStartFailoverThreshold={{ dg_fsfo_threshold_seconds }}; / {{ 'enable fast_start failover;' if dg_fsfo_status_check.stdout is search('Fast-Start Failover: DISABLED') else '-- already enabled, skipped' }} / show configuration; / show fast_start failover;"
+      - "rc: {{ dg_fsfo_enable_result.rc }}"
+      - "Output: {{ (dg_fsfo_enable_result.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+
+- name: "WARNING: dg_fsfo_enable.dgc was NOT removed (kept on disk by request) — it contains a live sys password in plaintext"
+  debug:
+    msg: >-
+      {{ staging_dir }}/sql/dg_fsfo_enable.dgc was intentionally left on
+      {{ groups['rac_node1'][0] }} (mode 0600, {{ oracle_user }}:oinstall
+      only). Remove it by hand once you no longer need it for reference —
+      it contains the real sys password used to connect.
+  run_once: true
+
+# ============================================================================
+# 9.5 — START OBSERVER IN BACKGROUND on oemserver01 (idempotent — checks for
+# an already-running observer process first; wallet-based CONNECT, no
+# embedded password in this script at all)
+# ============================================================================
+- name: "Check whether an observer process is already running on oemserver01"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  shell: "ps -ef | grep '[s]tart observer' || true"
+  register: dg_fsfo_observer_process_check
+  changed_when: false
+  run_once: true
+
+- name: Show observer process-check command and output
+  debug:
+    msg:
+      - "Command (on {{ groups['observer_nodes'][0] }}): ps -ef | grep '[s]tart observer' || true"
+      - "Output: {{ dg_fsfo_observer_process_check.stdout_lines if dg_fsfo_observer_process_check.stdout else '(no matching process — none running)' }}"
+  run_once: true
+
+- name: "Write DGMGRL script: START OBSERVER IN BACKGROUND (wallet CONNECT — no password in this file)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  copy:
+    dest: "{{ fsfo_dir }}/start_observer.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    content: |
+      connect /@apexdb_DGMGRL as sysdba
+      start observer {{ dg_observer_name }} in background file is '{{ fsfo_dir }}/{{ dg_observer_name }}.dat' logfile is '{{ fsfo_dir }}/{{ dg_observer_name }}.log' connect identifier is apexdb_DGMGRL;
+  when: dg_fsfo_observer_process_check.stdout == ""
+  run_once: true
+
+- name: "Run: START OBSERVER IN BACKGROUND"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['observer_nodes'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ observer_oracle_home }}
+    {{ observer_oracle_home }}/bin/dgmgrl < {{ fsfo_dir }}/start_observer.dgc
+  register: dg_fsfo_start_observer_result
+  when: dg_fsfo_observer_process_check.stdout == ""
+  run_once: true
+
+- name: Show START OBSERVER command and output
+  debug:
+    msg:
+      - "Command (on {{ groups['observer_nodes'][0] }}): {{ observer_oracle_home }}/bin/dgmgrl < {{ fsfo_dir }}/start_observer.dgc"
+      - "Script content: connect /@apexdb_DGMGRL as sysdba / start observer {{ dg_observer_name }} in background file is '{{ fsfo_dir }}/{{ dg_observer_name }}.dat' logfile is '{{ fsfo_dir }}/{{ dg_observer_name }}.log' connect identifier is apexdb_DGMGRL;"
+      - "rc: {{ dg_fsfo_start_observer_result.rc }}"
+      - "Output: {{ dg_fsfo_start_observer_result.stdout.split('\n') }}"
+  when: dg_fsfo_observer_process_check.stdout == ""
+  run_once: true
+
+# DGMGRL exits 0 even when a script it ran hit a syntax error — the exact
+# "task success != command success" gap already documented in
+# dataguard_broker's header (no `whenever sqlerror` equivalent in DGMGRL).
+# First real run of this task hit that directly: rc 0, "changed", but the
+# actual output was "Syntax error before or at ';'" — no observer ever
+# started. Check the real success message instead of trusting rc.
+- name: "Fail loudly if START OBSERVER didn't report real success — DGMGRL returns rc 0 even on its own internal syntax errors"
+  fail:
+    msg: >-
+      START OBSERVER did not report 'Submitted command "START OBSERVER"' —
+      read the raw output above. rc 0 does not mean it worked; DGMGRL has
+      no whenever-sqlerror equivalent (known-risks.md #137).
+  when:
+    - dg_fsfo_observer_process_check.stdout == ""
+    - dg_fsfo_start_observer_result.stdout is not search('Submitted command "START OBSERVER"')
+  run_once: true
+
+- name: "Note: start_observer.dgc kept on disk — no password in it (wallet-based CONNECT), left for reference like every other script in this role now"
+  debug:
+    msg: "{{ fsfo_dir }}/start_observer.dgc was not removed — it contains no password."
+  when: dg_fsfo_observer_process_check.stdout == ""
+  run_once: true
+
+- name: "Report: observer process already running on oemserver01, nothing to do"
+  debug:
+    msg: "An observer process is already running on oemserver01 — skipped START OBSERVER. Process: {{ dg_fsfo_observer_process_check.stdout }}"
+  when: dg_fsfo_observer_process_check.stdout != ""
+  run_once: true
+
+# ============================================================================
+# 9.6 — Final verification (from rac_node1): SHOW FAST_START FAILOVER +
+# SHOW OBSERVERS — confirms both the config-side state AND that oemserver01
+# actually registered as a live, active observer, not just that DGMGRL
+# reported success starting it.
+# ============================================================================
+- name: "Write DGMGRL script: final verification"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_fsfo_verify.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      show fast_start failover;
+      show observers;
+  run_once: true
+
+- name: "Run: final verification"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_fsfo_verify.dgc
+  register: dg_fsfo_verify_result
+  changed_when: false
+  run_once: true
+
+- name: Show final verification command and output (password redacted)
+  debug:
+    msg:
+      - "Command (on {{ groups['rac_node1'][0] }}): {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_fsfo_verify.dgc"
+      - "Script content: connect sys/***@apexdb_DGMGRL as sysdba / show fast_start failover; / show observers;"
+      - "rc: {{ dg_fsfo_verify_result.rc }}"
+      - "Output: {{ (dg_fsfo_verify_result.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+
+- name: "WARNING: dg_fsfo_verify.dgc was NOT removed (kept on disk by request) — it contains a live sys password in plaintext"
+  debug:
+    msg: >-
+      {{ staging_dir }}/sql/dg_fsfo_verify.dgc was intentionally left on
+      {{ groups['rac_node1'][0] }} (mode 0600, {{ oracle_user }}:oinstall
+      only). Remove it by hand once you no longer need it for reference —
+      it contains the real sys password used to connect.
+  run_once: true
+
+- name: "Phase 9 (Fast-Start Failover) summary"
+  debug:
+    msg: >-
+      Fast-Start Failover enabled, threshold {{ dg_fsfo_threshold_seconds }}s.
+      Observer '{{ dg_observer_name }}' running on oemserver01 (wallet auth,
+      no embedded password). Flashback Database confirmed on both apexdb
+      and apexdb_stby, so an old primary should auto-reinstate after a real
+      failover. Second observer (oradbserv04) deliberately deferred until
+      that node exists. NOT yet exercised against a real primary outage —
+      run --tags dataguard_fsfo_test (a separate, standalone role, not part
+      of this one, not built yet) when actually ready to test that for real.
+      Reminder — password-bearing scripts kept on disk this run, not deleted:
+      {{ staging_dir }}/sql/dg_fsfo_apply_off.dgc,
+      {{ staging_dir }}/sql/dg_fsfo_apply_on.dgc,
+      {{ staging_dir }}/sql/dg_fsfo_show_status.dgc, and
+      {{ staging_dir }}/sql/dg_fsfo_enable.dgc on {{ groups['rac_node1'][0] }};
+      {{ staging_dir }}/sql/dg_fsfo_verify.dgc on {{ groups['rac_node1'][0] }}.
+      Remove them by hand when you're done referencing them.
+  run_once: true

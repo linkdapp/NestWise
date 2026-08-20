@@ -1,0 +1,113 @@
+---
+# Included from main.yml, twice at most (attempt 1, and attempt 2 only if
+# attempt 1 left something behind after forcing primary-side log switches).
+# Same generate -> review -> run sequence either time, parametrized only by
+# {{ dg_srl_cleanup_attempt }} for clearer task names/output.
+#
+# Generate-via-SPOOL, not a hardcoded statement list, because standby redo
+# log member filenames are ASM-assigned (…/group_11.269.1234567890) and only
+# knowable at run time — same reasoning this project already applies to
+# discovering the RAC-conversion spfile path/undo tablespace names in
+# dataguard_convert_rac rather than guessing them.
+
+- name: "Attempt {{ dg_srl_cleanup_attempt }}: write SQL script to generate DROP statements for remaining +DATA standby redo log members"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_srl_cleanup_generate.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set linesize 150 pagesize 0 heading off feedback off trimspool on echo off tab off
+      spool {{ staging_dir }}/sql/dg_srl_cleanup_drop_generated.sql
+      select 'alter database drop standby logfile member ''' || member || ''';'
+      from v$logfile where type='STANDBY' and member like '+DATA%';
+      spool off
+      exit;
+
+# SPOOL appends to an existing file rather than overwriting it — deleting any
+# stale copy first keeps this attempt's generated file limited to exactly
+# what's actually present right now, not a growing duplicate list across
+# attempts.
+- name: "Attempt {{ dg_srl_cleanup_attempt }}: remove any stale generated-drops file before regenerating"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_srl_cleanup_drop_generated.sql"
+    state: absent
+
+- name: "Attempt {{ dg_srl_cleanup_attempt }}: run the generator (SPOOLs the DROP statements to a file — does not change anything itself)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_srl_cleanup_generate.sql
+  register: dg_srl_cleanup_generate_result
+  changed_when: false
+
+- name: "Attempt {{ dg_srl_cleanup_attempt }}: fetch the generated drop-statements file to the control node"
+  become: true
+  become_user: "{{ oracle_user }}"
+  fetch:
+    src: "{{ staging_dir }}/sql/dg_srl_cleanup_drop_generated.sql"
+    dest: "{{ dg_srl_cleanup_local_dir }}/dg_srl_cleanup_drop_generated.sql"
+    flat: true
+
+- name: "Attempt {{ dg_srl_cleanup_attempt }}: set fact — the actual DROP statements about to run"
+  become: false
+  set_fact:
+    dg_srl_cleanup_drop_statements: "{{ lookup('file', dg_srl_cleanup_local_dir + '/dg_srl_cleanup_drop_generated.sql').split('\n') | select('match', '^alter database drop') | list }}"
+
+- name: "Attempt {{ dg_srl_cleanup_attempt }}: show the DROP statements that will run"
+  debug:
+    var: dg_srl_cleanup_drop_statements
+
+- name: "Attempt {{ dg_srl_cleanup_attempt }}: report nothing left to drop"
+  debug:
+    msg: "No +DATA members found in v$logfile right now — nothing to drop on this attempt."
+  when: dg_srl_cleanup_drop_statements | length == 0
+
+- name: "Attempt {{ dg_srl_cleanup_attempt }}: pause for review before dropping — confirm every statement above targets a +DATA01 member only, never +{{ dg_srl_diskgroup }}"
+  pause:
+    prompt: |
+      About to run {{ dg_srl_cleanup_drop_statements | length }} DROP
+      statement(s) against apexdb_stby's standby redo logs (shown above).
+      Every statement should target a +DATA01 member only — the
+      +{{ dg_srl_diskgroup }} member of each group is what stays behind.
+      Press Enter to continue, or Ctrl+C then A to abort and investigate
+      first.
+  when: dg_srl_cleanup_drop_statements | length > 0
+
+- name: "Attempt {{ dg_srl_cleanup_attempt }}: write the executable DROP script (echo on, so every statement's real result shows in the output below)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_srl_cleanup_drop_exec.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      {% for stmt in dg_srl_cleanup_drop_statements %}
+      {{ stmt }}
+      {% endfor %}
+      exit;
+  when: dg_srl_cleanup_drop_statements | length > 0
+
+- name: "Attempt {{ dg_srl_cleanup_attempt }}: run the DROP script (ORA-00261 on an individual member is expected here if it's still in active use — not treated as a hard failure, see the role's header comment)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_srl_cleanup_drop_exec.sql
+  register: dg_srl_cleanup_drop_result
+  changed_when: "'Database altered' in dg_srl_cleanup_drop_result.stdout"
+  when: dg_srl_cleanup_drop_statements | length > 0
+
+- name: "Attempt {{ dg_srl_cleanup_attempt }}: show the DROP script's real output (any ORA-00261 lines here mean that specific member is still in use)"
+  debug:
+    var: dg_srl_cleanup_drop_result.stdout_lines
+  when: dg_srl_cleanup_drop_statements | length > 0

@@ -134,8 +134,9 @@
 - name: Check online redo log group/member layout (group, thread, member path, size)
   become: true
   become_user: "{{ oracle_user }}"
-  shell: >
-    ORACLE_HOME={{ db_home }} ORACLE_SID={{ sid_prefix }}1
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
     {{ db_home }}/bin/sqlplus -s / as sysdba <<'EOF'
     set heading off feedback off linesize 200
     select l.group# || ' thread=' || l.thread# || ' size_mb=' || (l.bytes/1024/1024)
@@ -155,8 +156,9 @@
 - name: Confirm this really is non-CDB (guards against a template/flag mismatch)
   become: true
   become_user: "{{ oracle_user }}"
-  shell: >
-    ORACLE_HOME={{ db_home }} ORACLE_SID={{ sid_prefix }}1
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
     {{ db_home }}/bin/sqlplus -s / as sysdba <<'EOF'
     set heading off feedback off
     select 'CDB=' || cdb from v$database;
@@ -182,8 +184,9 @@
 - name: Check dba_registry_sqlpatch for the OJVM patch registration
   become: true
   become_user: "{{ oracle_user }}"
-  shell: >
-    ORACLE_HOME={{ db_home }} ORACLE_SID={{ sid_prefix }}1
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
     {{ db_home }}/bin/sqlplus -s / as sysdba <<'EOF'
     set heading off feedback off linesize 200
     select patch_id || ' ' || patch_type || ' ' || status || ' ' || to_char(action_time, 'YYYY-MM-DD HH24:MI:SS')
@@ -199,8 +202,9 @@
 - name: Check invalid object count post-creation
   become: true
   become_user: "{{ oracle_user }}"
-  shell: >
-    ORACLE_HOME={{ db_home }} ORACLE_SID={{ sid_prefix }}1
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
     {{ db_home }}/bin/sqlplus -s / as sysdba <<'EOF'
     set heading off feedback off
     select count(*) from dba_objects where status = 'INVALID';

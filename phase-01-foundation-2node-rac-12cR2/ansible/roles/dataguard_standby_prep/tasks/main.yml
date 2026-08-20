@@ -1,0 +1,611 @@
+---
+# Data Guard Phase 3 — Prepare the standby host (SOP standby_dataguard_creation.txt
+# section 7): create a pfile from the primary's spfile, copy it (edited) and the
+# primary's real password file to oradbserv09, and start the auxiliary instance
+# apexdb1 there in NOMOUNT — everything RMAN's DUPLICATE ... FOR STANDBY FROM
+# ACTIVE DATABASE (Phase 4) needs to connect to as its AUXILIARY target.
+#
+# Only oradbserv09 (standby node 1) is touched here — RMAN DUPLICATE first
+# creates a single-instance standby; Phase 5 converts it to RAC afterward. SID
+# is literally "apexdb1", same as the primary's own instance 1 — sid_prefix is
+# deliberately NOT overridden per cluster (group_vars/standby_nodes.yml's own
+# comment).
+#
+# DB_UNIQUE_NAME=apexdb_stby (dg_standby_db_unique_name) IS set here, in the
+# aux pfile, per James's direct instruction — belt-and-suspenders with Phase
+# 4's RMAN DUPLICATE, which also SETs db_unique_name as part of building the
+# standby's real spfile. Verified against Oracle docs/community references:
+# when DUPLICATE ... SPFILE is used, the ONLY parameter strictly required in
+# the auxiliary instance's temporary pfile is DB_NAME — RMAN's own SET clauses
+# take over from there and rebuild the spfile at duplication time, so nothing
+# set here is load-bearing for Phase 4. It's set anyway so v$instance /
+# v$database report the correct identity from the very first NOMOUNT startup
+# (useful for the idempotency check below and for anyone reviewing the pause
+# prompt), and so this pfile stays self-consistent if it's ever used to start
+# the instance without RMAN.
+#
+# The rest of James's suggested parameter list — LOG_ARCHIVE_CONFIG,
+# LOG_ARCHIVE_DEST_n, LOG_ARCHIVE_DEST_STATE_n, ARCHIVE_LAG_TARGET,
+# DB_FILE_NAME_CONVERT, LOG_FILE_NAME_CONVERT — is deliberately NOT added
+# here. Reasoning (see docs/known-risks.md #93):
+#   - LOG_ARCHIVE_CONFIG / LOG_ARCHIVE_DEST_n: already set on the PRIMARY
+#     in dataguard_primary_prep (main.yml ~L429-434), so they're present,
+#     unedited, in the pfile this role fetches — but they're inert at NOMOUNT
+#     (no log transport happens until the database is mounted/open) and
+#     Phase 4's RMAN SET clause rebuilds them correctly for the standby's
+#     own role anyway. Editing them twice (once here, again in Phase 4)
+#     would just be two places that can drift out of sync.
+#   - LOG_ARCHIVE_DEST_STATE_n / ARCHIVE_LAG_TARGET: broker/runtime-tunable,
+#     not meaningful before the standby exists — that's Phase 7 territory.
+#   - FAL_CLIENT: confirmed via Oracle documentation and community
+#     references — no longer required since 11g; Data Guard resolves
+#     archive gaps without it. Not carried forward anywhere in this project.
+#   - DB_FILE_NAME_CONVERT / LOG_FILE_NAME_CONVERT: not needed — this lab's
+#     ASM diskgroups (DATA01/RECO01) use identical names on both usatclust1
+#     and usatclust2 with OMF, so datafile/redo paths already resolve
+#     correctly; RMAN places files via db_create_file_dest without an
+#     explicit conversion parameter.
+#
+# This play runs `hosts: localhost` with `delegate_to` for every remote task —
+# same pattern gi_db_home_clone already uses for primary->standby work, for the
+# same reason: NOT setting `connection: local` at the play level, since that
+# pins every task (including delegated ones) to the control node and breaks
+# delegate_to entirely — see docs/known-risks.md #48's third update.
+#
+# PFILE edits (James's direct call, not the SOP's exact wording): strip
+# RAC/primary-instance-specific parameters (apexdb1./apexdb2. prefixed lines,
+# instance_number, thread, undo_tablespace, local_listener, remote_listener,
+# cluster_database_instances) and force cluster_database=false, THEN pause
+# (Ansible's own `pause:` module — an interactive prompt, not a separate manual
+# re-run) so the edited pfile can be reviewed before this same run starts a real
+# instance on usatclust2 for the first time. Starting the instance itself stays
+# automatic after that pause — James's second call.
+
+- name: "Preflight: fail loudly if sys_password was never overridden (known-risks.md #113)"
+  # group_vars/all.yml's sys_password default is the literal string
+  # "CHANGE_ME_sys_password" — a deliberate placeholder, there so a
+  # forgotten -e sys_password=... override is obviously wrong if you go
+  # looking for the variable's value. But nothing before this assert
+  # actually STOPPED a run without that override — the local orapwd task
+  # later in this role would just silently create
+  # oradbserv09's password file with "CHANGE_ME_sys_password" as the real
+  # SYS password, no error, no warning. Confirmed for real: James ran
+  # --tags dataguard_standby_prep without -e sys_password=... (my own
+  # given command omitted it), the task reported "changed" with no hint
+  # anything was wrong, and the resulting password file didn't match the
+  # real SYS password used everywhere else — only surfaced because he
+  # asked how the task could possibly know the password at all. Failing
+  # here, before anything else in this role runs, catches the same mistake
+  # immediately and clearly instead of producing a working-looking file
+  # with the wrong password inside it.
+  assert:
+    that: sys_password != "CHANGE_ME_sys_password"
+    fail_msg: >
+      sys_password is still the group_vars/all.yml placeholder
+      ("CHANGE_ME_sys_password") — pass the real value explicitly:
+      -e sys_password='...'. Without this, the local password file this
+      role creates on oradbserv09 would silently get the placeholder text
+      as its actual SYS password instead of failing.
+  run_once: true
+
+- name: "Ensure the local (control node) scratch directory exists for pfile editing"
+  become: false
+  file:
+    path: "{{ dg_standby_prep_local_dir }}"
+    state: directory
+    mode: "0750"
+
+- name: "Ensure {{ staging_dir }}/standby exists on the primary"
+  # Deliberately plain root (become's default via ansible.cfg), NOT
+  # become_user: oracle_user — this directory is written into by BOTH oracle
+  # (pfile/sql staging) and grid (asmcmd pwcopy of the password file) later in
+  # this same role. If grid's asmcmd pwcopy ever runs before this task on a
+  # given host (e.g. a re-run after a prior partial failure), it auto-creates
+  # this directory as grid:oinstall — and a non-root oracle become_user can't
+  # chown it back (chown requires CAP_CHOWN/root regardless of shared group
+  # membership). Root can always fix ownership regardless of current state.
+  # Same pattern gi_db_home_clone already uses for its own staging directory.
+  delegate_to: "{{ dg_standby_prep_primary_node }}"
+  become: true
+  file:
+    path: "{{ staging_dir }}/standby"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0770"
+
+- name: "Ensure {{ staging_dir }}/standby exists on oradbserv09"
+  # Same reasoning as the primary-side task above — plain root, not oracle.
+  delegate_to: "{{ dg_standby_prep_target }}"
+  become: true
+  file:
+    path: "{{ staging_dir }}/standby"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0770"
+
+# --- 7.2 Create PFILE from the primary database (SOP 7.2) ---------------------
+- name: "Write SQL script: create pfile from the primary's spfile"
+  delegate_to: "{{ dg_standby_prep_primary_node }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_standby_pfile_create.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      create pfile='{{ staging_dir }}/standby/initapexdb.ora' from spfile;
+      exit;
+
+- name: "Create pfile from the primary's spfile"
+  delegate_to: "{{ dg_standby_prep_primary_node }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_standby_pfile_create.sql
+  register: dg_standby_pfile_create
+  changed_when: "'File created' in dg_standby_pfile_create.stdout"
+  failed_when: "dg_standby_pfile_create.rc != 0 or 'ORA-' in dg_standby_pfile_create.stdout"
+
+- name: Show pfile creation output
+  debug:
+    var: dg_standby_pfile_create.stdout_lines
+
+- name: "Fetch the primary's pfile to the control node for editing"
+  delegate_to: "{{ dg_standby_prep_primary_node }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  fetch:
+    src: "{{ staging_dir }}/standby/initapexdb.ora"
+    dest: "{{ dg_standby_prep_local_pfile }}"
+    flat: true
+
+# --- Strip RAC/primary-instance-specific parameters, force cluster_database=false ---
+- name: "Strip RAC/primary-instance-specific parameters from the fetched pfile"
+  become: false
+  lineinfile:
+    path: "{{ dg_standby_prep_local_pfile }}"
+    regexp: "{{ item }}"
+    state: absent
+  loop:
+    - '^apexdb1\.'
+    - '^apexdb2\.'
+    - '.*\.instance_number='
+    - '.*\.thread='
+    - '.*\.undo_tablespace='
+    - '.*\.local_listener='
+    - '.*\.remote_listener='
+    - '.*\.cluster_database_instances='
+  loop_control:
+    label: "{{ item }}"
+
+- name: "Force cluster_database=false (required for the active-duplicate auxiliary instance — SOP 7.2)"
+  become: false
+  lineinfile:
+    path: "{{ dg_standby_prep_local_pfile }}"
+    regexp: '^\*\.cluster_database='
+    line: '*.cluster_database=false'
+
+- name: "Ensure a cluster_database=false line exists even if the primary's pfile never set one explicitly"
+  become: false
+  lineinfile:
+    path: "{{ dg_standby_prep_local_pfile }}"
+    line: '*.cluster_database=false'
+    insertafter: EOF
+  when: "'*.cluster_database=false' not in lookup('file', dg_standby_prep_local_pfile)"
+
+# --- Set db_unique_name for the standby (James's direct call — see the role
+# header comment for why this is set here even though Phase 4's RMAN SET
+# clause also sets it) ----------------------------------------------------
+- name: "Strip any existing db_unique_name line from the fetched pfile (it currently reads the primary's own value)"
+  become: false
+  lineinfile:
+    path: "{{ dg_standby_prep_local_pfile }}"
+    regexp: '.*\.db_unique_name='
+    state: absent
+
+- name: "Set db_unique_name={{ dg_standby_db_unique_name }} for the standby auxiliary instance"
+  become: false
+  lineinfile:
+    path: "{{ dg_standby_prep_local_pfile }}"
+    line: "*.db_unique_name={{ dg_standby_db_unique_name }}"
+    insertafter: EOF
+
+# --- Set Data Guard Broker config file locations (James's direct call) ---
+# Same ASM directory-naming correction as the password file above: these
+# point at +DATA01/apexdb/DG and +RECO01/apexdb/DG — db_unique_name
+# (the original name), not dg_standby_db_unique_name. If the primary's
+# pfile already carried its own dg_broker_config_file1/2 lines (broker was
+# configured on the primary back in dataguard_primary_prep — see
+# docs/known-risks.md #81), strip them first so there's exactly one pair,
+# pointed at this environment's actual convention.
+- name: "Strip any existing dg_broker_config_file1/2 lines from the fetched pfile"
+  become: false
+  lineinfile:
+    path: "{{ dg_standby_prep_local_pfile }}"
+    regexp: "{{ item }}"
+    state: absent
+  loop:
+    - '.*\.dg_broker_config_file1='
+    - '.*\.dg_broker_config_file2='
+  loop_control:
+    label: "{{ item }}"
+
+- name: "Set dg_broker_config_file1/2 for the standby auxiliary instance"
+  become: false
+  lineinfile:
+    path: "{{ dg_standby_prep_local_pfile }}"
+    line: "{{ item }}"
+    insertafter: EOF
+  loop:
+    - "*.dg_broker_config_file1='+{{ asm_diskgroup_data }}/{{ db_unique_name }}/DG/dr1{{ db_unique_name }}.dat'"
+    - "*.dg_broker_config_file2='+{{ asm_diskgroup_reco }}/{{ db_unique_name }}/DG/dr2{{ db_unique_name }}.dat'"
+  loop_control:
+    label: "{{ item }}"
+
+- name: "Show the edited pfile that will be copied to oradbserv09"
+  debug:
+    msg: "{{ lookup('file', dg_standby_prep_local_pfile).split('\n') }}"
+
+- name: "Pause for review — this run is about to start the first real database instance ever on usatclust2"
+  pause:
+    prompt: |
+      Review the edited pfile above (RAC/primary-instance-specific parameters
+      stripped, cluster_database=false forced, db_unique_name set to
+      {{ dg_standby_db_unique_name }}, dg_broker_config_file1/2 set to
+      +{{ asm_diskgroup_data }}/{{ db_unique_name }}/DG and
+      +{{ asm_diskgroup_reco }}/{{ db_unique_name }}/DG). Press Enter to
+      continue: copy it + the primary's password file to oradbserv09 and
+      start the apexdb1 auxiliary instance there in NOMOUNT. Ctrl+C then A
+      aborts this run instead.
+
+- name: "Copy the edited pfile to oradbserv09"
+  delegate_to: "{{ dg_standby_prep_target }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    src: "{{ dg_standby_prep_local_pfile }}"
+    dest: "{{ staging_dir }}/standby/initapexdb.ora"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+
+# --- 7.2 Password file on standby ----------------------------------------------
+# known-risks.md #108/#112: this used to be a whole ASM-based pwcopy chain
+# (primary's ASM password file discovered, copied out to OS staging,
+# fetched to the control node, copied to oradbserv09, an ASM
+# +DATA01/apexdb_stby/PASSWORD directory created, copied back in) — #96's
+# original approach, corrected once by #104, and ultimately proven dead
+# weight by #108: RMAN's AUXILIARY connection never actually authenticated
+# against it. Neither of the two documented ways to properly TAG an ASM
+# password file for db_unique_name auto-discovery (`asmcmd pwcreate
+# --dbuniquename`, `orapwd ... dbuniquename=`) can even run before
+# apexdb_stby has a CRS resource, which doesn't exist until DUPLICATE
+# creates the database — so a plain, untagged `asmcmd pwcopy` INTO THE
+# STANDBY'S OWN ASM was never going to be found by the kernel's automatic
+# discovery, no matter how correctly the ASM directory was named. That
+# whole chain was removed per James's direct request (#112).
+#
+# What both methods below agree on: the classic, CRS-independent, purely
+# local password file at $ORACLE_HOME/dbs/orapw$ORACLE_SID is what RMAN's
+# AUXILIARY connection actually authenticates against (#108, confirmed for
+# real — v$pwfile_users populated immediately). They differ only in how
+# that local file's CONTENT is produced:
+#
+#   - copy_from_primary (default, known-risks.md #116): scp the PRIMARY's
+#     own real password file — already CRS-independent-and-working, already
+#     carrying the real SYS hash and any other privileged-user grants —
+#     from ITS ASM (not the standby's) onto the standby's local filesystem.
+#     This is the textbook-correct Data Guard approach: Oracle's own docs
+#     describe copying the primary's password file to every standby
+#     precisely so they stay in sync, rather than each side generating its
+#     own independently. James's direct fix, replacing the orapwd approach
+#     below as the default.
+#   - orapwd (fallback, known-risks.md #108): generate a brand new local
+#     password file from scratch with just SYS and whatever password= was
+#     passed. Kept, not deleted — select with -e dg_pwfile_method=orapwd.
+#
+# Scope is deliberately narrow either way — single-node, local to
+# oradbserv09's own filesystem, sufficient because RMAN's AUXILIARY
+# connection for Phase 4 only ever runs from there.
+- name: "Check whether a local password file already exists for apexdb1 on oradbserv09"
+  delegate_to: "{{ dg_standby_prep_target }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  stat:
+    path: "{{ db_home }}/dbs/orapw{{ sid_prefix }}1"
+    checksum_algorithm: sha1
+  register: dg_standby_local_pwfile_stat
+
+# --- copy_from_primary (default) ------------------------------------------
+# Two hardening fixes applied here (known-risks.md #132), ported over from
+# the identical pattern in dataguard_convert_rac (which surfaced both bugs
+# for real first, in apexdb2's own copy of this same logic — this role's
+# copy for apexdb1 was never actually run into the same failure, but has
+# the exact same code and would hit the exact same bugs): (1) skip this
+# entire discover/export/fetch/compare round-trip through the PRIMARY's own
+# ASM entirely if oradbserv09 already has a local password file — no need
+# to pay for an ASM round-trip, on a different host, just to verify
+# something that's already there; and (2) if `asmcmd pwget` comes back with
+# an empty path anyway (real, observed failure mode, root cause not yet
+# established), fall back to generating a fresh file via `orapwd` instead
+# of failing — James's own call: "if the password check didn't return a
+# value it should then create a password file because one does not exist."
+- name: "Discover the primary's real password file path in its own ASM (asmcmd pwget)"
+  # No explicit environment: block needed — matches dataguard_primary_prep's
+  # own asmcmd tasks (ls/mkdir for the broker-config directories), which run
+  # the same way and connect fine. Unlike sqlplus/srvctl (known-risks.md
+  # #78/#83, where the `command`/`shell` modules genuinely needed explicit
+  # ORACLE_HOME/ORACLE_SID), asmcmd resolves its own home from where it's
+  # invoked (grid_home/bin) and connects to whichever ASM instance is local
+  # to the node via the GPnP profile — no ORACLE_SID needed for a local,
+  # OS-authenticated connection.
+  delegate_to: "{{ dg_standby_prep_primary_node }}"
+  become: true
+  become_user: "{{ grid_user }}"
+  command: "{{ grid_home }}/bin/asmcmd pwget --dbuniquename {{ db_unique_name }}"
+  register: dg_standby_pwfile_asm_path
+  changed_when: false
+  when: dg_pwfile_method == 'copy_from_primary' and not dg_standby_local_pwfile_stat.stat.exists
+
+- name: Show the discovered primary password file ASM path
+  debug:
+    var: dg_standby_pwfile_asm_path.stdout
+  when: dg_pwfile_method == 'copy_from_primary' and not dg_standby_local_pwfile_stat.stat.exists
+
+- name: "Set fact: did the primary-ASM password file lookup come back empty (fall back to orapwd rather than fail)"
+  set_fact:
+    dg_standby_pwfile_asm_empty: >-
+      {{ dg_pwfile_method == 'copy_from_primary' and
+         not dg_standby_local_pwfile_stat.stat.exists and
+         (dg_standby_pwfile_asm_path.stdout | default('') | trim | length) == 0 }}
+
+- name: "Report: primary-ASM password file lookup returned nothing — falling back to orapwd instead of failing"
+  debug:
+    msg: >
+      asmcmd pwget --dbuniquename {{ db_unique_name }} on
+      {{ dg_standby_prep_primary_node }} returned no path. Falling back to
+      generating a fresh local password file via orapwd for apexdb1
+      instead of copying the primary's (known-risks.md #131/#132) — this
+      won't carry the primary's exact SYS hash or any other
+      privileged-user grants beyond what orapwd itself creates, only
+      matters if something relies on that. If it does, check
+      `asmcmd pwget --dbuniquename {{ db_unique_name }}` by hand on
+      {{ dg_standby_prep_primary_node }} to see why the lookup came back
+      empty.
+  when: dg_standby_pwfile_asm_empty
+
+- name: "Remove any stale staging copy on the primary before re-exporting (asmcmd pwcopy refuses an existing destination)"
+  delegate_to: "{{ dg_standby_prep_primary_node }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/standby/orapwd{{ db_unique_name }}"
+    state: absent
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_standby_local_pwfile_stat.stat.exists
+    and not dg_standby_pwfile_asm_empty
+
+- name: "Export the primary's real password file from ASM to a local staging file (asmcmd pwcopy)"
+  delegate_to: "{{ dg_standby_prep_primary_node }}"
+  become: true
+  become_user: "{{ grid_user }}"
+  command: >
+    {{ grid_home }}/bin/asmcmd pwcopy
+    {{ dg_standby_pwfile_asm_path.stdout | trim }}
+    {{ staging_dir }}/standby/orapwd{{ db_unique_name }}
+  register: dg_standby_pwfile_export
+  changed_when: dg_standby_pwfile_export.rc == 0
+  failed_when: dg_standby_pwfile_export.rc != 0
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_standby_local_pwfile_stat.stat.exists
+    and not dg_standby_pwfile_asm_empty
+
+- name: "Fetch the exported password file to the control node"
+  delegate_to: "{{ dg_standby_prep_primary_node }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  fetch:
+    src: "{{ staging_dir }}/standby/orapwd{{ db_unique_name }}"
+    dest: "{{ dg_standby_prep_local_dir }}/orapwd{{ db_unique_name }}"
+    flat: true
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_standby_local_pwfile_stat.stat.exists
+    and not dg_standby_pwfile_asm_empty
+
+- name: "Copy the primary's password file onto oradbserv09 as orapw{{ sid_prefix }}1 (nothing was there before this chain ran, so no checksum comparison is needed)"
+  delegate_to: "{{ dg_standby_prep_target }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    src: "{{ dg_standby_prep_local_dir }}/orapwd{{ db_unique_name }}"
+    dest: "{{ db_home }}/dbs/orapw{{ sid_prefix }}1"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_standby_local_pwfile_stat.stat.exists
+    and not dg_standby_pwfile_asm_empty
+
+- name: "Clean up the staging copy on the primary (contained real password material)"
+  delegate_to: "{{ dg_standby_prep_primary_node }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/standby/orapwd{{ db_unique_name }}"
+    state: absent
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_standby_local_pwfile_stat.stat.exists
+    and not dg_standby_pwfile_asm_empty
+
+- name: "Clean up the staging copy on the control node (contained real password material)"
+  file:
+    path: "{{ dg_standby_prep_local_dir }}/orapwd{{ db_unique_name }}"
+    state: absent
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_standby_local_pwfile_stat.stat.exists
+    and not dg_standby_pwfile_asm_empty
+
+# --- orapwd (fallback — known-risks.md #108) -------------------------------
+- name: "Create the local password file for apexdb1 (orapwd fallback — see comment above and known-risks.md #108; also fires when copy_from_primary's ASM lookup came back empty — known-risks.md #132)"
+  # no_log suppresses this from Ansible's own output/logs, matching the
+  # password-handling discipline used elsewhere in this project (the RMAN
+  # cmdfile in dataguard_duplicate, etc.). Unlike that cmdfile pattern,
+  # orapwd has no equivalent "read password from a file" option — it only
+  # ever takes password= as a literal CLI argument, so it IS briefly
+  # visible via `ps -ef` on oradbserv09 while this command runs. Accepted,
+  # documented risk for this home-lab context — not hideable with orapwd
+  # itself, and not worth building a wrapper script around for this
+  # project's threat model.
+  delegate_to: "{{ dg_standby_prep_target }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  no_log: true
+  command: >
+    {{ db_home }}/bin/orapwd file={{ db_home }}/dbs/orapw{{ sid_prefix }}1
+    password={{ sys_password }} entries=10 format=12
+  when: >
+    not dg_standby_local_pwfile_stat.stat.exists and
+    (dg_pwfile_method == 'orapwd' or dg_standby_pwfile_asm_empty | default(false))
+
+# --- 7.1 (the piece that's actually new here) — /etc/oratab entry -------------
+# Nothing in this repo manages /etc/oratab yet (checked — only ORATAB=/etc/oratab
+# is exported by os_prep's bash_profile templates, nothing writes the file
+# itself). N (not auto-started by dbstart/dbshut) — this instance is GI-managed
+# territory once Phase 5 registers it with srvctl; for now it only exists so
+# `. oraenv` works interactively on oradbserv09 if James wants to check on it
+# by hand between phases.
+- name: "Add an /etc/oratab entry for the apexdb1 auxiliary instance on oradbserv09"
+  delegate_to: "{{ dg_standby_prep_target }}"
+  become: true
+  lineinfile:
+    path: /etc/oratab
+    regexp: '^apexdb1:'
+    line: "apexdb1:{{ db_home }}:N"
+    create: true
+    owner: root
+    group: oinstall
+    mode: "0664"
+
+# --- audit_file_dest — James caught this directly from a real ORA-09925 ------
+# The fetched/edited pfile still carries the primary's own, unedited
+# audit_file_dest='/u01/app/oracle/admin/apexdb/adump' line (same
+# apexdb-keyed convention as #98 — never stripped, never should be, it's a
+# plain OS filesystem path, not ASM). Nothing had ever created that
+# directory on usatclust2 — no database has existed there before this
+# phase — so `startup nomount` failed outright: `ORA-09925: Unable to
+# create audit trail file`. James confirmed the fix manually
+# (`mkdir -p .../adump` on oradbserv09, then `startup nomount` succeeded)
+# and asked for it to check/create the directory on every node in the
+# standby cluster, not just the one node this phase starts an instance
+# on — mirroring `dbca_noncdb`'s own equivalent task for the PRIMARY
+# cluster (`Ensure the audit file destination exists and is writable, on
+# every RAC node`, looped over groups['rac_nodes']) so `oradbserv10` is
+# already correct and ready before Phase 5 converts this standby to RAC
+# and starts an instance there too. See docs/known-risks.md #100.
+- name: "Ensure the audit file destination exists and is writable, on every standby node"
+  delegate_to: "{{ item }}"
+  become: true
+  file:
+    path: "{{ oracle_base }}/admin/{{ db_unique_name }}/adump"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0750"
+    recurse: true
+  loop: "{{ groups['standby_nodes'] }}"
+
+# --- 7.4 Start auxiliary instance in NOMOUNT (SOP 7.4) -------------------------
+# Idempotency: check whether the instance is already up before trying to start
+# it — ORA-01081 ("cannot start already-running ORACLE") is the real failure
+# mode of starting a second time, same reasoning as every other idempotent
+# check-then-act task in this project's Data Guard roles.
+- name: "Write SQL script: check whether the apexdb1 auxiliary instance is already started"
+  delegate_to: "{{ dg_standby_prep_target }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_standby_instance_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off
+      select status from v$instance;
+      exit;
+
+- name: "Check whether the apexdb1 auxiliary instance is already started"
+  delegate_to: "{{ dg_standby_prep_target }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID=apexdb1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_standby_instance_check.sql
+  register: dg_standby_instance_check
+  changed_when: false
+  failed_when: false
+
+- name: Show instance check output
+  debug:
+    var: dg_standby_instance_check.stdout_lines
+
+- name: "Write SQL script: startup nomount"
+  delegate_to: "{{ dg_standby_prep_target }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_standby_startup_nomount.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      startup nomount pfile='{{ staging_dir }}/standby/initapexdb.ora';
+      exit;
+  when: "'ORA-01034' in dg_standby_instance_check.stdout or 'ORA-27101' in dg_standby_instance_check.stdout"
+
+- name: "Start the apexdb1 auxiliary instance in NOMOUNT (only if not already started)"
+  delegate_to: "{{ dg_standby_prep_target }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID=apexdb1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_standby_startup_nomount.sql
+  register: dg_standby_startup_nomount
+  when: "'ORA-01034' in dg_standby_instance_check.stdout or 'ORA-27101' in dg_standby_instance_check.stdout"
+  changed_when: "'ORACLE instance started' in dg_standby_startup_nomount.stdout"
+  failed_when: >
+    dg_standby_startup_nomount.rc != 0 or
+    ('ORA-' in dg_standby_startup_nomount.stdout and 'ORACLE instance started' not in dg_standby_startup_nomount.stdout)
+
+- name: Show startup nomount output
+  debug:
+    var: dg_standby_startup_nomount.stdout_lines
+  when: "'ORA-01034' in dg_standby_instance_check.stdout or 'ORA-27101' in dg_standby_instance_check.stdout"
+
+- name: "Report: apexdb1 auxiliary instance was already running, startup skipped"
+  debug:
+    msg: "apexdb1 on {{ dg_standby_prep_target }} is already started (v$instance query above succeeded) — skipped startup nomount."
+  when: "'ORA-01034' not in dg_standby_instance_check.stdout and 'ORA-27101' not in dg_standby_instance_check.stdout"
+
+- name: "Confirm final instance status"
+  delegate_to: "{{ dg_standby_prep_target }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID=apexdb1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_standby_instance_check.sql
+  register: dg_standby_instance_final
+  changed_when: false
+
+- name: Show final instance status (expect STARTED, mount_status will confirm NOMOUNT once Phase 4's RMAN DUPLICATE mounts/opens it)
+  debug:
+    var: dg_standby_instance_final.stdout_lines

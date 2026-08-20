@@ -41,6 +41,19 @@
 # the sub-tag blocks) make already-done stages no-ops, so the play "falls through" to
 # wherever it actually left off. See docs/known-risks.md #14 for the full mechanics.
 
+- name: "Resolve node1/node2 for whichever group is actually running this role (cluster-agnostic — nodes is redirected per group_vars/<group>.yml, same pattern as dns_bind/asmlib_disks/ssh_equivalence)"
+  # Every task below used to delegate_to/reference groups['rac_nodes'][0]/[1]
+  # directly — inventory-global, unaffected by which group's play is actually
+  # running this role, so reusing this role for usatclust2 via
+  # --tags standby_grid_infrastructure (hosts: standby_nodes) would have kept
+  # delegating to oradbserv05/06 instead of oradbserv09/10. Same bug class as
+  # #58/#52/#61 — fixed the same way, via the nodes variable (already redirected
+  # to standby_nodes' own node list in group_vars/standby_nodes.yml).
+  set_fact:
+    gi_node1: "{{ (nodes | map(attribute='name') | list)[0] }}"
+    gi_node2: "{{ (nodes | map(attribute='name') | list)[1] }}"
+  tags: always
+
 - name: "Stage GI software: extract, update OPatch, sanity-check with cluvfy"
   tags: [grid_stage]
   block:
@@ -52,7 +65,7 @@
         group: oinstall
         mode: "0600"
       run_once: true          # only invoked on the node gridSetup.sh actually runs from — see below
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
 
     # --- Software staging: node 1 (the first host in rac_nodes) only ---
     # This matches real Oracle behavior, not just this project's staging choice: OUI
@@ -73,7 +86,7 @@
         group: oinstall
         mode: "0775"
       run_once: true
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
 
     - name: Extract Grid Infrastructure software into grid_home
       unarchive:
@@ -85,7 +98,7 @@
       args:
         creates: "{{ grid_home }}/gridSetup.sh"
       run_once: true
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
 
     # --- cvuqdisk: cluvfy's own prereq package, required on BOTH nodes ------------
     # PRVG-11550 : Package "cvuqdisk" is missing — see docs/known-risks.md #7. This
@@ -105,7 +118,7 @@
         dest: "/tmp/{{ cvuqdisk_rpm_filename }}"
         flat: true
       run_once: true
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
 
     - name: Stage the cvuqdisk RPM into this node's staging directory
       copy:
@@ -141,7 +154,8 @@
         path: "{{ gi_opatch_zip }}"
       register: gi_opatch_zip_stat
       run_once: true
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
+      when: gi_apply_ru
 
     - name: Fail with a clear message if the GI OPatch zip isn't staged yet
       fail:
@@ -149,10 +163,10 @@
           Expected {{ gi_opatch_zip }} — download OPatch (MOS patch 6880880) filtered to
           the Grid Infrastructure 19.0.0.0.0 release and place it there before this role
           can update OPatch ahead of -applyRU.
-      when: not gi_opatch_zip_stat.stat.exists
+      when: gi_apply_ru and not gi_opatch_zip_stat.stat.exists
       run_once: true
 
-    - name: Update OPatch in grid_home from MOS patch 6880880 (required before -applyRU, not part of the RU itself)
+    - name: "Update OPatch in grid_home from MOS patch 6880880 (required before -applyRU, not part of the RU itself — skipped entirely when gi_apply_ru is false, see known-risks.md #65)"
       unarchive:
         src: "{{ gi_opatch_zip }}"
         dest: "{{ grid_home }}"
@@ -163,9 +177,12 @@
       # one-time extraction into an empty home), re-running this should overwrite
       # OPatch/ every time in case gi_opatch_zip gets updated to a newer OPatch
       # later; unarchive's own checksum-diff behavior already keeps a no-op re-run
-      # cheap.
+      # cheap. gi_apply_ru is false for the standby cluster (group_vars/
+      # standby_nodes.yml) — its GI home is already patched, cloned from
+      # oradbserv05, and no OPatch/RU zip is staged on oradbserv09/10 at all.
       run_once: true
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
+      when: gi_apply_ru
 
     - name: Run cluvfy pre-crsinst sanity check (informational, non-fatal)
       # Fresh-install form, not the -upgrade -rolling -src_crshome/-dest_crshome
@@ -181,13 +198,13 @@
       become_user: "{{ grid_user }}"
       command: >
         {{ grid_home }}/runcluvfy.sh stage -pre crsinst
-        -n {{ groups['rac_nodes'] | join(',') }}
+        -n {{ (nodes | map(attribute='name') | list) | join(',') }}
         -verbose
       register: cluvfy_result
       changed_when: false
       failed_when: false
       run_once: true
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
 
     - name: Show cluvfy pre-crsinst output (review before proceeding to -applyRU)
       debug:
@@ -254,7 +271,7 @@
       changed_when: false
       failed_when: false
       run_once: true
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
 
     - name: Report Phase A status
       debug:
@@ -264,20 +281,58 @@
           phase_a_inventory_check.rc == 0 else 'not yet done — running gridSetup.sh now.' }}
       run_once: true
 
-    - name: "Run gridSetup.sh silently (software-only, CRS_SWONLY), patched via -applyRU"
+    # gridSetup.sh (launched from gi_node1) propagates the GI home to every OTHER
+    # node in the response file's clusterNodes list itself, over SSH equivalence —
+    # it does NOT merge into a non-empty target; INS-44002 ("The Oracle home
+    # location contains directories or files on following remote nodes") fires and
+    # silently drops that node from the cluster if it finds ANYTHING there,
+    # including hidden dotfiles/dot-directories that a plain `rm -rf path/*` won't
+    # remove (shell globbing doesn't match dotfiles) — confirmed against a real run
+    # on oradbserv10 that still failed after a manual cleanup that looked complete.
+    # See known-risks.md #67. Full rm+recreate here, not a wildcard clear, and only
+    # for nodes OTHER than the one launching gridSetup.sh — never touches gi_node1
+    # itself, and the phase_a_inventory_check guard above means this whole block
+    # (including this task) is skipped entirely once Phase A has actually
+    # succeeded, so it can never wipe an already-formed cluster's home.
+    # Split into two separate looped tasks, not a block+loop combo — `loop` is not
+    # a valid attribute for a Block in ansible-core (hit and documented once
+    # already this project, see the git history on gi_db_home_clone's own copy
+    # tasks); each `file:` task loops independently instead.
+    - name: "Remove {{ grid_home }} entirely on every node OTHER than {{ gi_node1 }} (clears hidden dotfiles too — a plain rm -rf path/* would not)"
+      become: true
+      delegate_to: "{{ item }}"
+      loop: "{{ (nodes | map(attribute='name') | list) | reject('equalto', gi_node1) | list }}"
+      when: phase_a_inventory_check.rc != 0
+      file:
+        path: "{{ grid_home }}"
+        state: absent
+
+    - name: "Recreate {{ grid_home }} empty on every node OTHER than {{ gi_node1 }}, owned grid:oinstall"
+      become: true
+      delegate_to: "{{ item }}"
+      loop: "{{ (nodes | map(attribute='name') | list) | reject('equalto', gi_node1) | list }}"
+      when: phase_a_inventory_check.rc != 0
+      file:
+        path: "{{ grid_home }}"
+        state: directory
+        owner: "{{ grid_user }}"
+        group: oinstall
+        mode: "0775"
+
+    - name: "Run gridSetup.sh silently (software-only, CRS_SWONLY) — patched via -applyRU when gi_apply_ru is true (fresh install), omitted for a cloned home that's already patched (see known-risks.md #65)"
       become: true
       become_user: "{{ grid_user }}"
       when: phase_a_inventory_check.rc != 0
       command: >
         {{ grid_home }}/gridSetup.sh -silent
-        -applyRU {{ gi_ru_patch_path }}
+        {{ ('-applyRU ' ~ gi_ru_patch_path) if gi_apply_ru else '' }}
         -responseFile {{ staging_dir }}/response-files/grid_install_swonly.rsp
         {{ '-ignorePrereq -ignoreSysPrereqs' if use_ignore_prereq else '' }}
       register: gridsetup_result
       failed_when: gridsetup_result.rc not in [0, 6]   # 6 = success with config actions pending (root scripts)
       changed_when: gridsetup_result.rc == 0
       run_once: true
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
 
     - name: Show gridSetup.sh output (contains the orainstRoot.sh/root.sh command sequence to run)
       debug:
@@ -290,8 +345,8 @@
         msg: >
           gridSetup.sh has laid down and patched the software on every node (CRS_SWONLY —
           no cluster configuration has happened yet). Now, in this exact order: run
-          orainstRoot.sh then root.sh on {{ hostvars[groups['rac_nodes'][0]].inventory_hostname }}
-          first, then the same two scripts on {{ hostvars[groups['rac_nodes'][1]].inventory_hostname }}.
+          orainstRoot.sh then root.sh on {{ hostvars[gi_node1].inventory_hostname }}
+          first, then the same two scripts on {{ hostvars[gi_node2].inventory_hostname }}.
           Do not run them concurrently on both nodes. In CRS_SWONLY mode these scripts
           register the central inventory and set ownership/permissions — they do NOT form
           the cluster yet (no CRS, no ASM). Once both nodes are done, re-run
@@ -344,7 +399,7 @@
         group: oinstall
         mode: "0600"          # contains SYSASM password
       run_once: true
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
 
     # --- IDEMPOTENCY GUARD: has Phase B already completed? ------------------------
     # `crsctl check crs` succeeding (rc 0) means CRS is fully up and configured —
@@ -364,7 +419,7 @@
       changed_when: false
       failed_when: false
       run_once: true
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
 
     - name: Report Phase B status
       debug:
@@ -386,7 +441,7 @@
       changed_when: configsh_result.rc == 0
       when: phase_b_crs_check.rc != 0
       run_once: true
-      delegate_to: "{{ groups['rac_nodes'][0] }}"
+      delegate_to: "{{ gi_node1 }}"
 
     - name: Show config.sh output (contains the root.sh command sequence that actually forms the cluster)
       debug:
@@ -398,8 +453,8 @@
       debug:
         msg: >
           config.sh has generated cluster configuration. Now, in this exact order: run
-          root.sh on {{ hostvars[groups['rac_nodes'][0]].inventory_hostname }} first, then
-          on {{ hostvars[groups['rac_nodes'][1]].inventory_hostname }}. Do not run them
+          root.sh on {{ hostvars[gi_node1].inventory_hostname }} first, then
+          on {{ hostvars[gi_node2].inventory_hostname }}. Do not run them
           concurrently. THIS is the root.sh run that actually forms the cluster (CRS,
           ASM instance, OCR/voting) — watch node 2's cluster-join output interactively the
           first time through, same reasoning as always for root scripts in this role. Once
@@ -426,78 +481,29 @@
       when: phase_b_crs_check.rc != 0
       run_once: true
 
-- name: "Storage: DATA02/RECO01 diskgroups + OCR multiplexing (requires the cluster already up)"
+- name: "Storage: RECO01 diskgroup (requires the cluster already up)"
   tags: [grid_storage]
   block:
     # gridSetup.sh's response file only creates DATA01 (needed to bring the cluster
-    # up at all — hosts OCR/voting). DATA02 and RECO01 both need the cluster already
-    # online, so they're created here via asmca instead — re-run
-    # --tags grid_infrastructure (or just --tags grid_storage, once the cluster is
-    # confirmed up) once root.sh/resume is done; every task below is idempotent and
-    # skips whichever diskgroup/OCR location already exists.
-
-    - name: Check whether DATA02 diskgroup already exists (idempotency)
-      become: true
-      become_user: "{{ grid_user }}"
-      command: "{{ grid_home }}/bin/asmcmd lsdg {{ asm_diskgroup_data02 }}"
-      register: data02_check
-      changed_when: false
-      failed_when: false
-      run_once: true
-
-    - name: Create the DATA02 diskgroup via asmca (only if it doesn't exist yet and the cluster is up)
-      become: true
-      become_user: "{{ grid_user }}"
-      command: >
-        {{ grid_home }}/bin/asmca -silent -createDiskGroup
-        -diskGroupName {{ asm_diskgroup_data02 }}
-        -redundancy {{ asm_redundancy }}
-        {% for d in asm_diskgroup_data02_disks %}-disk '/dev/disk/by-label/{{ d }}' {% endfor %}
-      when: data02_check.rc != 0
-      register: data02_create
-      run_once: true
-
-    - name: Show DATA02 diskgroup creation output
-      debug:
-        var: data02_create.stdout_lines
-      when: data02_check.rc != 0
-      run_once: true
-
-    # --- OCR multiplexing to DATA02 -------------------------------------------
-    # Real OCR redundancy (up to 5 locations, `ocrconfig -add`/`-delete`) — NOT the
-    # same thing as voting-disk redundancy, which can't span diskgroups this way
-    # (see the voting-disk comment block in group_vars/all.yml). DATA01 already
-    # holds the primary OCR copy automatically (set at install time via the
-    # response file); this adds a second, independent copy in DATA02 now that it
-    # exists. Requires the diskgroup to already exist, so this has to run after
-    # DATA02 creation above, not before.
-
-    - name: Check current OCR configuration (idempotency)
-      become: true
-      command: "{{ grid_home }}/bin/ocrcheck"
-      register: ocrcheck_before
-      changed_when: false
-      failed_when: false
-      run_once: true
-
-    - name: Multiplex OCR to DATA02 (only if it isn't already configured there)
-      become: true
-      command: "{{ grid_home }}/bin/ocrconfig -add +{{ asm_diskgroup_data02 }}"
-      when: "('+' ~ asm_diskgroup_data02) not in ocrcheck_before.stdout"
-      register: ocr_add_result
-      run_once: true
-
-    - name: Show OCR configuration after multiplexing
-      become: true
-      command: "{{ grid_home }}/bin/ocrcheck"
-      register: ocrcheck_after
-      changed_when: false
-      run_once: true
-
-    - name: Show OCR configuration (confirm both +DATA01 and +DATA02 are listed)
-      debug:
-        var: ocrcheck_after.stdout_lines
-      run_once: true
+    # up at all — hosts OCR/voting). RECO01 needs the cluster already online, so
+    # it's created here via asmca instead — re-run --tags grid_infrastructure (or
+    # just --tags grid_storage, once the cluster is confirmed up) once root.sh/
+    # resume is done; every task below is idempotent and skips whichever
+    # diskgroup already exists.
+    #
+    # THERE IS NO DATA02 IN THIS PROJECT'S DESIGN — confirmed directly by James
+    # (see docs/known-risks.md #75), and consistent with earlier real evidence
+    # already in this doc: a real `kfod` listing on usatclust1 showed DATA02
+    # never existed there either (known-risks.md's cloning-diagnosis entry).
+    # The disk previously earmarked for DATA02 (ASMDISK04/SASMDISK4) now goes to
+    # RECO01 instead: RECO01 is DATA01's remaining disks (04/05/06 on usatclust1,
+    # SASMDISK4/5/6 on usatclust2), not just 05/06. group_vars/all.yml and
+    # group_vars/standby_nodes.yml's asm_diskgroup_reco_disks reflect this; the
+    # DATA02 creation + OCR-multiplex-to-DATA02 tasks that used to be here are
+    # removed, not just skipped — there is no DATA02 target to multiplex OCR
+    # into. OCR still gets its multiplexed second copy from DATA01's own NORMAL
+    # redundancy (3 failure groups) — that's a property of DATA01 itself, not
+    # something this project's OCR needed a second diskgroup for.
 
     - name: Check whether RECO01 diskgroup already exists (idempotency)
       become: true
@@ -508,16 +514,72 @@
       failed_when: false
       run_once: true
 
-    - name: Create the RECO01 diskgroup via asmca (only if it doesn't exist yet and the cluster is up)
+    # known-risks.md #110: asm_redundancy changed from EXTERNAL to NORMAL —
+    # the underlying .vdi disks really are on separate physical drives, so
+    # ASM mirroring provides genuine protection here, the same as DATA01
+    # already relies on. NORMAL redundancy needs one FAILGROUP per disk for
+    # real 2-way-mirror protection (same pattern DATA01 uses via
+    # grid_install.rsp.j2's disksWithFailureGroupNames, FG_<label> per disk).
+    #
+    # Switched from asmca -createDiskGroup to a real CREATE DISKGROUP SQL
+    # statement here (previously used asmca's -disk/-redundancy flags, which
+    # was fine for EXTERNAL — no failure groups needed there at all). asmca's
+    # own documented CLI syntax (Oracle 19c ASMCA Command-Line Interface
+    # reference) only shows -failuregroup as an option under -diskList mode,
+    # not per repeated -disk entries, and does not clearly document assigning
+    # a DIFFERENT failure group to each of several disks in one invocation —
+    # not verified/reliable enough to guess at for a NORMAL-redundancy
+    # diskgroup. Plain SQL CREATE DISKGROUP's FAILGROUP clause is
+    # unambiguous and well-documented, so used directly instead, run via
+    # sqlplus / as sysasm against the local +ASM instance — same file-then-
+    # execute pattern the Data Guard roles use for SQL. compatible.asm/
+    # compatible.rdbms/au_size values match DATA01's own real, confirmed
+    # attributes exactly (queried directly via asmcmd lsattr, not assumed).
+    - name: "Ensure {{ staging_dir }}/sql exists (this role runs before any Data Guard role would have created it)"
       become: true
       become_user: "{{ grid_user }}"
-      command: >
-        {{ grid_home }}/bin/asmca -silent -createDiskGroup
-        -diskGroupName {{ asm_diskgroup_reco }}
-        -redundancy {{ asm_redundancy }}
-        {% for d in asm_diskgroup_reco_disks %}-disk '/dev/disk/by-label/{{ d }}' {% endfor %}
+      file:
+        path: "{{ staging_dir }}/sql"
+        state: directory
+        owner: "{{ grid_user }}"
+        group: oinstall
+        mode: "0750"
+      when: reco_check.rc != 0
+      run_once: true
+
+    - name: "Write SQL script: create RECO01 with NORMAL redundancy, one failure group per disk"
+      become: true
+      become_user: "{{ grid_user }}"
+      copy:
+        dest: "{{ staging_dir }}/sql/create_reco01.sql"
+        owner: "{{ grid_user }}"
+        group: oinstall
+        mode: "0640"
+        content: |
+          set echo on
+          CREATE DISKGROUP {{ asm_diskgroup_reco }} {{ asm_redundancy }} REDUNDANCY
+          {% for d in asm_diskgroup_reco_disks %}  FAILGROUP FG_{{ d }} DISK '/dev/oracleasm/disks/{{ d }}'{% if not loop.last %}
+          {% endif %}{% endfor %}
+
+            ATTRIBUTE 'au_size'='4M', 'compatible.asm'='19.0.0.0.0', 'compatible.rdbms'='10.1.0.0.0';
+          exit;
+      when: reco_check.rc != 0
+      run_once: true
+
+    - name: "Create the RECO01 diskgroup (only if it doesn't exist yet and the cluster is up)"
+      become: true
+      become_user: "{{ grid_user }}"
+      shell: |
+        export ORACLE_HOME={{ grid_home }}
+        export ORACLE_SID=+ASM1
+        {{ grid_home }}/bin/sqlplus / as sysasm @{{ staging_dir }}/sql/create_reco01.sql
       when: reco_check.rc != 0
       register: reco_create
+      changed_when: "'DISKGROUP CREATED' in reco_create.stdout | upper"
+      failed_when: >
+        reco_create.rc != 0 or
+        'DISKGROUP CREATED' not in reco_create.stdout | upper or
+        'ORA-' in reco_create.stdout
       run_once: true
 
     - name: Show RECO01 diskgroup creation output

@@ -10,7 +10,38 @@
 - name: "Bootstrap: ensure /usr/bin/python3 exists before any module-based task runs — OL7 ships Python 2.7 by default, not 3 (see docs/known-risks.md #17)"
   hosts: rac_nodes
   gather_facts: no
-  tags: [always]
+  # Deliberately NOT tags: [always] — that special tag fires this play on EVERY
+  # ansible-playbook invocation regardless of --tags, including runs scoped entirely
+  # to standby_nodes. James flagged this directly: a `--tags standby_asmlib_disks`
+  # run had no business touching oradbserv05/06 at all, and it was (harmlessly, but
+  # needlessly — oradbserv05 is live, hosting apexdb). Listed explicitly instead:
+  # every tag below that actually targets rac_nodes and needs python3 present first.
+  # See docs/known-risks.md #55.
+  # dataguard_duplicate/dataguard_convert_rac added here (audit finding,
+  # known-risks.md #117): both now delegate password-file tasks
+  # (asmcmd pwget/pwcopy — #116) to groups['rac_node1'][0] (oradbserv05, a
+  # rac_nodes host), same as dataguard_primary_prep/dataguard_net_config/
+  # dataguard_standby_prep already did — needed for the same reason those
+  # were already listed. In practice oradbserv05 always already has
+  # python3 by the time either of these phases is reached (it's installed
+  # in Phase 0 and never removed), so this was low real risk, but explicit
+  # is correct for this project's own stated tag-independence principle.
+  # dataguard_srl_cleanup added for the same reason (known-risks.md #118)
+  # — its ORA-00261 log-switch remedy delegates to every rac_nodes host.
+  # dataguard_role_services added for the same reason again (known-risks.md
+  # #136) — it delegates the primary-side add/start/stop tasks to
+  # groups['rac_node1'][0] (oradbserv05).
+  # dataguard_broker added for the same reason again (Phase 7) — it
+  # delegates its primary-side ASM/SQL*Plus/DGMGRL tasks to
+  # groups['rac_node1'][0] the same way dataguard_role_services does.
+  # dataguard_switchover_test added for the same reason again — it's the
+  # standalone switchover-test role extracted out of dataguard_broker
+  # (known-risks.md #137's update), delegates its SHOW CONFIGURATION/
+  # SWITCHOVER/verification tasks to groups['rac_node1'][0] the same way.
+  # dataguard_fsfo/dataguard_fsfo_test added for the same reason again
+  # (Phase 9) — ENABLE FAST_START FAILOVER and FastStartFailoverThreshold
+  # are issued from groups['rac_node1'][0], same delegation pattern.
+  tags: [os_prep, verify_baseline, dns_bind, chrony, asmlib_disks, ssh_equivalence, patch_before_config, grid_infrastructure, db_software, dbca_noncdb, dataguard_primary_prep, dataguard_net_config, dataguard_standby_prep, dataguard_duplicate, dataguard_convert_rac, dataguard_srl_cleanup, dataguard_role_services, dataguard_broker, dataguard_switchover_test, dataguard_fsfo, dataguard_fsfo_test]
   tasks:
     - name: Check for /usr/bin/python3
       raw: test -e /usr/bin/python3
@@ -88,3 +119,358 @@
   tags: [dbca_noncdb]
   roles:
     - dbca_noncdb
+
+# --- Data Guard build (Phase 2 continued) — Phase 1 of the uploaded SOP -----------
+# (standby_dataguard_creation.txt): prepare the PRIMARY database before any
+# standby-side work. See roles/dataguard_primary_prep and docs/known-risks.md #76.
+- name: "Data Guard Phase 1 — prepare the primary database (apexdb) for standby creation"
+  hosts: rac_node1
+  tags: [dataguard_primary_prep]
+  roles:
+    - dataguard_primary_prep
+
+# --- Phase 2: Data Guard standby (usatclust2, oradbserv09/10) — OS baseline steps -
+# Mirrors the rac_nodes plays above exactly (same roles, reused as-is), pointed at
+# standby_nodes instead. group_vars/standby_nodes.yml redirects nodes/scan_name/
+# scan_ips/cluster_name to the standby_* values for any host in this group — see that
+# file's header comment for why paths/OS users/disk layout are deliberately shared,
+# not overridden.
+#
+# dns_bind is the one exception to "shared, not overridden" — usatclust1 and
+# usatclust2 are genuinely independent clusters, so DNS is independent too:
+# --tags standby_dns_bind below gives oradbserv09/10 their OWN standalone BIND
+# primary/secondary pair (group_vars/standby_nodes.yml now redirects dns_master/
+# dns_secondary/dns_master_ip too), not a shared lab-wide nameserver. Same role,
+# same code as --tags dns_bind — cluster-agnostic, just pointed at a different
+# group. See docs/known-risks.md #59.
+- name: "Bootstrap: ensure /usr/bin/python3 exists on standby nodes (same reasoning as the rac_nodes bootstrap play above)"
+  hosts: standby_nodes
+  gather_facts: no
+  # Same fix, same reason — see the rac_nodes bootstrap play's comment above and
+  # docs/known-risks.md #55. Listed explicitly: every tag that actually targets
+  # standby_nodes. dataguard_broker added (Phase 7) — delegates its
+  # standby-side ASM/SQL*Plus tasks to groups['standby_nodes'][0].
+  # dataguard_switchover_test added for the same reason — its srvctl
+  # service-status verification delegates to groups['standby_nodes'][0].
+  # dataguard_fsfo added for the same reason again (Phase 9) — its
+  # Flashback Database check/enable tasks delegate to
+  # groups['standby_nodes'][0] (oradbserv09). dataguard_fsfo_test listed
+  # pre-emptively (role not built yet) since a real induced-failover test
+  # will almost certainly need to verify apexdb_stby's role from its own
+  # node too — harmless if unused today, one less edit to remember later.
+  tags: [standby_os_prep, standby_verify_baseline, standby_dns_bind, standby_ssh_equivalence, standby_asmlib_disks, standby_chrony, gi_db_home_clone, standby_grid_infrastructure, dataguard_net_config, dataguard_standby_prep, dataguard_duplicate, dataguard_convert_rac, dataguard_srl_cleanup, dataguard_role_services, dataguard_broker, dataguard_switchover_test, dataguard_fsfo, dataguard_fsfo_test]
+  tasks:
+    - name: Check for /usr/bin/python3
+      raw: test -e /usr/bin/python3
+      register: python3_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install python3 (raw — no Python needed on the target for this module to run)
+      raw: yum install -y python3
+      when: python3_check.rc != 0
+
+- name: "OS baseline on standby nodes (oradbserv09/10) — same os_prep role as usatclust1, group_vars/standby_nodes.yml redirects nodes/etc."
+  hosts: standby_nodes
+  tags: [standby_os_prep]
+  roles:
+    - os_prep
+
+- name: "Verify standby nodes' baseline matches os_prep's output"
+  hosts: standby_nodes
+  tags: [standby_verify_baseline]
+  roles:
+    - verify_baseline
+
+# DNS — independent BIND primary/secondary for usatclust2, own zone, own records
+# only (no cross-cluster lookups via DNS — /etc/hosts, already rendered by
+# standby_os_prep, covers that). One command, no dependency on the rac_nodes dns_bind
+# play at all. Position matches installation/README.md's own order (os_prep -> DNS
+# -> chrony -> ASMLib -> SSH equivalence -> software staging). See
+# docs/known-risks.md #57 (ordering) and #59 (independent-per-cluster DNS design).
+- name: "DNS — independent BIND primary (oradbserv09) / secondary (oradbserv10) for usatclust2"
+  hosts: standby_nodes
+  tags: [standby_dns_bind]
+  roles:
+    - dns_bind
+
+# Same chrony role as rac_nodes, unmodified — its client branch (`when:
+# inventory_hostname != chrony_master_hostname`) already generalizes to any node
+# that isn't oemserver01, no standby-specific variable redirection needed.
+- name: "Time sync — oradbserv09/10 as clients of the same oemserver01 time master as usatclust1"
+  hosts: standby_nodes
+  tags: [standby_chrony]
+  roles:
+    - chrony
+
+- name: "ASMLib — configure + mark oradbserv09/10's own shared disks (separate .vdi disks from usatclust1, already created)"
+  hosts: standby_nodes
+  tags: [standby_asmlib_disks]
+  roles:
+    - asmlib_disks
+
+# SSH equivalence deliberately LAST in the prep sequence — matching
+# installation/README.md Section 9a's own position (right before software
+# staging/install), since it's the one prerequisite that's actually FOR the
+# upcoming Oracle-software step (gi_db_home_clone's fetch/copy, and later
+# gridSetup.sh's own node propagation), not a general OS-readiness item like the
+# three plays above it.
+- name: "SSH equivalence for grid/oracle across oradbserv09/10 (required before gi_db_home_clone's fetch/copy steps and later gridSetup.sh)"
+  hosts: standby_nodes
+  tags: [standby_ssh_equivalence]
+  roles:
+    - ssh_equivalence
+
+# --- Phase 2: Data Guard standby (usatclust2, oradbserv09/10) — Oracle Home clone --
+# Clones the already-installed, already-patched GI 19c + DB 12.2.0.1 Oracle Homes
+# from oradbserv05 (usatclust1, primary) onto oradbserv09/oradbserv10 — skips
+# re-running the silent install + RU/OJVM patch cycle. Does NOT form a cluster or
+# touch usatclust1 — see roles/gi_db_home_clone/tasks/main.yml for the documented
+# procedure (Oracle's own "Creating a Cluster by Cloning Oracle Clusterware", ch. 7
+# of the 19c Clusterware Administration and Deployment Guide). Every task in this
+# role uses delegate_to (clone_source_node / clone_target_nodes) — nothing actually
+# runs against localhost itself, so this play deliberately does NOT set
+# `connection: local`: that keyword, if set explicitly at the play level, pins
+# EVERY task in the play to a local connection, including delegated ones — it does
+# not get overridden by delegate_to per task. That was a real bug (not just
+# theoretical): every attempt to run this role failed at the connection/become layer
+# against oradbserv05 (`sudo: a password is required`, ACL chmod errors, generic
+# MODULE FAILURE) because Ansible was actually trying to escalate privileges on the
+# WSL2 control node, never actually reaching oradbserv05 at all — see
+# known-risks.md #48's third update. `hosts: localhost` alone (no explicit
+# `connection:`) is enough for a control-node-only play; delegate_to still resolves
+# each task's real connection from inventory correctly without it.
+- name: "Data Guard standby prep: clone GI + DB Oracle Homes from oradbserv05 onto oradbserv09/10"
+  hosts: localhost
+  gather_facts: no
+  tags: [gi_db_home_clone]
+  vars:
+    clone_source_node: oradbserv05
+    clone_target_nodes: "{{ groups['standby_nodes'] }}"
+  roles:
+    - gi_db_home_clone
+
+# --- Phase 2: Data Guard standby (usatclust2, oradbserv09/10) — configure the cluster ---
+# Reuses grid_silent_install AS-IS (same role usatclust1 uses) — made cluster-agnostic
+# (nodes-based node1/node2 resolution, not hardcoded groups['rac_nodes']) specifically
+# for this reuse. Confirmed against Oracle's current 19c Clusterware Administration and
+# Deployment Guide, "Creating a Cluster by Cloning Oracle Clusterware": for standing up
+# a NEW cluster from a clone (not adding a node to an EXISTING one — a different,
+# clone.pl-based procedure, and clone.pl is deprecated as of 19c regardless), Oracle's
+# own documented step is simply to run gridSetup.sh normally — silent or interactive —
+# against the already-deployed home, exactly like a fresh install. No clone.pl, no
+# -attachHome equivalent for the GI home specifically (gi_db_home_clone deliberately
+# left it unregistered for exactly this reason).
+#
+# The one real difference from usatclust1's fresh-media install: gi_apply_ru is false
+# for standby_nodes (group_vars/standby_nodes.yml) — the cloned home is already patched
+# (tarred from oradbserv05's post-RU home), so Phase A's gridSetup.sh call omits
+# -applyRU entirely, and the OPatch-update tasks are skipped outright (no RU/OPatch zip
+# is staged on oradbserv09/10 — there's nothing to patch with). Software extraction
+# itself is also a no-op here (its own `creates: {{ grid_home }}/gridSetup.sh` guard
+# sees the cloned binaries already in place) — nothing about the staging stage needed
+# to change for that. See docs/known-risks.md #65.
+- name: "Grid Infrastructure for usatclust2 — configure the cluster against the already-cloned GI home (Phase A registration, Phase B configuration, storage — same grid_silent_install role usatclust1 uses)"
+  hosts: standby_nodes
+  tags: [standby_grid_infrastructure]
+  roles:
+    - grid_silent_install
+
+# --- Data Guard Phase 2 — Oracle Net configuration (both clusters) ---------------
+# SOP section 6 (standby_dataguard_creation.txt): TNS aliases for redo transport +
+# static _DGMGRL listener entries required for Broker. Runs against dg_db_nodes
+# (rac_nodes + standby_nodes together, see inventory/hosts.ini) — the one Data
+# Guard role that genuinely needs both clusters in the same play, since every node
+# needs to see both clusters' SCAN aliases. See roles/dataguard_net_config and
+# docs/known-risks.md #76 for the apexdb/apexdb_stby naming decision this reuses.
+- name: "Data Guard Phase 2 — Oracle Net configuration (TNS aliases + static _DGMGRL listener entries, all 4 DB nodes)"
+  hosts: dg_db_nodes
+  tags: [dataguard_net_config]
+  roles:
+    - dataguard_net_config
+
+# --- Data Guard Phase 3 — Prepare the standby host (oradbserv09) -----------------
+# SOP section 7: pfile from the primary's spfile (edited: RAC/primary-instance
+# params stripped, cluster_database=false), the primary's real password file
+# copied into the standby's ASM, and the apexdb1 auxiliary instance started in
+# NOMOUNT — everything RMAN DUPLICATE (Phase 4) needs as its AUXILIARY target.
+# hosts: localhost + delegate_to per task, same pattern as gi_db_home_clone
+# (deliberately no `connection: local` at the play level — see that role's
+# comment and docs/known-risks.md #48's third update for why that breaks
+# delegate_to). Only oradbserv09 is touched — RMAN DUPLICATE creates a
+# single-instance standby first; Phase 6 converts it to RAC afterward.
+- name: "Data Guard Phase 3 — prepare the standby host (oradbserv09) for RMAN DUPLICATE"
+  hosts: localhost
+  gather_facts: no
+  tags: [dataguard_standby_prep]
+  vars:
+    dg_standby_prep_primary_node: "{{ groups['rac_node1'][0] }}"
+    dg_standby_prep_target: "{{ groups['standby_nodes'][0] }}"
+    dg_standby_prep_local_dir: "/tmp/dataguard_standby_prep"
+    dg_standby_prep_local_pfile: "/tmp/dataguard_standby_prep/initapexdb.ora"
+  roles:
+    - dataguard_standby_prep
+
+# --- Data Guard Phase 4 — RMAN DUPLICATE ... FOR STANDBY FROM ACTIVE DATABASE ---
+# SOP section 8. Runs entirely on oradbserv09 (standby_node1) — no
+# localhost/delegate_to needed here, unlike Phase 3, since RMAN itself
+# connects TARGET/AUXILIARY outbound over TNS (apexdb/apexdb_stby, the
+# real aliases Phase 2 built) rather than needing files staged across
+# hosts. See roles/dataguard_duplicate for the full adaptation notes
+# (diskgroup names, dropped PARAMETER_VALUE_CONVERT, apexdb-keyed broker
+# config paths — all confirmed directly with James) and docs/known-risks.md
+# #101.
+- name: "Data Guard Phase 4 — RMAN DUPLICATE FOR STANDBY FROM ACTIVE DATABASE"
+  hosts: standby_node1
+  gather_facts: no
+  tags: [dataguard_duplicate]
+  vars:
+    # Control-node staging path for the copy-from-primary password file
+    # method (known-risks.md #116) — same naming convention as
+    # dataguard_standby_prep's own dg_standby_prep_local_dir.
+    dg_duplicate_local_dir: "/tmp/dataguard_duplicate"
+  roles:
+    - dataguard_duplicate
+
+# --- Data Guard Phase 5 — remove the multiplexed +DATA01 standby redo log ------
+# member on apexdb_stby, run only after Phase 4 has been confirmed working
+# (managed recovery applying, transport lag healthy). hosts: standby_node1,
+# same as dataguard_duplicate — v$logfile/v$standby_log read from the shared
+# standby control file, so oradbserv09 alone is sufficient regardless of which
+# standby instance is up; the role delegates to both primary nodes internally
+# only for the ORA-00261 log-switch remedy. Deliberately sequenced before
+# Phase 6 (RAC conversion) — this is basic Data Guard hygiene on the
+# single-instance standby DUPLICATE just created, not something that needs
+# CRS registration first. See roles/dataguard_srl_cleanup for the full
+# procedure and docs/known-risks.md #118 for why apexdb_stby's SRLs ended up
+# multiplexed in the first place.
+- name: "Data Guard Phase 5 — remove the multiplexed +DATA01 standby redo log member on apexdb_stby"
+  hosts: standby_node1
+  gather_facts: no
+  tags: [dataguard_srl_cleanup]
+  vars:
+    # Control-node staging path for the generated DROP statements, same
+    # convention as every other phase's own local dir.
+    dg_srl_cleanup_local_dir: "/tmp/dataguard_srl_cleanup"
+  roles:
+    - dataguard_srl_cleanup
+
+# --- Data Guard Phase 6 — convert the single-instance standby to RAC ------------
+# Registers apexdb_stby with CRS (already a 2-node GI cluster since Section 9 —
+# this does NOT install clusterware) and adds the second instance, apexdb2, on
+# oradbserv10. hosts: localhost + delegate_to per task, same pattern as
+# dataguard_standby_prep/gi_db_home_clone — this role genuinely coordinates two
+# different standby nodes in sequence. See roles/dataguard_convert_rac for the
+# full procedure and docs/known-risks.md #114 for the design decisions.
+- name: "Data Guard Phase 6 — convert the single-instance standby (apexdb_stby) to a 2-node RAC standby"
+  hosts: localhost
+  gather_facts: no
+  tags: [dataguard_convert_rac]
+  vars:
+    dg_convert_rac_node1: "{{ groups['standby_nodes'][0] }}"
+    dg_convert_rac_node2: "{{ groups['standby_nodes'][1] }}"
+    # Control-node staging path for the copy-from-primary password file
+    # method (known-risks.md #116), same convention as
+    # dataguard_standby_prep/dataguard_duplicate's own local dirs.
+    dg_convert_rac_local_dir: "/tmp/dataguard_convert_rac"
+  roles:
+    - dataguard_convert_rac
+
+# --- Data Guard Phase 8 — role-based services (apexdb_rw / apexdb_ro) -----------
+# Built ahead of Phase 7 (Broker, not yet built) on purpose — James's own call,
+# since these srvctl commands are self-contained and don't need Broker to exist
+# to register/start correctly today. hosts: localhost + delegate_to per
+# database (one delegates to rac_node1, the other to standby_nodes[0]), same
+# pattern as dataguard_convert_rac/dataguard_net_config — this role genuinely
+# touches both clusters. See roles/dataguard_role_services and
+# docs/known-risks.md #136 for the full design (including why the database's
+# role is queried live via SQL rather than assumed, and what Phase 7 still
+# adds on top of this).
+- name: "Data Guard Phase 8 — role-based services (apexdb_rw / apexdb_ro) on both apexdb and apexdb_stby"
+  hosts: localhost
+  gather_facts: no
+  tags: [dataguard_role_services]
+  roles:
+    - dataguard_role_services
+
+# --- Data Guard Phase 7 — Broker configuration -----------------------------
+# Numbered lower than Phase 8 but built and run after it — James's own call,
+# documented in dataguard_role_services' own header (Phase 8's srvctl
+# commands were self-contained and didn't need Broker to exist yet). Phase 7
+# is what finally gives this lab automatic apexdb_rw/apexdb_ro role-flip
+# during a real switchover/failover. hosts: localhost + delegate_to per
+# database, same pattern as dataguard_convert_rac/dataguard_role_services.
+# Prerequisite: dataguard_net_config must have been re-run (--tags
+# dataguard_net_config) since it picked up the apexdb_DGMGRL/
+# apexdb_stby_DGMGRL TNS alias rename and the static _DGMGRL listener entry
+# — this role's DGMGRL connections depend on both. See
+# roles/dataguard_broker and docs/known-risks.md #137.
+#
+# Switchover test lives in its own standalone role/play below
+# (dataguard_switchover_test) — NOT a flag on this play. A real switchover
+# is genuinely disruptive and has no business being reachable via a stray
+# `-e` flag on this role's normal idempotent re-run path.
+- name: "Data Guard Phase 7 — Data Guard Broker configuration (apexdb / apexdb_stby, MaxAvailability)"
+  hosts: localhost
+  gather_facts: no
+  tags: [dataguard_broker]
+  roles:
+    - dataguard_broker
+
+# --- Data Guard Broker — switchover test (standalone, not part of Phase 7) ------
+# Extracted out of dataguard_broker (known-risks.md #137's update) after James
+# found the old flag-gated inline block silently skipping every task because
+# `-e dg_broker_test_switchover=true` wasn't set on a normal Phase 7 re-run —
+# an easy thing to forget on a command line, and not something that should be
+# reachable that way regardless. Invoke deliberately, on its own:
+# --tags dataguard_switchover_test. hosts: localhost + delegate_to per
+# database, same pattern as dataguard_broker/dataguard_role_services.
+# Direction-agnostic (queries SHOW CONFIGURATION first, switches over
+# whichever database is currently standby) — re-running this same play
+# switches back. See roles/dataguard_switchover_test for the full procedure.
+- name: "Data Guard Broker — switchover test (direction-agnostic; re-run to switch back)"
+  hosts: localhost
+  gather_facts: no
+  tags: [dataguard_switchover_test]
+  roles:
+    - dataguard_switchover_test
+
+# --- Data Guard Phase 9 — Fast-Start Failover and Observer (oemserver01) --------
+# oemserver01 is a pre-existing OEM 13.5 VM, never previously under this project's
+# Ansible management (see inventory/hosts.ini's [observer_nodes] comment and
+# [time_master]'s original "not otherwise managed by this phase" note) — first
+# real use of it as an Ansible target, so it needs its own python3 bootstrap,
+# same OL7-ships-Python-2-not-3 reasoning as the rac_nodes/standby_nodes plays
+# above (docs/known-risks.md #17), confirmed live: a first `-m ping` against
+# oemserver01 failed with `/bin/sh: /usr/bin/python3: No such file or directory`.
+- name: "Bootstrap: ensure /usr/bin/python3 exists on the observer host (same reasoning as the rac_nodes/standby_nodes bootstrap plays above)"
+  hosts: observer_nodes
+  gather_facts: no
+  tags: [dataguard_fsfo, dataguard_fsfo_test]
+  tasks:
+    - name: Check for /usr/bin/python3
+      raw: test -e /usr/bin/python3
+      register: python3_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install python3 (raw — no Python needed on the target for this module to run)
+      raw: yum install -y python3
+      when: python3_check.rc != 0
+
+# --- Data Guard Phase 9 — Fast-Start Failover and Observer (continued) ----------
+# hosts: localhost + delegate_to per host (rac_node1, standby_node1,
+# observer_nodes) — genuinely coordinates three hosts in one play, same
+# pattern as every other Data Guard phase above. Requires: Phase 7 (Broker)
+# confirmed working (known-risks.md #137), oemserver01 bootstrapped just
+# above, and the manual ansible-user SSH bootstrap documented in
+# docs/ansible-on-windows.md #4 already done there (one-time, not
+# Ansible-managed — nothing can SSH in as `ansible` before the account and
+# key exist). See roles/dataguard_fsfo for the full procedure, including the
+# Flashback Database gap this role also closes on apexdb_stby.
+- name: "Data Guard Phase 9 — Fast-Start Failover and Observer (oemserver01)"
+  hosts: localhost
+  gather_facts: no
+  tags: [dataguard_fsfo]
+  roles:
+    - dataguard_fsfo

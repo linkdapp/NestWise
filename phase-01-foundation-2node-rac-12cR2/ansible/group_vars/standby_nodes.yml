@@ -1,0 +1,104 @@
+---
+# Group-scoped override for the standby_nodes inventory group (oradbserv09/10,
+# usatclust2, Phase 2 Data Guard target). Ansible auto-loads group_vars/<group>.yml
+# for any host in that inventory group — this file only takes effect for plays whose
+# hosts: pattern includes standby_nodes, and has zero effect on rac_nodes.
+#
+# Why so few overrides: os_prep/verify_baseline/ssh_equivalence/asmlib_disks build an
+# IDENTICAL architecture on oradbserv09/10 as on oradbserv05/06 (same OFA paths, same
+# oracle/grid OS users and UID/GID scheme, same /u01 device convention, same ASMLib
+# disk device naming) — that sameness is what makes GI/DB Oracle Home cloning valid
+# later (see roles/gi_db_home_clone). Only genuinely per-cluster identity is
+# redirected here; see known-risks.md #47.
+
+nodes: "{{ standby_nodes }}"
+scan_name: "{{ standby_scan_name }}"
+scan_ips: "{{ standby_scan_ips }}"
+cluster_name: "{{ standby_cluster_name }}"
+
+# Which node marks the shared ASM disks for THIS cluster — oradbserv09, not
+# oradbserv05 (dns_master, the default in group_vars/all.yml). Without this override,
+# roles/asmlib_disks silently marked zero disks on usatclust2: its `when:` gate used
+# to check inventory_hostname == dns_master directly, which is never true for any
+# standby_nodes host. See known-risks.md #52.
+asm_marking_node: "{{ standby_nodes[0].name }}"
+
+# usatclust1 and usatclust2 are genuinely independent clusters (separate OCR/voting,
+# separate storage, separate everything) — DNS follows the same principle now, not a
+# shared lab-wide service. oradbserv09 is THIS cluster's own primary nameserver,
+# oradbserv10 its own secondary; roles/dns_bind is unchanged code, just pointed at a
+# different pair via these three variables, exactly like asm_marking_node above —
+# the role itself doesn't know or care which cluster it's serving. See
+# known-risks.md #59 (this reverses #56/#58's earlier "one shared BIND pair for the
+# whole lab" design, which James asked to change).
+dns_master: "{{ standby_nodes[0].name }}"
+dns_secondary: "{{ standby_nodes[1].name }}"
+dns_master_ip: "{{ standby_nodes[0].public_ip }}"
+
+# usatclust2's GI home arrives via gi_db_home_clone (tar/untar from oradbserv05's
+# ALREADY-patched home), not a fresh install from base media — grid_silent_install's
+# Phase A has no RU to apply and no OPatch/RU zip staged on oradbserv09/10 at all.
+# See group_vars/all.yml's own comment on gi_apply_ru and known-risks.md #65.
+gi_apply_ru: false
+
+# usatclust2's ASM disks use a distinct "SASMDISK" label convention, not
+# usatclust1's "ASMDISK" — confirmed directly (James). Device order/paths are
+# unchanged from group_vars/all.yml's own asmlib_disks list (confirmed against
+# oradbserv09's real device mapping earlier this session: ASMDISK01 ->
+# /dev/sdd1, ASMDISK02 -> /dev/sde1, and so on in the same order) — only the
+# LABEL text changes, not which physical device each position refers to.
+# SASMDISK4-6 go to RECO01 — TWO diskgroups only (DATA01 + RECO01), no DATA02.
+# James confirmed both the SASMDISK naming and this exact split directly:
+# DATA01(SASMDISK1/SASMDISK2/SASMDISK3), RECO01(SASMDISK4/SASMDISK5/SASMDISK6).
+# See docs/known-risks.md #75 (also corrects group_vars/all.yml's usatclust1
+# disk split the same way — RECO01 there is now 04/05/06, not just 05/06).
+asmlib_disks:
+  - { label: SASMDISK1, device: /dev/sdd }
+  - { label: SASMDISK2, device: /dev/sde }
+  - { label: SASMDISK3, device: /dev/sdf }
+  - { label: SASMDISK4, device: /dev/sdg }
+  - { label: SASMDISK5, device: /dev/sdh }
+  - { label: SASMDISK6, device: /dev/sdi }
+asm_diskgroup_data_disks: [SASMDISK1, SASMDISK2, SASMDISK3]
+asm_diskgroup_reco_disks: [SASMDISK4, SASMDISK5, SASMDISK6]
+
+# oradbserv09/10's disks were already createdisk'd under the OLD ASMDISK0N
+# labels (Phase A ASM disk marking + verification, confirmed earlier this
+# session) before the SASMDISK convention above was settled. asmlib_disks'
+# own free-disk safety checks (known-risks.md #5) would refuse to createdisk
+# over an already-labeled device, so simply changing the labels above isn't
+# enough on its own — asmlib_disks/tasks/main.yml uses this list to run a
+# one-time, idempotent `oracleasm renamedisk` pass first (Oracle's own
+# documented, in-place, non-destructive mechanism — no data touched, no
+# delete+recreate). Safe here specifically because nothing has attached to
+# these disks yet (no ASM instance, no diskgroup, Phase B hasn't succeeded).
+# See known-risks.md #74. Empty on every other group (group_vars/all.yml
+# default) — a no-op there.
+asmlib_disks_rename_from:
+  - { from: ASMDISK01, to: SASMDISK1 }
+  - { from: ASMDISK02, to: SASMDISK2 }
+  - { from: ASMDISK03, to: SASMDISK3 }
+  - { from: ASMDISK04, to: SASMDISK4 }
+  - { from: ASMDISK05, to: SASMDISK5 }
+  - { from: ASMDISK06, to: SASMDISK6 }
+
+# dataguard_net_config (Phase 2) needs to know THIS cluster's db_unique_name to
+# build the static _DGMGRL listener.ora entry's GLOBAL_DBNAME correctly — see
+# group_vars/all.yml's own comment on dg_local_db_unique_name for why this can't
+# just reuse db_unique_name directly (that var isn't overridden here, and stays
+# "apexdb" everywhere — see the note below).
+dg_local_db_unique_name: "{{ dg_standby_db_unique_name }}"    # apexdb_stby
+
+# NOT overridden here yet, deliberately out of scope until the named future step:
+#   - db_unique_name / sid_prefix — the standby DATABASE itself will be created
+#     with DB_UNIQUE_NAME=apexdb_stby (dg_standby_db_unique_name), but that's set
+#     directly in the RMAN DUPLICATE ... SET db_unique_name='apexdb_stby' clause
+#     at Phase 4, not via this project's usual group_vars override pattern — the
+#     source database (accessed via the apexdb TNS alias during RMAN AUXILIARY
+#     connection) is still named "apexdb" throughout, so overriding db_unique_name
+#     here would be wrong for every task that isn't the DUPLICATE statement itself.
+#     sid_prefix stays "apexdb" on both clusters either way (SOP's own design —
+#     ORACLE_SID pattern is identical, only DB_UNIQUE_NAME differs).
+#   - chrony_master_* — genuinely shared lab infrastructure (one physical time
+#     source, oemserver01, for the whole lab) — this is a different kind of
+#     dependency than DNS and stays global on purpose.

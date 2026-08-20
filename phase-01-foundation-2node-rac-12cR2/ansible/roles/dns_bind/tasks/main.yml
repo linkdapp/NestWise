@@ -1,9 +1,30 @@
 ---
-# BIND DNS for the cluster's own domain — nodes[0] (oradbserv05) is primary, nodes[1] (oradbserv06) secondary.
-# Adapted from the project's tested reference notes (see docs/network-and-hosts.md).
+# BIND DNS — cluster-agnostic. This role has no idea which cluster it's serving; it
+# only ever reads dns_master/dns_secondary/nodes/scan_name/scan_ips/domain as plain
+# variables. Which real hostnames those resolve to depends entirely on which
+# inventory group the invoking play targets:
+#   --tags dns_bind          (hosts: rac_nodes)      -> oradbserv05 primary, oradbserv06 secondary, usatclust1's own nodes/SCAN (group_vars/all.yml)
+#   --tags standby_dns_bind  (hosts: standby_nodes)   -> oradbserv09 primary, oradbserv10 secondary, usatclust2's own nodes/SCAN (group_vars/standby_nodes.yml)
+# Each pair is a fully independent, standalone BIND primary/secondary — NOT
+# zone-transferring or otherwise coordinating with the other cluster's pair, same
+# principle as OCR/voting being fully separate between usatclust1 and usatclust2.
+# Each zone file contains ONLY that cluster's own records — no cross-cluster
+# lookups happen via DNS at all; /etc/hosts (os_prep's hosts.j2, which DOES include
+# both clusters on every node) is what actually covers cross-cluster name
+# resolution, same reasoning as the /etc/hosts-vs-DNS note in docs/known-risks.md
+# #12. See docs/known-risks.md #59 for the full reasoning and why this replaced an
+# earlier "one shared BIND pair for the whole lab" design.
+#
 # Gives SCAN real 3-IP round-robin resolution instead of the single static IP an
 # /etc/hosts-only design would provide. See docs/known-risks.md #12 for the
 # /etc/hosts-vs-DNS shadowing gotcha and the BIND zone-serial requirement.
+#
+# Every server-only task below (install BIND, render named.conf/zone files, open
+# firewalld, start named) is gated to `inventory_hostname == dns_master or ==
+# dns_secondary` — correct and sufficient for a 2-node cluster regardless of which
+# group is invoking the role, since dns_master/dns_secondary always resolve to two
+# real members of whichever group is running. The client-config tasks (resolv.conf,
+# NetworkManager) are ungated and always run for whichever hosts the play targets.
 
 - name: Install BIND
   yum:
@@ -72,23 +93,29 @@
   changed_when: false
   when: inventory_hostname == dns_master
 
+# --- Server-only from here down, except the two client-config tasks noted below ---
+# Gated to dns_master/dns_secondary explicitly (not just "whatever rac_nodes is") so
+# this role behaves correctly when --tags standby_dns_bind runs it against
+# standby_nodes too — see the header comment.
+
 - name: Check whether firewalld is even active (this project's minimal lab builds often don't have it running at all)
   command: systemctl is-active firewalld
   register: firewalld_active
   changed_when: false
   failed_when: false
+  when: inventory_hostname == dns_master or inventory_hostname == dns_secondary
 
 - name: "Open firewalld for DNS (port 53 tcp+udp) on the public zone (only if firewalld is actually running)"
   command: "firewall-cmd --zone=public --add-service=dns --permanent"
   register: fw_dns
   changed_when: "'ALREADY_ENABLED' not in fw_dns.stdout"
   failed_when: false
-  when: firewalld_active.stdout | trim == 'active'
+  when: (inventory_hostname == dns_master or inventory_hostname == dns_secondary) and firewalld_active.stdout | trim == 'active'
 
 - name: Reload firewalld (only if firewalld is actually running)
   command: firewall-cmd --reload
   changed_when: false
-  when: firewalld_active.stdout | trim == 'active'
+  when: (inventory_hostname == dns_master or inventory_hostname == dns_secondary) and firewalld_active.stdout | trim == 'active'
 
 - name: Note firewalld is not running (informational — nothing to reload if it's not managing anything)
   debug:
@@ -97,13 +124,17 @@
       the DNS service and reload. Not a gap in this lab (firewalld is permanently
       disabled here); if that changes, `systemctl enable --now firewalld` and re-run
       this role to open port 53.
-  when: firewalld_active.stdout | trim != 'active'
+  when: (inventory_hostname == dns_master or inventory_hostname == dns_secondary) and firewalld_active.stdout | trim != 'active'
 
 - name: Enable and start named
   systemd:
     name: named
     state: started
     enabled: true
+  when: inventory_hostname == dns_master or inventory_hostname == dns_secondary
+
+# --- Client config — this is what actually runs for any OTHER host the play
+# targets (e.g. standby_nodes via --tags standby_dns_bind) ------------------------
 
 - name: Point resolv.conf at both name servers (primary first)
   copy:
@@ -112,7 +143,7 @@
       # Managed by ansible role dns_bind
       search {{ domain }}
       nameserver {{ dns_master_ip }}
-      nameserver {{ nodes[1].public_ip if inventory_hostname == dns_master else nodes[0].public_ip }}
+      nameserver {{ nodes[1].public_ip }}
     mode: "0644"
 
 - name: Ensure NetworkManager doesn't overwrite resolv.conf

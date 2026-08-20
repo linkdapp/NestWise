@@ -1,0 +1,723 @@
+---
+# Data Guard Phase 4 — RMAN DUPLICATE ... FOR STANDBY FROM ACTIVE DATABASE
+# (SOP section 8). Runs entirely from oradbserv09 (standby_node1) — RMAN
+# connects TARGET to the primary (apexdb, via the Phase 2 TNS alias) and
+# AUXILIARY to the apexdb1 instance Phase 3 already started NOMOUNT on this
+# same host, over the apexdb_stby alias. No cross-host file staging needed
+# here (unlike Phase 3) — hosts: standby_node1 directly, no
+# localhost/delegate_to pattern.
+#
+# Adapted from James's pasted SOP text, NOT copied verbatim — several
+# values in the SOP are generic placeholders that don't match this
+# project's real environment, and two design questions were resolved
+# directly with James before writing this (see docs/known-risks.md #101):
+#
+#   - apexdb_pri -> apexdb throughout (this project's primary db_unique_name
+#     was never renamed to apexdb_pri — see known-risks.md #76). The TNS
+#     aliases used for TARGET/AUXILIARY are apexdb/apexdb_stby, the real
+#     ones Phase 2 already built and tested — not the SOP's alternative
+#     host:port/service form, which would just be reinventing what already
+#     exists and works.
+#   - +data/+reco01 (SOP's generic diskgroup names) -> +DATA01/+RECO01,
+#     this project's real, only diskgroups (known-risks.md #75).
+#   - db_recovery_file_dest_size: SOP says 500g — a home-lab RECO01
+#     diskgroup doesn't have anything close to that. Used the PRIMARY's
+#     own real, currently-working value instead (7368m, confirmed directly
+#     from the real pfile Phase 3 dumped), not a guess.
+#   - Channel count reduced from 4+4 to 2+2 — this is a single-VirtualBox-
+#     host lab where every channel ultimately shares the same physical
+#     disk I/O regardless of count; 8 parallel channels has no real
+#     throughput benefit here. Easy to raise back if a real run shows it's
+#     worth it.
+#   - dg_broker_config_file1/2: James confirmed apexdb-keyed
+#     (+DATA01/apexdb/DG/dr1apexdb.dat), matching Phase 3's pfile edit and
+#     the password-file convention (known-risks.md #98) — NOT the SOP's
+#     literal apexdb_stby-keyed text. This is the value that actually
+#     takes effect: RMAN's SPFILE SET clauses rebuild the spfile from
+#     scratch here, so whatever Phase 3 set for this parameter never
+#     mattered past this point regardless.
+#   - PARAMETER_VALUE_CONVERT dropped entirely, per James's direct
+#     decision — db_unique_name is the only thing genuinely differing
+#     between primary and standby here (db_name stays "apexdb" on both,
+#     required for any physical standby), so there's nothing left for a
+#     blanket substring convert to safely do that explicit SET clauses
+#     don't already cover, and Oracle's own docs didn't give a confident
+#     enough answer on whether db_name itself is exempt from it to risk
+#     it on a real run.
+#   - log_archive_dest_2 SERVICE changed from apexdb_dg to plain apexdb —
+#     James found live that the standby can't use SCAN-based aliases yet
+#     (apexdb_stby isn't CRS-registered until Phase 5), so
+#     dataguard_net_config now points apexdb_stby/apexdb_stby_DGMGRL at the
+#     standby's own node hostname instead, and gave apexdb_stby itself
+#     (UR=A) too — the _dg-suffixed aliases no longer do anything the
+#     plain ones don't, so log_archive_dest_2 uses the plain name on both
+#     sides now (this role's own log_archive_dest_2 below, and
+#     dataguard_primary_prep's). See known-risks.md #115.
+#   - db_flashback_retention_target added to the SET clause list — James
+#     raised this from the original 24h (1440) to 3 days (4320) by hand on
+#     both the primary and standby after Phase 4; baking it into DUPLICATE
+#     itself means a future rebuild gets the real value from the start
+#     instead of inheriting whatever the primary's spfile happened to say
+#     at duplication time. See group_vars/all.yml's dg_flashback_retention_
+#     minutes and known-risks.md #115.
+#
+# Password handling: the ONLY place a real password is needed is inside
+# the RMAN cmdfile's own CONNECT TARGET/CONNECT AUXILIARY lines (a real
+# SQL*Net, listener-based connection — unlike the plain OS-authenticated
+# `/ as sysdba` used for every other SQL check in this role). Written via
+# a no_log:true copy to a 0600 file and run as `rman cmdfile=...` with no
+# password ever touching the command line/argv — same pattern established
+# throughout this project's Data Guard roles. The RMAN run{} block itself
+# (no password in it) is built as its own fact so it can be shown for
+# review before anything runs, without exposing the password anywhere in
+# Ansible output/logs.
+
+- name: "Preflight: fail loudly if sys_password was never overridden (known-risks.md #113)"
+  # Same gap, same fix as dataguard_standby_prep's equivalent assert — see
+  # that role's comment for the full story. This role has even more at
+  # stake if sys_password is left as the placeholder: it's used directly
+  # in the RMAN cmdfile's CONNECT TARGET/AUXILIARY lines, not just the
+  # local orapwd task, so a missed override here wouldn't just create a
+  # wrong password file — it would run RMAN DUPLICATE itself against the
+  # wrong credentials.
+  assert:
+    that: sys_password != "CHANGE_ME_sys_password"
+    fail_msg: >
+      sys_password is still the group_vars/all.yml placeholder
+      ("CHANGE_ME_sys_password") — pass the real value explicitly:
+      -e sys_password='...'. This role uses it both for the local
+      password file on oradbserv09 and for RMAN's own CONNECT
+      TARGET/AUXILIARY lines.
+  run_once: true
+
+- name: "Ensure the SQL/RMAN script staging directory exists on oradbserv09"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/sql"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0750"
+
+# --- Preflight: local password file for apexdb1's AUXILIARY authentication ---
+# known-risks.md #108: RMAN's AUXILIARY connection authenticates against the
+# classic local $ORACLE_HOME/dbs/orapw$ORACLE_SID file, not the ASM-based
+# copy dataguard_standby_prep also creates (that one can't be properly
+# tagged for db_unique_name auto-discovery until apexdb_stby has a CRS
+# resource, which doesn't exist until AFTER this role's own DUPLICATE
+# completes). dataguard_standby_prep already creates this same file — but
+# it's a SEPARATE play with a separate tag (see site.yml), so a run scoped
+# to just `--tags dataguard_duplicate` (e.g. retrying Phase 4 in isolation,
+# or after a node reprovision) would never reach it. Duplicated here,
+# idempotent (checks first, matching dataguard_standby_prep's own pattern)
+# — cheap and harmless if dataguard_standby_prep already created it, and
+# self-sufficient if it didn't.
+#
+# copy_from_primary (default, known-risks.md #116) vs orapwd (fallback,
+# #108) — same two methods, same reasoning, as dataguard_standby_prep's own
+# 7.2 section; see that role for the full writeup. This play is `hosts:
+# standby_node1` (not localhost+delegate_to like dataguard_standby_prep), so
+# only the primary-side asmcmd tasks need delegate_to — everything else
+# already runs on oradbserv09 by default.
+- name: "Check whether a local password file already exists for apexdb1 on oradbserv09"
+  become: true
+  become_user: "{{ oracle_user }}"
+  stat:
+    path: "{{ db_home }}/dbs/orapw{{ sid_prefix }}1"
+    checksum_algorithm: sha1
+  register: dg_duplicate_local_pwfile_stat
+
+# --- copy_from_primary (default) ------------------------------------------
+# Two hardening fixes applied here (known-risks.md #132), ported from
+# dataguard_convert_rac, which hit both bugs for real first in apexdb2's
+# copy of this exact same logic: (1) skip this entire ASM round-trip
+# through the primary entirely if oradbserv09 already has a local password
+# file; (2) if `asmcmd pwget` comes back empty anyway, fall back to
+# `orapwd` instead of failing — James's own call: "if the password check
+# didn't return a value it should then create a password file because one
+# does not exist."
+- name: "Discover the primary's real password file path in its own ASM (asmcmd pwget)"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ grid_user }}"
+  command: "{{ grid_home }}/bin/asmcmd pwget --dbuniquename {{ db_unique_name }}"
+  register: dg_duplicate_pwfile_asm_path
+  changed_when: false
+  when: dg_pwfile_method == 'copy_from_primary' and not dg_duplicate_local_pwfile_stat.stat.exists
+
+- name: "Set fact: did the primary-ASM password file lookup come back empty (fall back to orapwd rather than fail)"
+  set_fact:
+    dg_duplicate_pwfile_asm_empty: >-
+      {{ dg_pwfile_method == 'copy_from_primary' and
+         not dg_duplicate_local_pwfile_stat.stat.exists and
+         (dg_duplicate_pwfile_asm_path.stdout | default('') | trim | length) == 0 }}
+
+- name: "Report: primary-ASM password file lookup returned nothing — falling back to orapwd instead of failing"
+  debug:
+    msg: >
+      asmcmd pwget --dbuniquename {{ db_unique_name }} on
+      {{ groups['rac_node1'][0] }} returned no path. Falling back to
+      generating a fresh local password file via orapwd for apexdb1
+      instead of copying the primary's (known-risks.md #131/#132) — this
+      won't carry the primary's exact SYS hash or any other
+      privileged-user grants beyond what orapwd itself creates, only
+      matters if something relies on that. If it does, check
+      `asmcmd pwget --dbuniquename {{ db_unique_name }}` by hand on
+      {{ groups['rac_node1'][0] }} to see why the lookup came back empty.
+  when: dg_duplicate_pwfile_asm_empty
+
+- name: "Remove any stale staging copy on the primary before re-exporting (asmcmd pwcopy refuses an existing destination)"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/standby/orapwd{{ db_unique_name }}"
+    state: absent
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_duplicate_local_pwfile_stat.stat.exists
+    and not dg_duplicate_pwfile_asm_empty
+
+- name: "Ensure {{ staging_dir }}/standby exists on the primary"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  file:
+    path: "{{ staging_dir }}/standby"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0770"
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_duplicate_local_pwfile_stat.stat.exists
+    and not dg_duplicate_pwfile_asm_empty
+
+- name: "Export the primary's real password file from ASM to a local staging file (asmcmd pwcopy)"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ grid_user }}"
+  command: >
+    {{ grid_home }}/bin/asmcmd pwcopy
+    {{ dg_duplicate_pwfile_asm_path.stdout | trim }}
+    {{ staging_dir }}/standby/orapwd{{ db_unique_name }}
+  register: dg_duplicate_pwfile_export
+  changed_when: dg_duplicate_pwfile_export.rc == 0
+  failed_when: dg_duplicate_pwfile_export.rc != 0
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_duplicate_local_pwfile_stat.stat.exists
+    and not dg_duplicate_pwfile_asm_empty
+
+- name: "Fetch the exported password file to the control node"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  fetch:
+    src: "{{ staging_dir }}/standby/orapwd{{ db_unique_name }}"
+    dest: "{{ dg_duplicate_local_dir }}/orapwd{{ db_unique_name }}"
+    flat: true
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_duplicate_local_pwfile_stat.stat.exists
+    and not dg_duplicate_pwfile_asm_empty
+
+- name: "Copy the primary's password file onto oradbserv09 as orapw{{ sid_prefix }}1 (nothing was there before this chain ran, so no checksum comparison is needed)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    src: "{{ dg_duplicate_local_dir }}/orapwd{{ db_unique_name }}"
+    dest: "{{ db_home }}/dbs/orapw{{ sid_prefix }}1"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_duplicate_local_pwfile_stat.stat.exists
+    and not dg_duplicate_pwfile_asm_empty
+
+- name: "Clean up the staging copy on the primary (contained real password material)"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/standby/orapwd{{ db_unique_name }}"
+    state: absent
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_duplicate_local_pwfile_stat.stat.exists
+    and not dg_duplicate_pwfile_asm_empty
+
+- name: "Clean up the staging copy on the control node (contained real password material)"
+  delegate_to: localhost
+  file:
+    path: "{{ dg_duplicate_local_dir }}/orapwd{{ db_unique_name }}"
+    state: absent
+  when: >
+    dg_pwfile_method == 'copy_from_primary' and not dg_duplicate_local_pwfile_stat.stat.exists
+    and not dg_duplicate_pwfile_asm_empty
+
+# --- orapwd (fallback — known-risks.md #108) -------------------------------
+- name: "Create the local password file for apexdb1 if missing (orapwd fallback — see comment above and known-risks.md #108; also fires when copy_from_primary's ASM lookup came back empty — known-risks.md #132)"
+  # no_log for the same reason as dataguard_standby_prep's equivalent task —
+  # suppresses this from Ansible's own output/logs; orapwd itself has no
+  # option to read the password from a file, so it's briefly visible via
+  # `ps -ef` on oradbserv09 while this runs (accepted, documented risk for
+  # this home-lab context, same as noted in dataguard_standby_prep).
+  become: true
+  become_user: "{{ oracle_user }}"
+  no_log: true
+  command: >
+    {{ db_home }}/bin/orapwd file={{ db_home }}/dbs/orapw{{ sid_prefix }}1
+    password={{ sys_password }} entries=10 format=12
+  when: >
+    not dg_duplicate_local_pwfile_stat.stat.exists and
+    (dg_pwfile_method == 'orapwd' or dg_duplicate_pwfile_asm_empty | default(false))
+
+# --- Preflight: has DUPLICATE already run? -------------------------------
+# apexdb1 was left NOMOUNT by Phase 3. If it's already MOUNTED or OPEN,
+# RMAN DUPLICATE has already completed successfully on a prior run of this
+# role — skip straight to the post-duplicate validation section rather
+# than attempting DUPLICATE a second time against a database that already
+# exists (which RMAN would reject anyway, but check-then-act is this
+# project's established idiom over relying on RMAN's own error text).
+- name: "Write SQL script: check the apexdb1 instance's current mount status"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_duplicate_status_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off
+      select status from v$instance;
+      exit;
+
+- name: "Check the apexdb1 instance's current mount status"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID=apexdb1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_duplicate_status_check.sql
+  register: dg_duplicate_status_check
+  changed_when: false
+
+- name: Show instance status check output
+  debug:
+    var: dg_duplicate_status_check.stdout_lines
+
+- name: "Set fact: has DUPLICATE already run (instance is MOUNTED or OPEN, not just STARTED/NOMOUNT)"
+  set_fact:
+    dg_duplicate_already_done: "{{ 'MOUNTED' in dg_duplicate_status_check.stdout or 'OPEN' in dg_duplicate_status_check.stdout }}"
+
+# --- Build and review the RMAN DUPLICATE command --------------------------
+- name: "Set fact: the RMAN run{} block (no password in this — safe to display and log)"
+  set_fact:
+    dg_duplicate_run_block: |
+      run {
+        allocate channel c1 type disk;
+        allocate channel c2 type disk;
+        allocate auxiliary channel a1 type disk;
+        allocate auxiliary channel a2 type disk;
+        duplicate target database
+          for standby
+          from active database
+          dorecover
+          spfile
+            set db_unique_name='{{ dg_standby_db_unique_name }}'
+            set db_create_file_dest='+{{ asm_diskgroup_data }}'
+            set db_create_online_log_dest_1='+{{ asm_diskgroup_data }}'
+            set db_create_online_log_dest_2='+{{ asm_diskgroup_reco }}'
+            set db_recovery_file_dest='+{{ asm_diskgroup_reco }}'
+            set db_recovery_file_dest_size='7368m'
+            set control_files='+{{ asm_diskgroup_data }}','+{{ asm_diskgroup_reco }}'
+            set cluster_database='false'
+            set audit_file_dest='{{ oracle_base }}/admin/{{ db_unique_name }}/adump'
+            set fal_server='{{ db_unique_name }}'
+            set log_archive_config='dg_config=({{ db_unique_name }},{{ dg_standby_db_unique_name }})'
+            set log_archive_dest_1='location=use_db_recovery_file_dest valid_for=(all_logfiles,all_roles) db_unique_name={{ dg_standby_db_unique_name }}'
+            set log_archive_dest_2='service={{ db_unique_name }} async valid_for=(online_logfiles,primary_role) db_unique_name={{ db_unique_name }}'
+            set db_flashback_retention_target='{{ dg_flashback_retention_minutes }}'
+            set standby_file_management='auto'
+            set dg_broker_start='true'
+            set dg_broker_config_file1='+{{ asm_diskgroup_data }}/{{ db_unique_name }}/DG/dr1{{ db_unique_name }}.dat'
+            set dg_broker_config_file2='+{{ asm_diskgroup_reco }}/{{ db_unique_name }}/DG/dr2{{ db_unique_name }}.dat'
+          nofilenamecheck;
+      }
+
+- name: "Show the RMAN DUPLICATE command that will run (CONNECT lines have the real password redacted for display)"
+  debug:
+    msg: "{{ (['connect target sys/REDACTED@' + db_unique_name, 'connect auxiliary sys/REDACTED@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=' + ansible_host + ')(PORT=1521))(CONNECT_DATA=(SERVER=DEDICATED)(SID=' + sid_prefix + '1)))', ''] + dg_duplicate_run_block.split('\n')) }}"
+  when: not dg_duplicate_already_done
+
+- name: "Pause for review — this is about to physically copy the primary's datafiles over the network and create the standby database for real"
+  pause:
+    prompt: |
+      Review the RMAN DUPLICATE command above. This is the least reversible
+      step so far — it copies apexdb's live datafiles to oradbserv09 over
+      the network and creates real standby datafiles under
+      +{{ asm_diskgroup_data }}/{{ dg_standby_db_unique_name }} /
+      +{{ asm_diskgroup_reco }}/{{ dg_standby_db_unique_name }}. Press Enter
+      to continue and run it for real. Ctrl+C then A aborts this run
+      instead.
+  when: not dg_duplicate_already_done
+
+- name: "Report: DUPLICATE already completed on a prior run — skipping straight to post-duplicate validation"
+  debug:
+    msg: "apexdb1 on oradbserv09 is already MOUNTED/OPEN (see status check above) — RMAN DUPLICATE already ran successfully. Skipping straight to 8.3's validation checks."
+  when: dg_duplicate_already_done
+
+# --- Write the real cmdfile (password included) and run it ----------------
+# CONNECT AUXILIARY uses a real net service name (RMAN-06217 confirmed a
+# bequeath `/` doesn't work for FROM ACTIVE DATABASE — #102/#103), but NOT
+# the apexdb_stby TNS alias's SCAN-based descriptor. Root cause, confirmed
+# against Oracle documentation and a full round of live diagnostics
+# (SCAN1/2/3 on the primary all healthy, /etc/hosts on oradbserv09
+# correct, DNS working as designed) — the actual gap: static SID_LIST
+# entries are scoped PER LISTENER PROCESS. #103's fix added its SID_DESC
+# to the plain `LISTENER` resource's config only (`SID_LIST_LISTENER`) —
+# but `apexdb_stby`'s alias connects via scan-usatclust2.usat.com, which
+# routes through the SEPARATE LISTENER_SCAN1/2/3 processes, not the plain
+# LISTENER at all. Those SCAN listeners never got any static entry, so
+# they have zero knowledge of apexdb_stby regardless of DNS/round-robin —
+# confirmed as the cause of a 100%-consistent ORA-12514 that persisted
+# through repeated retries, a fresh v$pwfile_users check, a manual
+# orapwd-created password file, and a manual `alter system register`,
+# none of which touch this at all.
+#
+# Oracle's own documented fix for this is a SEPARATE static stanza per
+# SCAN listener (SID_LIST_LISTENER_SCAN1, etc.) — deliberately NOT done
+# here: that requires per-node awareness of which SCAN listener GI
+# currently has running where (they can relocate on failover), for a
+# need that's actually narrow and temporary — nothing else in this
+# project needs apexdb_stby reachable via SCAN before Phase 4 duplicates
+# it (Phase 2's own connectivity test already expects apexdb_stby to fail
+# with ORA-12514 at that stage — "no standby database until Phase 4").
+# Once DUPLICATE mounts/opens the database for real, PMON's normal
+# dynamic registration takes over everywhere, SCAN included, same as
+# apexdb already works today.
+#
+# Since RMAN is running locally on oradbserv09 anyway, AUXILIARY connects
+# directly to oradbserv09's own IP/plain LISTENER instead — the one
+# listener process that DOES have the correct static entry — bypassing
+# SCAN and tnsnames.ora entirely for just this one connection. See
+# docs/known-risks.md #105.
+#
+# #106: even with SCAN bypassed, SERVICE_NAME=apexdb_stby still failed —
+# TNS-12537 (connection closed), then ORA-01017 on retries. Root cause,
+# confirmed via lsnrctl status LISTENER on oradbserv09 and against Oracle
+# documentation: a NOMOUNT-only instance can never be more than BLOCKED
+# for a SERVICE_NAME-based handler (PMON can't fully register a service
+# until the database mounts), and the listener closes new connections
+# routed through a BLOCKED handler — exactly what TNS-12537 signals. The
+# ORA-01017 on subsequent attempts came from the connection falling
+# through to the OTHER (UNKNOWN-status, unrelated) handler entry for the
+# same service name, not from any real password-file problem — confirmed
+# separately: remote_login_passwordfile=EXCLUSIVE is set correctly on
+# apexdb1, matching #104's fix.
+#
+# The documented fix for connecting to a NOMOUNT auxiliary is CONNECT_DATA
+# keyed on SID, not SERVICE_NAME — SID-based static registration routes
+# directly to the instance process without going through the
+# service-handler gate that BLOCKED is gating. apexdb1 is the real,
+# confirmed SID (lsnrctl status LISTENER shows "Instance apexdb1" under
+# the apexdb_stby service) — same value sid_prefix + "1" resolves to
+# everywhere else in this project. See docs/known-risks.md #106.
+- name: "Write the RMAN cmdfile (both CONNECT lines include the real sys password — no_log)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_duplicate.rman"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect target sys/{{ sys_password }}@{{ db_unique_name }}
+      connect auxiliary sys/{{ sys_password }}@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={{ ansible_host }})(PORT=1521))(CONNECT_DATA=(SERVER=DEDICATED)(SID={{ sid_prefix }}1)))
+      {{ dg_duplicate_run_block }}
+  when: not dg_duplicate_already_done
+
+- name: "Run RMAN DUPLICATE (this will take a while — real network copy of every primary datafile)"
+  # known-risks.md #109: failed_when/changed_when here used to check
+  # dg_duplicate_run.stdout for 'Finished Duplicate Db' / 'RMAN-' — WRONG.
+  # rman was invoked with BOTH cmdfile= AND log=, and with log= present
+  # rman sends essentially everything (every real line of output, the
+  # actual success/failure text included) to the LOG FILE, not to its own
+  # stdout — stdout is left with just the bare interactive prompt echoes
+  # ("RMAN> 2> 3> ... 32> "), nothing substantive. A real, fully successful
+  # DUPLICATE (confirmed directly: dg_duplicate.log genuinely ends
+  # "Finished Duplicate Db ... Recovery Manager complete.") still got
+  # reported FAILED by Ansible every time, because the text the
+  # failed_when was searching for was never going to be in stdout,
+  # regardless of what actually happened. rc alone is trusted here now —
+  # not a perfect signal for rman (it can occasionally return 0 despite an
+  # RMAN- error in some scenarios, which is why the original stdout check
+  # existed at all), but the REAL safety net is the next task below, which
+  # reads the actual log file content and fails on that instead.
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID=apexdb1
+    {{ db_home }}/bin/rman cmdfile={{ staging_dir }}/sql/dg_duplicate.rman log={{ staging_dir }}/sql/dg_duplicate.log
+  register: dg_duplicate_run
+  changed_when: true
+  failed_when: dg_duplicate_run.rc != 0
+  when: not dg_duplicate_already_done
+
+- name: "Read the real RMAN DUPLICATE output from the log file (not stdout — see comment above and known-risks.md #109)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  command: "cat {{ staging_dir }}/sql/dg_duplicate.log"
+  register: dg_duplicate_log
+  changed_when: false
+  when: not dg_duplicate_already_done
+
+- name: "Fail if the log doesn't actually show a completed DUPLICATE (the real safety net — checks the log file, not stdout)"
+  fail:
+    msg: >
+      dg_duplicate.log does not show 'Finished Duplicate Db', or contains
+      an 'RMAN-' error line — review
+      {{ staging_dir }}/sql/dg_duplicate.log on oradbserv09 directly.
+  when: >
+    not dg_duplicate_already_done and
+    ('Finished Duplicate Db' not in dg_duplicate_log.stdout or
+     'RMAN-' in dg_duplicate_log.stdout)
+
+- name: Show RMAN DUPLICATE output (from the log file)
+  debug:
+    var: dg_duplicate_log.stdout_lines
+  when: not dg_duplicate_already_done
+
+- name: "Remove the RMAN cmdfile (contained the real password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_duplicate.rman"
+    state: absent
+  when: not dg_duplicate_already_done
+
+# --- 8.3.1 Confirm standby role and state ----------------------------------
+- name: "Write SQL script: confirm standby role/state"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_duplicate_confirm_role.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 tab off pagesize 100
+      column name format a10
+      column db_unique_name format a15
+      column database_role format a17
+      column open_mode format a15
+      column switchover_status format a20
+      select name, db_unique_name, database_role, open_mode, switchover_status from v$database;
+      column process format a8
+      column status format a12
+      select process, status, thread#, sequence#, block#, blocks from v$managed_standby;
+      exit;
+
+- name: "Confirm standby role/state (expect PHYSICAL STANDBY / MOUNTED)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID=apexdb1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_duplicate_confirm_role.sql
+  register: dg_duplicate_confirm_role
+  changed_when: false
+
+- name: Show standby role/state confirmation
+  debug:
+    var: dg_duplicate_confirm_role.stdout_lines
+
+- name: "Pause for review before starting managed recovery (James's direct call — separate from the pause before DUPLICATE itself)"
+  pause:
+    prompt: |
+      Review the standby role/state above — expect DATABASE_ROLE=PHYSICAL
+      STANDBY, OPEN_MODE=MOUNTED. Press Enter to continue: start managed
+      recovery (real-time apply) on oradbserv09. Ctrl+C then A aborts this
+      run instead.
+
+# --- 8.3.2 Start Managed Recovery (MRP) — real-time apply ------------------
+# Idempotency: check v$managed_standby for an already-active MRP process
+# first (APPLYING_LOG/WAIT_FOR_LOG both mean it's already running) rather
+# than trusting RMAN/SQL*Plus error text for "already started" — same
+# check-then-act idiom used throughout this project's Data Guard roles
+# (and the more reliable choice after known-risks.md #99's lesson about
+# not trusting an uncertain error-matching approach).
+- name: "Write SQL script: check whether managed recovery is already running"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_duplicate_mrp_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off
+      select process, status from v$managed_standby where process like 'MRP%';
+      exit;
+
+- name: "Check whether managed recovery is already running"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID=apexdb1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_duplicate_mrp_check.sql
+  register: dg_duplicate_mrp_check
+  changed_when: false
+
+- name: Show MRP check output
+  debug:
+    var: dg_duplicate_mrp_check.stdout_lines
+
+- name: "Write SQL script: start managed recovery"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_duplicate_start_mrp.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter database recover managed standby database disconnect from session;
+      exit;
+  when: "'APPLYING_LOG' not in dg_duplicate_mrp_check.stdout and 'WAIT_FOR_LOG' not in dg_duplicate_mrp_check.stdout"
+
+- name: "Start managed recovery (only if not already running)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID=apexdb1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_duplicate_start_mrp.sql
+  register: dg_duplicate_start_mrp
+  when: "'APPLYING_LOG' not in dg_duplicate_mrp_check.stdout and 'WAIT_FOR_LOG' not in dg_duplicate_mrp_check.stdout"
+  changed_when: "'Database altered' in dg_duplicate_start_mrp.stdout"
+  failed_when: >
+    dg_duplicate_start_mrp.rc != 0 or
+    ('ORA-' in dg_duplicate_start_mrp.stdout and 'Database altered' not in dg_duplicate_start_mrp.stdout)
+
+- name: Show start-managed-recovery output
+  debug:
+    var: dg_duplicate_start_mrp.stdout_lines
+  when: "'APPLYING_LOG' not in dg_duplicate_mrp_check.stdout and 'WAIT_FOR_LOG' not in dg_duplicate_mrp_check.stdout"
+
+- name: "Report: managed recovery was already running, start skipped"
+  debug:
+    msg: "MRP is already active on oradbserv09 (see check above) — skipped starting it again."
+  when: "'APPLYING_LOG' in dg_duplicate_mrp_check.stdout or 'WAIT_FOR_LOG' in dg_duplicate_mrp_check.stdout"
+
+# --- 8.3.3 Force redo generation on the primary ----------------------------
+- name: "Write SQL script: force log switch + archive on the primary"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_duplicate_force_redo.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on
+      alter system switch logfile;
+      alter system archive log current;
+      exit;
+
+- name: "Force redo generation on the primary (5 iterations, SOP's own recommended range)"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_duplicate_force_redo.sql
+  register: dg_duplicate_force_redo
+  loop: "{{ range(1, 6) | list }}"
+  loop_control:
+    label: "iteration {{ item }}"
+  changed_when: "'System altered' in dg_duplicate_force_redo.stdout"
+
+- name: Show force-redo output (last iteration)
+  debug:
+    var: dg_duplicate_force_redo.results[-1].stdout_lines
+
+# --- 8.3.4 Verify transport and apply on the standby -----------------------
+- name: "Write SQL script: verify transport/apply status"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_duplicate_verify_apply.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 tab off pagesize 100
+      column process format a8
+      column status format a14
+      select process, status, thread#, sequence#, block#, blocks from v$managed_standby order by process;
+      column name format a20
+      column value format a15
+      select name, value, unit, time_computed from v$dataguard_stats where name in ('transport lag','apply lag','apply finish time');
+      column status format a10
+      select thread#, sequence#, applied, status from v$archived_log order by sequence# desc fetch first 10 rows only;
+      exit;
+
+- name: "Verify transport/apply status on the standby"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID=apexdb1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_duplicate_verify_apply.sql
+  register: dg_duplicate_verify_apply
+  changed_when: false
+
+- name: Show transport/apply verification output
+  debug:
+    var: dg_duplicate_verify_apply.stdout_lines
+
+# --- 8.3.5 Optional — primary-side confirmation ----------------------------
+- name: "Write SQL script: primary-side archive destination confirmation"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_duplicate_primary_confirm.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 tab off pagesize 100
+      column status format a10
+      column error format a30
+      select dest_id, status, error, gap_status from v$archive_dest_status where dest_id = 2;
+      column applied format a5
+      select sequence#, applied from v$archived_log where dest_id = 2 order by sequence# desc fetch first 5 rows only;
+      exit;
+
+- name: "Confirm archive destination status on the primary"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_duplicate_primary_confirm.sql
+  register: dg_duplicate_primary_confirm
+  changed_when: false
+
+- name: Show primary-side archive destination confirmation
+  debug:
+    var: dg_duplicate_primary_confirm.stdout_lines
+
+- name: "Reminder — this is a manual gate, not an automated one"
+  debug:
+    msg: >
+      Per the SOP's own guidance: only proceed to Phase 5 (convert to RAC)
+      once transport lag and apply lag above are healthy (at or near 0) and
+      the MRP/RFS processes show APPLYING_LOG/WAIT_FOR_LOG, not stuck or
+      absent. This role does not auto-gate on those numbers — review them
+      yourself before running Phase 5.

@@ -16,8 +16,13 @@
 # exist; package installation has no such dependency, so it belongs on the golden
 # image like every other RPM. This role configures the oracleasm service for the
 # grid user and marks/discovers the shared disks. Disk MARKING (createdisk) only
-# happens on dns_master (the first node) — the label gets written to the shared
-# block device itself, so the second node just needs to scan for it.
+# happens on asm_marking_node (the first node of THIS cluster — see
+# group_vars/all.yml) — the label gets written to the shared block device itself, so
+# the second node just needs to scan for it. Deliberately NOT dns_master (used to be
+# — see docs/known-risks.md #52): that variable is a single global value pointing at
+# oradbserv05, which silently skipped disk marking entirely the first time this role
+# ran against a different cluster's nodes (standby_nodes), since the `when:` below
+# could never match.
 
 # Tags below split this role into two tiers, from safest to most destructive:
 #   asmlib_service_config  — /etc/sysconfig/oracleasm, `oracleasm init`, enabling the
@@ -43,17 +48,43 @@
       ORACLEASM_SCANEXCLUDE=""
       ORACLEASM_USE_LOGICAL_BLOCK_SIZE=false
     mode: "0644"
+  register: asm_sysconfig
   when: use_asmlib
   tags: [asmlib_service_config]
 
 - name: Initialize the oracleasm driver/filesystem
   # Loads the kernel module and sets up /dev/oracleasm — does not touch any specific
   # disk, but it IS configuring ASM (not just installing packages), hence its own tag.
+  # `init` is a no-op ("already initialized") if the driver is already loaded — see
+  # the reload task below for why that matters.
   command: /usr/sbin/oracleasm init
   register: asm_init
   changed_when: "'already' not in asm_init.stdout"
   failed_when: false
   when: use_asmlib
+  tags: [asmlib_service_config]
+
+- name: "Reload the oracleasm driver (exit + init) when /etc/sysconfig/oracleasm just changed — see docs/known-risks.md #69"
+  # `oracleasm init` above only LOADS the driver if it isn't already loaded; per
+  # Oracle's own admin doc (Administering Oracle ASMLIB and Disks — init/exit "load
+  # or unload... without restarting the system"), applying a changed ORACLEASM_UID/
+  # ORACLEASM_GID to an already-loaded driver requires an explicit exit+init cycle.
+  # Without this, a GID fix made to this file after the driver was first initialized
+  # (e.g. on a node provisioned before ORACLEASM_GID=asmadmin was correct in this
+  # role) silently never takes effect — the file is right, but every disk createdisk
+  # marks afterward still inherits the stale in-memory group. Confirmed live:
+  # oradbserv09/10 both showed /dev/oracleasm/disks/* as grid:oinstall despite this
+  # role always having written ORACLEASM_GID=asmadmin.
+  #
+  # Only fires when the copy task above actually changed the file — safe to leave
+  # unconditional-init alone on every other run, and this must never fire against a
+  # node where ASM is already up with mounted diskgroups (exit unloads the driver
+  # out from under them). Gating on asm_sysconfig.changed means it only runs the
+  # very first time the file is written correctly, well before Phase B/storage ever
+  # brings ASM up — same "don't refight already-correct state" discipline as the
+  # os_prep olr.loc guard (#68).
+  shell: /usr/sbin/oracleasm exit && /usr/sbin/oracleasm init
+  when: use_asmlib and asm_sysconfig.changed
   tags: [asmlib_service_config]
 
 - name: Enable oracleasm at boot
@@ -63,6 +94,35 @@
     state: started
   when: use_asmlib
   tags: [asmlib_service_config]
+
+# --- One-time label migration (ASMDISK0N -> a different convention, e.g. usatclust2's
+# SASMDISK) — only when asmlib_disks_rename_from is non-empty ------------------
+# See docs/known-risks.md #74. `oracleasm renamedisk` is Oracle's own documented,
+# in-place, non-destructive relabel — no data touched, no delete+recreate. Safe
+# specifically because this only ever targets disks nothing has attached to yet
+# (no ASM instance, no diskgroup). Idempotent: querydisk first, only rename a
+# pair whose OLD label still exists — a re-run after a successful rename finds
+# nothing under the old label and skips cleanly.
+- name: "Check whether each renamed-from disk still exists under its OLD label (idempotent — skip pairs already renamed)"
+  command: "/usr/sbin/oracleasm querydisk -p {{ item.from }}"
+  register: asm_rename_check
+  changed_when: false
+  failed_when: false
+  loop: "{{ asmlib_disks_rename_from }}"
+  when: use_asmlib and inventory_hostname == asm_marking_node and (asmlib_disks_rename_from | length > 0)
+  tags: [asmlib_disk_marking]
+
+- name: "Rename each disk still under its OLD label to its new label"
+  command: "/usr/sbin/oracleasm renamedisk {{ item.item.from }} {{ item.item.to }}"
+  loop: "{{ asm_rename_check.results | default([]) }}"
+  when: use_asmlib and inventory_hostname == asm_marking_node and (asmlib_disks_rename_from | length > 0) and item.rc == 0
+  tags: [asmlib_disk_marking]
+
+- name: "Re-scan disks on the marking node so renamed labels are visible before the free-disk checks below"
+  command: /usr/sbin/oracleasm scandisks
+  changed_when: false
+  when: use_asmlib and inventory_hostname == asm_marking_node and (asmlib_disks_rename_from | length > 0)
+  tags: [asmlib_disk_marking]
 
 # --- Disk marking: primary node only ------------------------------------------
 # `oracleasm createdisk` writes a label directly onto the raw block device — wrong
@@ -76,7 +136,7 @@
     path: "{{ item.device }}"
   register: asm_dev_check
   loop: "{{ asmlib_disks }}"
-  when: use_asmlib and inventory_hostname == dns_master
+  when: use_asmlib and inventory_hostname == asm_marking_node
   tags: [asmlib_disk_marking]
 
 - name: Fail if any ASM device path is missing (placeholders in group_vars/all.yml not yet updated to real /dev/sdX)
@@ -87,36 +147,67 @@
       docs/golden-image-and-cloning.md) and update asmlib_disks in
       ansible/group_vars/all.yml before re-running.
   loop: "{{ asm_dev_check.results }}"
-  when: use_asmlib and inventory_hostname == dns_master and not item.stat.exists
+  when: use_asmlib and inventory_hostname == asm_marking_node and not item.stat.exists
   tags: [asmlib_disk_marking]
 
-- name: "Confirm each ASM device path is genuinely free (no partition table, filesystem, or mountpoint)"
-  command: "lsblk -no MOUNTPOINT,FSTYPE,PTTYPE {{ item.device }}"
+- name: "Confirm each ASM device path is genuinely free (no filesystem, partition table, or other on-disk signature) — blkid, not lsblk's PTTYPE column (unsupported on OL7's util-linux 2.23; see known-risks.md #53)"
+  command: "blkid -o value -s TYPE {{ item.device }}"
   register: asm_dev_in_use
   changed_when: false
+  # blkid exits 2 with empty stdout when a device has NO recognized signature at
+  # all — that's the GOOD/expected case for a genuinely free disk, not a failure.
+  failed_when: false
   loop: "{{ asmlib_disks }}"
-  when: use_asmlib and inventory_hostname == dns_master
+  when: use_asmlib and inventory_hostname == asm_marking_node
   tags: [asmlib_disk_marking]
 
-- name: Fail if any ASM device path is already in use (already has a partition table, filesystem, or mountpoint)
+- name: Fail if any ASM device path is already in use (already has a filesystem, partition table, or other signature)
   fail:
     msg: >
-      {{ item.item.device }} is not a free raw disk — `lsblk` reports
-      "{{ item.stdout | trim }}" (mountpoint/fstype/pttype). Marking it for ASMLib
-      would destroy whatever is already there. Confirm the real free shared-disk
-      device paths with `lsblk` (see docs/known-risks.md #5) and fix asmlib_disks in
+      {{ item.item.device }} is not a free raw disk — `blkid` reports type
+      "{{ item.stdout | trim }}". Marking it for ASMLib would destroy whatever is
+      already there. Confirm the real free shared-disk device paths with `lsblk`
+      (see docs/known-risks.md #5) and fix asmlib_disks in
       ansible/group_vars/all.yml before re-running — do not override this check.
   loop: "{{ asm_dev_in_use.results }}"
-  when: use_asmlib and inventory_hostname == dns_master and (item.stdout | trim) != ''
+  when: use_asmlib and inventory_hostname == asm_marking_node and (item.stdout | trim) != ''
   tags: [asmlib_disk_marking]
 
-- name: Mark each shared disk for ASMLib (primary node only — label is written to the shared device)
-  command: "/usr/sbin/oracleasm createdisk {{ item.label }} {{ item.device }}"
+# `oracleasm createdisk` refuses a raw, unpartitioned disk — confirmed on a real run
+# against oradbserv09 ("Device "/dev/sdd" is not a partition"), and confirmed against
+# Oracle's own 19c Linux install docs ("Configuring Disk Devices to Use Oracle
+# ASMLIB": create a single whole-disk partition with fdisk/parted first, then run
+# createdisk against the partition, e.g. /dev/sdb1) — a real gap in this role, not a
+# quirk of these particular disks. See docs/known-risks.md #54. The "confirm each ASM
+# device path is genuinely free" check above already guarantees the RAW disk is blank
+# before this runs; a second run after a disk is already partitioned+marked will
+# correctly hit that same check and fail closed, since blkid reports a real
+# partition-table signature by then — that's the intended, safe behavior, not a
+# regression.
+- name: "Ensure parted is installed (needed to partition the raw ASM disks — see comment above)"
+  package:
+    name: parted
+    state: present
+  when: use_asmlib and inventory_hostname == asm_marking_node
+
+- name: "Create a single whole-disk GPT partition on each raw ASM device"
+  command: "parted -s {{ item.device }} mklabel gpt mkpart primary 0% 100%"
+  loop: "{{ asmlib_disks }}"
+  when: use_asmlib and inventory_hostname == asm_marking_node
+
+- name: "Re-read the partition table so the kernel sees the new partition device before oracleasm uses it"
+  command: "partprobe {{ item.device }}"
+  loop: "{{ asmlib_disks }}"
+  changed_when: false
+  when: use_asmlib and inventory_hostname == asm_marking_node
+
+- name: Mark each shared disk for ASMLib (primary node only — label is written to the shared partition, NOT the raw disk)
+  command: "/usr/sbin/oracleasm createdisk {{ item.label }} {{ item.device }}1"
   register: asm_createdisk
   changed_when: "'created' in asm_createdisk.stdout|lower or asm_createdisk.rc == 0"
   failed_when: asm_createdisk.rc != 0 and 'already' not in asm_createdisk.stderr|lower
   loop: "{{ asmlib_disks }}"
-  when: use_asmlib and inventory_hostname == dns_master
+  when: use_asmlib and inventory_hostname == asm_marking_node
   tags: [asmlib_disk_marking]
 
 # --- Disk discovery: both nodes -------------------------------------------------

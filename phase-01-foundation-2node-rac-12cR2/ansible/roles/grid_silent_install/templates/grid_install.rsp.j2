@@ -94,14 +94,25 @@ oracle.install.asm.diskGroup.name={{ asm_diskgroup_data }}
 # further, to DATA02, post-install via `ocrconfig -add` (see this role's
 # tasks/main.yml) — unrelated to this setting.
 oracle.install.asm.diskGroup.redundancy={{ asm_diskgroup_data_redundancy }}
-oracle.install.asm.diskGroup.AUSize=0
+# AUSize=0 (this line's previous value) is not one of Oracle's actual valid
+# allocation-unit sizes (1/2/4/8/16/32/64 MB — see the real, blank 19.3
+# gridsetup.rsp's own comment on this field) and isn't a documented "auto"
+# sentinel either. A real, working reference response file (oracle-base.com's
+# 12.2 grid_config.rsp, from an actual documented RAC install) sets this to
+# 4 — Oracle's own stated default — never 0. [INS-08109]'s "/ by zero" at the
+# CreateASMDiskGroup validation state is a literal Java ArithmeticException;
+# AU size is used as a real divisor when OUI sizes the diskgroup against the
+# disks it's given, so a literal 0 here throws exactly that. See
+# docs/known-risks.md #73.
+oracle.install.asm.diskGroup.AUSize=4
 
-# ASM disk paths use /dev/disk/by-label/<LABEL> — a generic udev mechanism, not
-# tied to ASMLib specifically — rather than /dev/oracleasm/disks/<LABEL>. See
-# docs/known-risks.md #4: by-label resolves to the correct physical disk even
-# when raw /dev/sdX letters differ between nodes at attach/clone time, the same
-# durability property as /dev/disk/by-id/, keyed to the label this project
-# already uses.
+# ASM disk paths use /dev/oracleasm/disks/<LABEL>, not /dev/disk/by-label/<LABEL>
+# — a deliberate change from this project's original design (known-risks.md #4
+# still explains the by-label reasoning; #74 explains the switch back to
+# ASMLib's own path convention specifically, confirmed working against a real,
+# manually-run gridSetup.sh/config.sh for this cluster). /dev/disk/by-label
+# still exists as a valid, generic udev alternative if a future phase needs it
+# again — not removed from the project, just not what this template renders.
 #
 # disksWithFailureGroupNames is REQUIRED here since asm_diskgroup_data_redundancy
 # is NORMAL, not EXTERNAL — see docs/known-risks.md #10. The real template's own
@@ -110,9 +121,31 @@ oracle.install.asm.diskGroup.AUSize=0
 # alternating list (disk1,FGName1,disk2,FGName2,...), not bare disk paths. One
 # failure group per disk, named FG_<label> — derived directly from
 # asm_diskgroup_data_disks below, no separate failure-group-name list needed.
-oracle.install.asm.diskGroup.disksWithFailureGroupNames={% for d in asm_diskgroup_data_disks %}/dev/disk/by-label/{{ d }},FG_{{ d }}{% if not loop.last %},{% endif %}{% endfor %}
-oracle.install.asm.diskGroup.disks={% for d in asm_diskgroup_data_disks %}/dev/disk/by-label/{{ d }}{% if not loop.last %},{% endif %}{% endfor %}
-oracle.install.asm.diskGroup.diskDiscoveryString=/dev/disk/by-label/*
+#
+# NOTE — the blank line after each of the next two properties is deliberate, not
+# cosmetic. Both end in an inline Jinja for-loop's closing tag with nothing
+# else on the line; Ansible's template module sets trim_blocks=True, which
+# silently eats the ONE newline immediately following any Jinja block tag.
+# With no blank line to absorb that, this property's rendered value ran
+# straight into the next property's key=value text with no line break between
+# them — OUI then parsed the whole merged blob as a single
+# disksWithFailureGroupNames value, and the comma-split token that should have
+# been ASMDISK03's failure-group name ended up being
+# "/dev/disk/by-label/ASMDISK03oracle.install.asm.diskGroup.
+# diskDiscoveryString=/dev/disk/by-label/*" instead — exactly the string
+# [INS-30542] quoted back ("does not start with an alphabet"). The
+# clusterNodes property above survives this same trim_blocks behavior only
+# because it already happens to be followed by a blank line. See
+# docs/known-risks.md #70. (Writing the literal tag delimiters in this
+# comment the first time around was itself a second bug — Jinja parses `#`
+# as plain text, not a comment marker the way the rendered .rsp file treats
+# it, so literal for/endfor delimiter text in a comment gets parsed as a
+# real, unmatched block tag. See known-risks.md #71.)
+oracle.install.asm.diskGroup.disksWithFailureGroupNames={% for d in asm_diskgroup_data_disks %}/dev/oracleasm/disks/{{ d }},FG_{{ d }}{% if not loop.last %},{% endif %}{% endfor %}
+
+oracle.install.asm.diskGroup.disks={% for d in asm_diskgroup_data_disks %}/dev/oracleasm/disks/{{ d }}{% if not loop.last %},{% endif %}{% endfor %}
+
+oracle.install.asm.diskGroup.diskDiscoveryString=/dev/oracleasm/disks/*
 
 # Passwords — pulled from group_vars/all.yml, which should be ansible-vault
 # encrypted before this is ever run against real infrastructure.

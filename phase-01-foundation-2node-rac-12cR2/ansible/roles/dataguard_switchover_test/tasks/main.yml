@@ -1,0 +1,388 @@
+---
+# Data Guard Broker — switchover test (README.md Section 14's own "what's
+# left" gap, known-risks.md #137). Standalone role, deliberately NOT part
+# of roles/dataguard_broker — a real switchover is genuinely disruptive
+# (briefly makes the primary unavailable while roles flip) and has no
+# business being reachable via a stray `-e` flag on dataguard_broker's own
+# normal, idempotent re-run path. Invoke this role directly, on its own,
+# only when actually ready: `--tags dataguard_switchover_test`.
+#
+# hosts: localhost + delegate_to per database, same pattern as
+# dataguard_broker/dataguard_role_services — genuinely coordinates both
+# clusters from a single play.
+#
+# --- Direction-agnostic by design -------------------------------------
+# This role does NOT hardcode "switch apexdb to apexdb_stby" — it queries
+# DGMGRL's own SHOW CONFIGURATION first to determine which database is
+# CURRENTLY primary, then issues SWITCHOVER TO whichever is currently
+# standby. That means the exact same command switches over on the first
+# run and switches BACK on the second run — no direction variable, no
+# separate "undo" role. Re-run this role twice in a row (with time to
+# verify in between) to test a full round trip.
+#
+# --- What this actually verifies, not just performs --------------------
+# The real point of this test, stated in README.md Section 14 and
+# known-risks.md #137 as the one thing still unverified about this whole
+# Data Guard build: Section 13's role-based services (apexdb_rw/apexdb_ro,
+# `-policy AUTOMATIC`) are supposed to flip automatically the instant
+# Broker updates each database's CRS role attribute during a real
+# switchover — nobody has actually watched that happen yet. This role
+# doesn't just run SWITCHOVER and call it done; it re-queries both
+# databases' real database_role via SQL afterward, and checks srvctl's
+# real service status on both clusters afterward, specifically to either
+# confirm or contradict that automatic-flip claim with real evidence.
+#
+# --- Credential hygiene -------------------------------------------------
+# Same convention as dataguard_broker: every DGMGRL script opens with
+# `CONNECT sys/{{ sys_password }}@... AS SYSDBA` as its first line,
+# written to a 0600 file via a no_log'd copy task, invoked via shell input
+# redirection (`dgmgrl < file` — NOT `@file`, confirmed not valid DGMGRL
+# syntax the hard way in dataguard_broker's own first real run, see
+# known-risks.md #137). Every debug task that displays DGMGRL stdout
+# strips the live sys_password value via a regex_escape'd regex_replace
+# first, so a leak can't reach the terminal/log either way.
+#
+# ONE deliberate exception (James's own call): the SWITCHOVER script itself
+# (dg_switch_switchover.dgc) is kept on disk after the run instead of being
+# deleted, for reference/debugging — see the comment right above that task
+# below. It's still mode 0600 / oracle-owned-only, but the live password
+# does persist in that one plaintext file until removed by hand.
+
+- name: "Preflight: fail loudly if sys_password was never overridden (same guard as dataguard_broker/dataguard_duplicate/dataguard_net_config)"
+  run_once: true
+  assert:
+    that: sys_password != "CHANGE_ME_sys_password"
+    fail_msg: >
+      sys_password is still the group_vars/all.yml placeholder
+      ("CHANGE_ME_sys_password") — pass the real value explicitly:
+      -e sys_password='...'. DGMGRL's CONNECT commands below use it directly.
+
+# ============================================================================
+# Determine current primary/standby (check-then-act — never assume a
+# direction, always ask DGMGRL what's actually true right now)
+# ============================================================================
+- name: "Write DGMGRL script: SHOW CONFIGURATION (determine current primary/standby before deciding switchover direction)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_switch_show_config.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      show configuration;
+  run_once: true
+
+- name: "Run: SHOW CONFIGURATION"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_switch_show_config.dgc
+  register: dg_switch_show_config_raw
+  changed_when: false
+  run_once: true
+
+- name: Show SHOW CONFIGURATION output (password redacted)
+  debug:
+    msg: "{{ (dg_switch_show_config_raw.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+
+- name: "Remove the SHOW CONFIGURATION script (contained a live password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_switch_show_config.dgc"
+    state: absent
+  run_once: true
+
+- name: "Fail loudly if SHOW CONFIGURATION didn't report either database as Primary — something is wrong with the configuration itself, don't guess a direction"
+  fail:
+    msg: >-
+      Could not determine which database is currently PRIMARY from SHOW
+      CONFIGURATION's output. Read the output above by hand before
+      re-running — this role refuses to guess a switchover direction.
+  when: >-
+    not (dg_switch_show_config_raw.stdout is search(db_name ~ '\s*-\s*Primary database'))
+    and not (dg_switch_show_config_raw.stdout is search(dg_standby_db_unique_name ~ '\s*-\s*Primary database'))
+  run_once: true
+
+- name: "Set facts: which database is currently primary, and which is currently standby (drives everything below — no hardcoded direction)"
+  set_fact:
+    dg_switch_current_primary: "{{ db_name if (dg_switch_show_config_raw.stdout is search(db_name ~ '\\s*-\\s*Primary database')) else dg_standby_db_unique_name }}"
+    dg_switch_current_standby: "{{ dg_standby_db_unique_name if (dg_switch_show_config_raw.stdout is search(db_name ~ '\\s*-\\s*Primary database')) else db_name }}"
+  run_once: true
+
+# Confirmed via Oracle docs / DGMGRL practice: SWITCHOVER TO <standby> must
+# be issued while CONNECTed to the CURRENT PRIMARY — DGMGRL then handles the
+# standby-side coordination automatically. Connecting to the standby and
+# issuing the same command is not the documented/supported direction.
+- name: "Set fact: TNS alias for the CURRENT PRIMARY (must CONNECT here to issue SWITCHOVER TO — not the standby's alias)"
+  set_fact:
+    dg_switch_primary_alias: "{{ 'apexdb_stby_DGMGRL' if dg_switch_current_primary == dg_standby_db_unique_name else 'apexdb_DGMGRL' }}"
+  run_once: true
+
+- name: Report detected direction
+  debug:
+    msg: >-
+      Currently PRIMARY: {{ dg_switch_current_primary }}. Currently STANDBY:
+      {{ dg_switch_current_standby }}. This run will SWITCHOVER TO
+      {{ dg_switch_current_standby }} — it becomes the new PRIMARY,
+      {{ dg_switch_current_primary }} becomes the new STANDBY. Re-run this
+      same role afterward to switch back (direction is re-detected fresh
+      each run).
+  run_once: true
+
+# ============================================================================
+# PAUSE — last chance to abort before roles actually flip
+# ============================================================================
+- name: "PAUSE — about to SWITCHOVER TO {{ dg_switch_current_standby }}. This flips primary/standby roles for real and briefly interrupts primary availability. Ctrl+C then A to abort."
+  pause:
+    prompt: >
+      About to run SWITCHOVER TO {{ dg_switch_current_standby }}.
+      {{ dg_switch_current_standby }} becomes the new PRIMARY,
+      {{ dg_switch_current_primary }} becomes the new STANDBY. Section 13's
+      role-based services (apexdb_rw/apexdb_ro) SHOULD flip automatically —
+      this run verifies that for real. Press Enter to continue, or Ctrl+C
+      then A to abort.
+  run_once: true
+
+# ============================================================================
+# SWITCHOVER
+#
+# Deliberate deviation from this project's usual convention (James's own
+# call): every other DGMGRL/SQL*Plus script that embeds a live password gets
+# deleted right after use (see dataguard_broker, and the SHOW CONFIGURATION
+# script above in this same role). This one — dg_switch_switchover.dgc — is
+# kept on disk after the run instead, for reference/debugging. Mitigations
+# still in place: mode 0600, owned by {{ oracle_user }}:oinstall only (not
+# world- or group-readable), and every debug task that prints its output
+# still redacts the password via the regex_escape-protected regex_replace.
+# The live sys password itself DOES remain in this plaintext file on
+# oradbserv05 until manually removed — clean it up by hand
+# ({{ staging_dir }}/sql/dg_switch_switchover.dgc) once it's no longer
+# needed for reference.
+# ============================================================================
+- name: "Write DGMGRL script: SWITCHOVER TO {{ dg_switch_current_standby }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_switch_switchover.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@{{ dg_switch_primary_alias }} as sysdba
+      switchover to {{ dg_switch_current_standby }};
+      show configuration;
+  run_once: true
+
+- name: "Run: SWITCHOVER TO {{ dg_switch_current_standby }}"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_switch_switchover.dgc
+  register: dg_switch_switchover_result
+  run_once: true
+
+- name: 'Show switchover output (password redacted) — expect "Switchover succeeded, new primary is ..." and the new Members: list reversed'
+  debug:
+    msg: "{{ (dg_switch_switchover_result.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+
+- name: "Reminder: dg_switch_switchover.dgc was NOT removed (kept on disk by request) — it still contains a live sys password in plaintext"
+  debug:
+    msg: >-
+      {{ staging_dir }}/sql/dg_switch_switchover.dgc was intentionally left
+      on {{ groups['rac_node1'][0] }} (mode 0600, {{ oracle_user }}:oinstall
+      only). Remove it by hand once it's no longer needed for reference —
+      it contains the real sys password used to connect.
+  run_once: true
+
+- name: "Fail loudly if DGMGRL didn't report success — don't proceed to the verification steps below against a switchover that may not have actually completed"
+  fail:
+    msg: >-
+      SWITCHOVER TO {{ dg_switch_current_standby }} did not report success —
+      read the raw output above by hand before doing anything else. Do NOT
+      assume the role flip happened; verify against v$database directly on
+      both instances before touching srvctl or re-running this role.
+  when: dg_switch_switchover_result.stdout is not search('Switchover succeeded')
+  run_once: true
+
+# ============================================================================
+# Verify the role flip actually happened — real SQL, not DGMGRL's own report.
+# Local OS-authenticated connect (sqlplus -s / as sysdba) on each database's
+# own owning node — same convention as dataguard_role_services' own role
+# checks, no password needed for a plain SELECT against v$database.
+# ============================================================================
+- name: "Write SQL to verify database_role + open_mode directly (ground truth, independent of what DGMGRL just reported)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_switch_verify_role.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    content: |
+      set echo off heading off feedback off pagesize 0 linesize 200 tab off
+      select database_role || '|' || open_mode from v$database;
+      exit;
+  loop:
+    - { db: apexdb, node: "{{ groups['rac_node1'][0] }}" }
+    - { db: apexdb_stby, node: "{{ groups['standby_nodes'][0] }}" }
+  loop_control:
+    label: "{{ item.db }}"
+  run_once: true
+
+- name: "Run: verify database_role on both databases (delegated to each database's own owning node)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_switch_verify_role.sql
+  loop:
+    - { db: apexdb, node: "{{ groups['rac_node1'][0] }}" }
+    - { db: apexdb_stby, node: "{{ groups['standby_nodes'][0] }}" }
+  loop_control:
+    label: "{{ item.db }}"
+  register: dg_switch_verify_role
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Show real database_role verification (this is ground truth, not DGMGRL's own report)
+  debug:
+    msg: "{{ item.item.db }}: {{ item.stdout }}"
+  loop: "{{ dg_switch_verify_role.results }}"
+  loop_control:
+    label: "{{ item.item.db }}"
+  run_once: true
+
+- name: "Remove the role-verification script from both nodes"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_switch_verify_role.sql"
+    state: absent
+  loop:
+    - { db: apexdb, node: "{{ groups['rac_node1'][0] }}" }
+    - { db: apexdb_stby, node: "{{ groups['standby_nodes'][0] }}" }
+  loop_control:
+    label: "{{ item.db }}"
+  run_once: true
+
+- name: "Fail loudly if the new standby ({{ dg_switch_current_primary }}) doesn't actually show PHYSICAL STANDBY — the DGMGRL success message alone is not proof"
+  fail:
+    msg: >-
+      SWITCHOVER TO {{ dg_switch_current_standby }} reported success, but
+      real SQL against {{ dg_switch_current_primary }} does not show
+      PHYSICAL STANDBY. Investigate by hand before touching srvctl or
+      re-running this role — the database roles may be in an inconsistent
+      state.
+  when: >-
+    (dg_switch_verify_role.results | selectattr('item.db', 'equalto', 'apexdb' if dg_switch_current_primary == db_name else 'apexdb_stby') | first).stdout
+    is not search('PHYSICAL STANDBY')
+  run_once: true
+
+# ============================================================================
+# Verify Section 13's role-based services flipped automatically — the whole
+# point of this test
+# ============================================================================
+- name: "Check apexdb_rw / apexdb_ro status on apexdb (rac_node1)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  command: "{{ db_home }}/bin/srvctl status service -db {{ db_name }} -service {{ item }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+  loop:
+    - "{{ dg_primary_role_service_rw }}"
+    - "{{ dg_primary_role_service_ro }}"
+  loop_control:
+    label: "{{ item }}"
+  register: dg_switch_primary_service_status
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Show apexdb service status
+  debug:
+    msg: "{{ db_name }} / {{ item.item }}: {{ item.stdout | default(item.stderr) }}"
+  loop: "{{ dg_switch_primary_service_status.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  run_once: true
+
+- name: "Check apexdb_rw / apexdb_ro status on apexdb_stby (standby_nodes[0])"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  command: "{{ db_home }}/bin/srvctl status service -db {{ dg_standby_db_unique_name }} -service {{ item }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+  loop:
+    - "{{ dg_primary_role_service_rw }}"
+    - "{{ dg_primary_role_service_ro }}"
+  loop_control:
+    label: "{{ item }}"
+  register: dg_switch_standby_service_status
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Show apexdb_stby service status
+  debug:
+    msg: "{{ dg_standby_db_unique_name }} / {{ item.item }}: {{ item.stdout | default(item.stderr) }}"
+  loop: "{{ dg_switch_standby_service_status.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  run_once: true
+
+- name: "Set facts: did the role-based services actually flip automatically, matching the NEW roles"
+  set_fact:
+    dg_switch_new_primary_runs_rw: >-
+      {{
+        (dg_switch_primary_service_status.results | selectattr('item', 'equalto', dg_primary_role_service_rw) | first).stdout
+        is search('is running')
+        if dg_switch_current_standby == db_name else
+        (dg_switch_standby_service_status.results | selectattr('item', 'equalto', dg_primary_role_service_rw) | first).stdout
+        is search('is running')
+      }}
+    dg_switch_new_standby_runs_ro: >-
+      {{
+        (dg_switch_standby_service_status.results | selectattr('item', 'equalto', dg_primary_role_service_ro) | first).stdout
+        is search('is running')
+        if dg_switch_current_standby == db_name else
+        (dg_switch_primary_service_status.results | selectattr('item', 'equalto', dg_primary_role_service_ro) | first).stdout
+        is search('is running')
+      }}
+  run_once: true
+
+- name: "Switchover test result"
+  debug:
+    msg: >-
+      Switchover to {{ dg_switch_current_standby }} complete.
+      {{ dg_switch_current_standby }} is now PRIMARY, {{ dg_switch_current_primary }}
+      is now STANDBY (confirmed via real SQL, not just DGMGRL's own report).
+      Automatic role-based service flip:
+      {{ dg_primary_role_service_rw }} running on the new primary =
+      {{ dg_switch_new_primary_runs_rw }};
+      {{ dg_primary_role_service_ro }} running on the new standby =
+      {{ dg_switch_new_standby_runs_ro }}.
+      {{ 'CONFIRMED — Section 13s automatic role-flip claim holds against a real switchover.' if (dg_switch_new_primary_runs_rw and dg_switch_new_standby_runs_ro) else 'DID NOT FLIP AUTOMATICALLY — read the srvctl output above; the services may need a manual srvctl start/stop, or -policy AUTOMATIC is not behaving as expected. This contradicts Section 13s documented claim and is worth investigating before relying on it.' }}
+      Re-run this same role (--tags dataguard_switchover_test) to switch
+      back — direction is re-detected fresh each run.
+  run_once: true

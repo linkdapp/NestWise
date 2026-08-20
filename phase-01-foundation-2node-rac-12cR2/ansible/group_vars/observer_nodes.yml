@@ -1,0 +1,26 @@
+---
+# Group-scoped vars for the observer_nodes inventory group (oemserver01,
+# Data Guard Phase 9 — Fast-Start Failover) — intentionally EMPTY.
+#
+# Originally held observer_oracle_home/fsfo_dir/fsfo_wallet_dir/
+# dg_observer_name here, following group_vars/standby_nodes.yml's own
+# per-group redirection pattern. Real first run caught why that doesn't
+# work for this role specifically: dataguard_fsfo is hosts: localhost +
+# delegate_to (same pattern as dataguard_broker/dataguard_role_services),
+# and group_vars/<group>.yml only auto-loads for the play's OWN `hosts:`
+# target — localhost isn't a member of observer_nodes, so vars defined here
+# were undefined when a delegated task tried to template them
+# ("'fsfo_dir' is undefined"), even though the task correctly ran ON
+# oemserver01. Every var that already worked from a localhost-hosted,
+# delegate_to role (db_home, sid_prefix, oracle_user, staging_dir) does so
+# only because those live in group_vars/all.yml, which loads for every
+# host including localhost — group_vars/standby_nodes.yml-style redirection
+# only actually works for roles whose `hosts:` line targets that group
+# directly (dataguard_net_config, os_prep, etc.), not for a coordinating
+# role delegating INTO the group from localhost.
+#
+# Fixed by moving all four variables into group_vars/all.yml instead (new,
+# dedicated names, still not reusing db_home/staging_dir — see that file's
+# own comment for why). This file is kept, empty, rather than deleted, so
+# the [observer_nodes] group in inventory/hosts.ini still has a documented
+# home for anything genuinely observer_nodes-specific in the future.

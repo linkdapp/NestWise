@@ -297,9 +297,25 @@
     create_home: true
 
 - name: Ensure oracle user is in all the groups this project needs (preinstall RPM creates the base account)
+  # known-risks.md #111: asmadmin/asmoper were missing here — James found this
+  # for real (`usermod -G dba,oper,backupdba,dgdba,kmdba,racdba,vboxsf,
+  # asmdba,asmadmin,asmoper oracle` by hand) and asked for it to be folded
+  # back into os_prep. asmdba alone (SYSDBA on +ASM — lets the RDBMS owner
+  # connect to and use ASM-stored database files) is Oracle's documented
+  # minimum for the database owner; asmadmin (SYSASM — full ASM
+  # administration) is normally grid-only in Oracle's standard role-separated
+  # model. Not second-guessing James's real, empirical fix on the actual
+  # system though — added both asmadmin and asmoper to match grid_user's own
+  # groups line above exactly, rather than assume asmdba alone is actually
+  # sufficient for every asmcmd/ASM interaction this project's roles run as
+  # oracle. backupdba/dgdba/kmdba deliberately NOT added here — those are
+  # created and already populated by the oracle-database-preinstall-19c RPM
+  # itself (see group_vars/all.yml's GID comment on oper — same precedent),
+  # not something os_prep manages, and there's no evidence oracle was
+  # actually missing from them.
   user:
     name: "{{ oracle_user }}"
-    groups: "oinstall,dba,asmdba,oper,racdba,{{ vboxsf_group }}"
+    groups: "oinstall,dba,asmdba,asmadmin,asmoper,oper,racdba,{{ vboxsf_group }}"
     append: true
 
 - name: Give oracle and grid sudo privileges (lab convenience — NOT a production pattern)
@@ -386,33 +402,52 @@
 # change every time os_prep runs afterward — worth suspecting as a contributing cause
 # of some of today's chmod/EPERM weirdness even though not confirmed as the sole cause.
 # `stat` first, only act on a node that's still pre-install (owner isn't root yet).
+#
+# CORRECTED 2026-08-14 (known-risks.md #68) — "owner is root" alone turned out to be
+# too weak a signal for "root.sh already ran, don't fight it." Confirmed on a real
+# run: oradbserv09/10 (root.sh never once succeeded there — Phase A has never
+# completed) still had /u01/app root-owned, root:oinstall, timestamped from this
+# session's own earlier troubleshooting (not root.sh) — os_prep's guard read that as
+# "post-install" and silently skipped fixing it, on every single re-run, which
+# cascaded into gridSetup.sh's INS-32031/INS-32033 ("Invalid inventory location" /
+# "Central Inventory location is not writable") since grid could no longer create
+# {{ inventory_loc }} as a new child of a root-owned /u01/app. /etc/oracle/olr.loc
+# is a much more specific signal — root.sh (any phase) creates it as part of setting
+# up the Oracle Local Registry; nothing else in this project's roles ever creates or
+# would create it. Skip the ownership fix only when BOTH root-owned AND olr.loc
+# actually exists — real evidence root.sh ran, not just an ownership coincidence.
+- name: "Check for /etc/oracle/olr.loc (root.sh's own marker — the reliable signal that it has actually run, not just 'owner is root')"
+  stat:
+    path: /etc/oracle/olr.loc
+  register: olr_loc_stat
+
 - name: "Check current owner of {{ u01_mount_point }} (root.sh re-owns this to root:oinstall after running — this task must not fight that)"
   stat:
     path: "{{ u01_mount_point }}"
   register: u01_stat
 
-- name: "Pre-install ownership on {{ u01_mount_point }} itself — grid:oinstall (matches Oracle's documented OFA model; skipped once root.sh has already flipped this to root)"
+- name: "Pre-install ownership on {{ u01_mount_point }} itself — grid:oinstall (matches Oracle's documented OFA model; skipped only once root.sh has ACTUALLY run — see olr.loc check above)"
   file:
     path: "{{ u01_mount_point }}"
     state: directory
     owner: "{{ grid_user }}"
     group: oinstall
     mode: "0775"
-  when: u01_stat.stat.pw_name != 'root'
+  when: not (u01_stat.stat.pw_name == 'root' and olr_loc_stat.stat.exists)
 
 - name: "Check current owner of {{ oracle_base | dirname }} (/u01/app — same root.sh re-ownership lifecycle as {{ u01_mount_point }} above)"
   stat:
     path: "{{ oracle_base | dirname }}"
   register: u01_app_stat
 
-- name: "Pre-install ownership on {{ oracle_base | dirname }} — grid:oinstall (matches Oracle's documented OFA model; skipped once root.sh has already flipped this to root)"
+- name: "Pre-install ownership on {{ oracle_base | dirname }} — grid:oinstall (matches Oracle's documented OFA model; skipped only once root.sh has ACTUALLY run — see olr.loc check above)"
   file:
     path: "{{ oracle_base | dirname }}"
     state: directory
     owner: "{{ grid_user }}"
     group: oinstall
     mode: "0775"
-  when: u01_app_stat.stat.pw_name != 'root'
+  when: not (u01_app_stat.stat.pw_name == 'root' and olr_loc_stat.stat.exists)
 
 # {{ oracle_base | dirname }}/grid (i.e. /u01/app/grid, the PARENT of grid_home
 # /u01/app/grid/19.3.0) never gets an explicit owner/mode of its own anywhere else in

@@ -38,12 +38,25 @@ alias startcrs='sudo $GRID_HOME/bin/crsctl start crs'
 alias checkcrs='sudo $GRID_HOME/bin/crsctl check crs'
 alias stopclust='sudo $GRID_HOME/bin/crsctl stop cluster -all'
 alias strtclust='sudo $GRID_HOME/bin/crsctl start cluster -all'
+# checkclust needs the "check" verb — "crsctl cluster -all" alone isn't valid crsctl
+# syntax, caught while merging this alias in from a hand-edited live .bash_profile.
+alias checkclust='sudo $GRID_HOME/bin/crsctl check cluster -all'
 
 alias alertlog="vi $ORACLE_BASE/diag/asm/+asm/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log"
 alias tailalert="echo -e \"\n\nTailing $ORACLE_BASE/diag/asm/+asm/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log\n\n\"; tail -f $ORACLE_BASE/diag/asm/+asm/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log"
+# dbalert/alertdb and asmalert/alertasm are the same two commands as alertlog/tailalert
+# above, under different mnemonics — kept as aliases-of-the-same-thing rather than
+# collapsed, since James uses both naming patterns interchangeably day to day.
+alias dbalert="vi $ORACLE_BASE/diag/asm/+asm/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log"
+alias alertdb="echo -e \"\n\nTailing $ORACLE_BASE/diag/asm/+asm/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log\n\n\"; tail -f $ORACLE_BASE/diag/asm/+asm/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log"
+alias asmalert="vi $ORACLE_BASE/diag/asm/+asm/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log"
+alias alertasm="echo -e \"\n\nTailing $ORACLE_BASE/diag/asm/+asm/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log\n\n\"; tail -f $ORACLE_BASE/diag/asm/+asm/\$ORACLE_SID/trace/alert_\$ORACLE_SID.log"
 
 # Full OS-user switch to oracle — passwordless via /etc/sudoers.d/11-oracle-grid
-# (os_prep role). Same reasoning as oracle's su2grid alias, in reverse.
+# (os_prep role). Same reasoning as oracle's su2grid alias, in reverse. (No stray
+# "# alias su2grid=..." comment here on purpose — that showed up on the live,
+# hand-edited oradbserv05 file, not in this template; re-rendering from this
+# template clears it.)
 alias su2oracle='sudo -iu {{ oracle_user }}'
 
 ############ Change Control #############################

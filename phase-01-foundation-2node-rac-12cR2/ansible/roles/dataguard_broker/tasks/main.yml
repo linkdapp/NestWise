@@ -1,0 +1,1018 @@
+---
+# Data Guard Phase 7 — Broker configuration (README.md Section 14, SOP-adjacent —
+# no uploaded SOP section covers Broker, this is built from James's own draft
+# workflow plus current Oracle MAA documentation). Runs AFTER Phase 8
+# (dataguard_role_services, known-risks.md #136) even though it's numbered
+# lower — Phase 8's srvctl-based role services were self-contained and built
+# first on purpose; Phase 7/Broker is what finally gives this lab automatic
+# service role-flip during a real switchover/failover, closing that gap.
+#
+# hosts: localhost + delegate_to per database (rac_node1 for apexdb,
+# standby_nodes[0] for apexdb_stby) — same pattern as dataguard_convert_rac /
+# dataguard_role_services, since this role genuinely coordinates both
+# clusters from a single play.
+#
+# --- Design decisions worth stating up front ------------------------------
+#
+# 1. TNS aliases: apexdb_DGMGRL / apexdb_stby_DGMGRL (dataguard_net_config),
+#    not the plain apexdb/apexdb_stby aliases, for every DGMGRL CONNECT/
+#    CREATE CONFIGURATION/ADD DATABASE identifier below. These carry UR=A —
+#    DGMGRL needs to reach an instance in ANY state (MOUNT, not just OPEN),
+#    which matters most during switchover/failover, exactly when the plain
+#    app-facing alias could fail to resolve. Renamed from the original "_dg"
+#    suffix (James's own call) specifically because "_dg" collided in
+#    spirit with dg_broker_config_name ("apexdb_dg" in group_vars/all.yml —
+#    the BROKER CONFIGURATION's name, a different namespace, but confusing
+#    to read side by side). "_DGMGRL" also now matches the static listener
+#    GLOBAL_DBNAME dataguard_net_config registers 1:1.
+#
+# 2. Protection mode: MaxAvailability, not MaxPerformance — James's own
+#    updated call. This REQUIRES LogXptMode='SYNC' (or 'FASTSYNC') on both
+#    database objects, not 'ASYNC' — MaxAvailability cannot be enabled at
+#    all while redo transport is asynchronous; Broker will reject the mode
+#    change with an ORA-16xxx validation error if attempted first. Order
+#    matters: LogXptMode is set to SYNC BEFORE the protection-mode edit
+#    below, not after.
+#
+#    On James's direct question — yes: MaxAvailability's SYNC transport does
+#    NOT hang the primary indefinitely if the standby lags or drops. Oracle
+#    waits up to the NetTimeout property (30 seconds, left at its default
+#    here) for the standby's acknowledgment; if that elapses without ack,
+#    Data Guard automatically and temporarily stops waiting on that
+#    destination — the primary keeps committing without blocking, which is
+#    functionally the same as MaxPerformance's async behavior, for as long
+#    as the standby stays unavailable/behind. The protection mode LABEL
+#    itself does not change (SHOW CONFIGURATION still reports
+#    "MaxAvailability") — only the transport behavior degrades — and once
+#    the standby catches back up, redo transport automatically resumes true
+#    SYNC and the zero-data-loss guarantee is back in force. This graceful
+#    degrade-and-resync is exactly why MaxAvailability is MAA's recommended
+#    mode over MaxProtection (which instead stalls the primary/refuses
+#    commits if no viable SYNC standby remains at all).
+#
+# 3. ASM /DG subdirectory gap (known-risks.md #98/#99): standby's spfile
+#    already points dg_broker_config_file1/2 at the /DG path (baked in by
+#    RMAN DUPLICATE ... SPFILE SET at Phase 4 — dg_broker_start='true' was
+#    baked in too), but the ASM directory itself was never created —
+#    meaning DMON has been running on the standby this whole time pointed
+#    at a path that doesn't exist in ASM. The primary, by contrast, is
+#    still on its ORIGINAL (no /DG) path from dataguard_primary_prep and
+#    needs an actual relocation (disable -> set -> enable dance, same
+#    pattern as that role, known-risks.md #81 — DMON locks whatever path is
+#    already live the instant dg_broker_start=true takes effect, so the
+#    file location MUST change while broker is temporarily disabled).
+#    ASM has no mkdir -p (James's own reminder) — both diskgroups already
+#    have the parent {{ db_unique_name }}/ directory (DBCA created it), so
+#    only the DG/ subdirectory itself needs the check-then-create step
+#    below, but it's still written as an explicit check rather than assumed.
+#
+# 4. Static _DGMGRL listener entry: added by dataguard_net_config itself now
+#    (same managed block as the plain SID_DESC — Oracle allows only one
+#    SID_LIST_LISTENER stanza per listener), not by this role. See that
+#    role's own comments. Prerequisite for this role: dataguard_net_config
+#    must have been re-run (--tags dataguard_net_config) since that change
+#    landed, on all 4 DB nodes, before this role's DGMGRL connections can
+#    reach any instance that isn't already OPEN.
+#
+# 5. Switchover test: lives in its own standalone role
+#    (roles/dataguard_switchover_test, tags: [dataguard_switchover_test]),
+#    not in this one — a real switchover is a genuinely disruptive,
+#    briefly-primary-unavailable operation and has no business being
+#    reachable via a stray `-e` flag on this role's normal idempotent
+#    re-run path. Invoke it deliberately, on its own, when actually ready.
+#
+# 6. SYS password: already identical on both databases — RMAN DUPLICATE
+#    copied the primary's real password file onto the standby verbatim at
+#    Phase 4 (known-risks.md #116), which Broker requires across every
+#    database in a configuration. No extra sync step needed here.
+#
+# --- One more honest caveat -------------------------------------------------
+# Unlike sqlplus's `whenever sqlerror exit failure`, DGMGRL has no documented
+# equivalent for making an individual failed command inside a script abort
+# the whole script with a non-zero process exit code — I'm not fully grounded
+# on its exact per-command failure propagation, and this project's own ethic
+# is to say so rather than assume. Every DGMGRL execution task below still
+# registers and displays full output either way (so a failure is always
+# visible to read), but don't rely solely on "the task didn't fail" as proof
+# a step succeeded — read the actual DGMGRL output shown by each debug task,
+# especially CREATE CONFIGURATION/ADD DATABASE/ENABLE CONFIGURATION and the
+# final health check, on the first real run.
+#
+# --- Update — first real run: `dgmgrl @file` is not valid DGMGRL syntax ----
+# Confirmed from a real run's actual output: invoking `dgmgrl @{{ path }}`
+# (RMAN/SQL*Plus-style script argument) is NOT valid — DGMGRL printed
+# "Invalid option." plus its own CONNECT syntax help immediately after the
+# welcome banner, then reported "not logged on" for every subsequent
+# command in the script. Net effect: NOTHING in the script actually ran —
+# including the very first SHOW CONFIGURATION check, whose garbled output
+# never contained the literal string "ORA-16532", which made
+# `dg_broker_config_exists` evaluate to a FALSE POSITIVE (concluding a
+# configuration already existed when James's own manual `dgmgrl` session —
+# `connect sys/sys@apexdb_DGMGRL as sysdba` then `show configuration` —
+# proved directly that no configuration exists at all). Fixed: every DGMGRL
+# invocation below now uses shell input REDIRECTION (`dgmgrl < {{ path }}`)
+# instead of a `@file` argument — the standard, documented way to feed
+# DGMGRL a script non-interactively, confirmed correct because it matches
+# the exact same command sequence James proved works by hand (bare
+# `dgmgrl`, then typed commands) — redirection just supplies those same
+# commands via stdin instead of a keyboard. `AS SYSDBA` was also added
+# explicitly to every CONNECT line, matching James's own working manual
+# example exactly, rather than relying on it being optional per the syntax
+# reference. A second, unrelated bug surfaced by the same run: `VALIDATE
+# STATIC CONNECT IDENTIFIER FOR <db>` is wrong word order — real DGMGRL
+# syntax is `VALIDATE DATABASE <db> STATIC CONNECT IDENTIFIER;`, confirmed
+# directly from DGMGRL's own "Syntax error before or at 'static'" message
+# once it was actually able to read a script at all. Not yet re-run with
+# these fixes in place.
+#
+# --- Output/credential hygiene ---------------------------------------------
+# Every DGMGRL script below opens with `CONNECT sys/{{ sys_password }}@...
+# AS SYSDBA` as its first line, written to a 0600 file via a no_log'd copy
+# task — same convention as every sqlplus/RMAN script elsewhere in this
+# project, fed to DGMGRL via stdin redirection (see the update above, not
+# a `@file` argument). DGMGRL's exact echo behavior for a redirected
+# CONNECT line still isn't confirmed either way from the first real run
+# (nothing actually executed) — still worth watching on the next run. As a
+# defense-in-depth safety net regardless of that answer, every debug task
+# below that displays DGMGRL stdout runs it through a regex_replace that
+# strips the literal live sys_password value first, so a leak can't reach
+# the terminal/log either way. sys_password is passed through the
+# `regex_escape` filter before being spliced into the regex_replace
+# PATTERN argument — without that, a real password containing regex
+# metacharacters (`.`, `+`, `(`, `$`, etc. — all plausible in a real
+# password) would either fail to match at all (leaving the password
+# unredacted) or throw a Jinja/regex compilation error and fail the task
+# outright. Caught in a self-review before this ever ran for real.
+
+- name: "Preflight: fail loudly if sys_password was never overridden (same guard as dataguard_duplicate/dataguard_net_config)"
+  run_once: true
+  assert:
+    that: sys_password != "CHANGE_ME_sys_password"
+    fail_msg: >
+      sys_password is still the group_vars/all.yml placeholder
+      ("CHANGE_ME_sys_password") — pass the real value explicitly:
+      -e sys_password='...'. DGMGRL's CONNECT commands below use it directly.
+
+# ============================================================================
+# 7.1 — ASM /DG subdirectory: primary cluster (usatclust1)
+# ============================================================================
+- name: "Primary: check whether the ASM /DG subdirectory already exists under each diskgroup"
+  become: true
+  become_user: "{{ grid_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  command: "{{ grid_home }}/bin/asmcmd ls +{{ item }}/{{ db_unique_name }}/DG"
+  loop:
+    - "{{ asm_diskgroup_data }}"
+    - "{{ asm_diskgroup_reco }}"
+  loop_control:
+    label: "+{{ item }}/{{ db_unique_name }}/DG"
+  register: dg_broker_primary_asm_check
+  changed_when: false
+  failed_when: false
+
+- name: Show primary ASM /DG check output
+  debug:
+    var: dg_broker_primary_asm_check.results
+
+- name: "Primary: create the ASM /DG subdirectory under each diskgroup (only where the check above didn't find it — parent {{ db_unique_name }}/ already exists, DBCA created it)"
+  become: true
+  become_user: "{{ grid_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  command: "{{ grid_home }}/bin/asmcmd mkdir +{{ item.item }}/{{ db_unique_name }}/DG"
+  loop: "{{ dg_broker_primary_asm_check.results }}"
+  loop_control:
+    label: "+{{ item.item }}/{{ db_unique_name }}/DG"
+  when: item.rc != 0
+  register: dg_broker_primary_asm_mkdir
+
+- name: Show primary ASM /DG create output
+  debug:
+    var: dg_broker_primary_asm_mkdir.results
+  when: dg_broker_primary_asm_mkdir.changed
+
+# ============================================================================
+# 7.1 — ASM /DG subdirectory: standby cluster (usatclust2)
+# ============================================================================
+- name: "Standby: check whether the ASM /DG subdirectory already exists under each diskgroup"
+  become: true
+  become_user: "{{ grid_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  command: "{{ grid_home }}/bin/asmcmd ls +{{ item }}/{{ dg_standby_db_unique_name }}/DG"
+  loop:
+    - "{{ asm_diskgroup_data }}"
+    - "{{ asm_diskgroup_reco }}"
+  loop_control:
+    label: "+{{ item }}/{{ dg_standby_db_unique_name }}/DG"
+  register: dg_broker_standby_asm_check
+  changed_when: false
+  failed_when: false
+
+- name: Show standby ASM /DG check output
+  debug:
+    var: dg_broker_standby_asm_check.results
+
+- name: "Standby: create the ASM /DG subdirectory under each diskgroup (only where the check above didn't find it)"
+  become: true
+  become_user: "{{ grid_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  command: "{{ grid_home }}/bin/asmcmd mkdir +{{ item.item }}/{{ dg_standby_db_unique_name }}/DG"
+  loop: "{{ dg_broker_standby_asm_check.results }}"
+  loop_control:
+    label: "+{{ item.item }}/{{ dg_standby_db_unique_name }}/DG"
+  when: item.rc != 0
+  register: dg_broker_standby_asm_mkdir
+
+- name: Show standby ASM /DG create output
+  debug:
+    var: dg_broker_standby_asm_mkdir.results
+  when: dg_broker_standby_asm_mkdir.changed
+
+# ============================================================================
+# 7.2 — Relocate the PRIMARY's broker config files onto the new /DG path
+# (standby's spfile already points there since Phase 4 — see header note 3;
+# only the primary needs the disable/set/enable dance)
+# ============================================================================
+- name: "Primary: write SQL to check current dg_broker_config_file1 value"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_primary_file_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo off heading off feedback off pagesize 0 linesize 200 tab off
+      select value from v$parameter where name = 'dg_broker_config_file1';
+      exit;
+
+- name: "Primary: check current dg_broker_config_file1 value (idempotency gate — only run the relocation dance if it's not already on /DG)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_broker_primary_file_check.sql
+  register: dg_broker_primary_file_check
+  changed_when: false
+
+- name: Show primary's current dg_broker_config_file1 value
+  debug:
+    var: dg_broker_primary_file_check.stdout_lines
+
+- name: "Set fact: does the primary's broker config file already live under /DG"
+  set_fact:
+    dg_broker_primary_needs_relocate: "{{ '/DG/' not in dg_broker_primary_file_check.stdout }}"
+
+- name: "Primary: write SQL to relocate dg_broker_config_file1/2 onto the /DG path (disable -> set -> enable — known-risks.md #81, DMON locks the live path the instant dg_broker_start=true)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_relocate_primary.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 pagesize 100 tab off
+      alter system set dg_broker_start=false scope=both sid='*';
+      alter system set dg_broker_config_file1='+{{ asm_diskgroup_data }}/{{ db_unique_name }}/DG/dr1{{ db_unique_name }}.dat' scope=both sid='*';
+      alter system set dg_broker_config_file2='+{{ asm_diskgroup_reco }}/{{ db_unique_name }}/DG/dr2{{ db_unique_name }}.dat' scope=both sid='*';
+      alter system set dg_broker_start=true scope=both sid='*';
+      exit;
+  when: dg_broker_primary_needs_relocate
+
+- name: "Primary: run the broker config file relocation"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_broker_relocate_primary.sql
+  register: dg_broker_primary_relocate_result
+  when: dg_broker_primary_needs_relocate
+
+- name: Show primary broker config file relocation output
+  debug:
+    var: dg_broker_primary_relocate_result.stdout_lines
+  when: dg_broker_primary_needs_relocate
+
+- name: Report primary broker config file already on /DG (skip branch)
+  debug:
+    msg: "Primary dg_broker_config_file1/2 already point under /DG ({{ dg_broker_primary_file_check.stdout }}) — relocation skipped."
+  when: not dg_broker_primary_needs_relocate
+
+# ============================================================================
+# Standby: confirm dg_broker_start / file location (informational only — no
+# relocation SQL needed, Phase 4's RMAN DUPLICATE already baked the /DG path
+# and dg_broker_start=true into the standby spfile; the ASM directory just
+# didn't exist until the step above)
+# ============================================================================
+- name: "Standby: write SQL to confirm dg_broker_start and dg_broker_config_file1/2 current values"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_standby_param_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo off heading on feedback off pagesize 100 linesize 200 tab off
+      column name format a30
+      column value format a55
+      select name, value from v$parameter where name in ('dg_broker_start','dg_broker_config_file1','dg_broker_config_file2');
+      exit;
+
+- name: "Standby: confirm dg_broker_start and dg_broker_config_file1/2 current values"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_broker_standby_param_check.sql
+  register: dg_broker_standby_param_check
+  changed_when: false
+
+- name: Show standby dg_broker_start / file location
+  debug:
+    var: dg_broker_standby_param_check.stdout_lines
+
+- name: "Standby: check the alert log for DMON/broker errors now that the /DG directory exists (informational — a prior ORA-16573/DMON-can't-find-file error should stop recurring on the next log check after this)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  shell: |
+    ALERT_LOG=$(find {{ oracle_base }}/diag/rdbms/{{ dg_standby_db_unique_name | lower }} -name 'alert_*.log' 2>/dev/null | head -1)
+    if [ -n "${ALERT_LOG}" ]; then
+      tail -100 "${ALERT_LOG}" | grep -iE 'DMON|ORA-16|ORA-02097' || echo "No DMON/broker-related errors in the last 100 alert log lines (${ALERT_LOG})."
+    else
+      echo "Alert log not found under {{ oracle_base }}/diag/rdbms/{{ dg_standby_db_unique_name | lower }} — skipping check."
+    fi
+  register: dg_broker_standby_alert_check
+  changed_when: false
+  failed_when: false
+
+- name: Show standby alert log DMON/broker check
+  debug:
+    var: dg_broker_standby_alert_check.stdout_lines
+
+# --- Update — first real run: ORA-16571 on ADD DATABASE --------------------
+# Real run finding: CREATE CONFIGURATION on the primary succeeded (its own
+# broker file was freshly created right after this role's own disable/set/
+# enable relocation dance, which bounces DMON as a side effect), but ADD
+# DATABASE failed with "ORA-16571: Oracle Data Guard configuration file
+# creation failure" — the standby was never actually added, cascading into
+# every later step ("Object apexdb_stby was not found", ORA-16860 on the
+# FastStartFailoverTarget property, ORA-16627 on the protection-mode change
+# since a MaxAvailability configuration needs a standby member to support
+# it). Root cause: the standby's dg_broker_config_file1/2 have pointed at
+# /DG since Phase 4 (baked in by RMAN DUPLICATE), and dg_broker_start=true
+# was baked in too — meaning DMON on the standby has been running since
+# instance startup, almost certainly having already tried and failed once
+# to create its broker file against a /DG path that didn't exist in ASM
+# until earlier in THIS run. DMON doesn't poll and retry in the background;
+# it only (re)attempts file creation when dg_broker_start actually
+# transitions state. The primary got exactly this kind of bounce as a side
+# effect of its own relocation dance; the standby never did.
+#
+# Update — the plain off/on bounce above was NOT enough on its own. James's
+# own real-run diagnosis (a genuine `ORA-16525: broker not yet available`
+# on ADD DATABASE, traced back through `show parameter dg_broker_start`
+# reading FALSE and the standby's alert log) found the actual sequence:
+# `alter system set dg_broker_start=true` was being SILENTLY REJECTED by
+# Oracle and reset back to FALSE, with the alert log explicitly stating
+# "One or both of the files specified by the dg_broker_config_file[1|2]
+# initialization parameters cannot be written... DG_BROKER_START has been
+# set to FALSE" — even though the ASM directory itself is real and
+# confirmed present (asmcmd ls -l). Toggling dg_broker_start alone,
+# without RE-ISSUING the dg_broker_config_file1/2 SET statements (even to
+# the SAME paths they already had), was not sufficient to get DMON to
+# actually re-validate and successfully open the file. James confirmed the
+# fix directly: re-set both file parameters, THEN dg_broker_start=true —
+# succeeded cleanly. Matches the exact three-step dance (disable -> set ->
+# enable) the primary's own relocation task already used — this role's
+# original assumption that the standby could skip the "set" step, since
+# its path wasn't changing, was wrong; Oracle needs the SET restated as
+# part of any dg_broker_start re-enable, not just implicitly reused.
+# File-naming convention confirmed against Phase 4's own already-live
+# values (and James's own working manual command): the ASM DIRECTORY uses
+# the standby's own db_unique_name (apexdb_stby — this role's own /DG
+# subdirectory, created earlier in this file), but the FILENAME STEM uses
+# the PRIMARY's db_unique_name (apexdb, not apexdb_stby) — an existing
+# baked-in convention from Phase 4/dataguard_standby_prep, not something to
+# "correct" now.
+- name: "Standby: write SQL to restart the broker (disable -> RE-SET file1/file2 -> enable — same three-step dance as the primary's relocation, see update above for why the plain off/on bounce wasn't enough)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_standby_restart.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 pagesize 100 tab off
+      alter system set dg_broker_start=false scope=both sid='*';
+      alter system set dg_broker_config_file1='+{{ asm_diskgroup_data }}/{{ dg_standby_db_unique_name }}/DG/dr1{{ db_unique_name }}.dat' scope=both sid='*';
+      alter system set dg_broker_config_file2='+{{ asm_diskgroup_reco }}/{{ dg_standby_db_unique_name }}/DG/dr2{{ db_unique_name }}.dat' scope=both sid='*';
+      alter system set dg_broker_start=true scope=both sid='*';
+      exit;
+
+- name: "Standby: restart the broker (dg_broker_start off/on)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_broker_standby_restart.sql
+  register: dg_broker_standby_restart_result
+
+- name: Show standby broker restart output
+  debug:
+    var: dg_broker_standby_restart_result.stdout_lines
+
+# ============================================================================
+# PAUSE before touching log_archive_dest_2 / creating the Broker configuration
+# ============================================================================
+- name: "PAUSE — about to clear log_archive_dest_2 (both databases) and create the Data Guard Broker configuration. Ctrl+C then A to abort."
+  pause:
+    prompt: >
+      Primary and standby broker config files are on /DG. About to clear
+      log_archive_dest_2 (Broker will manage it from here) and run CREATE
+      CONFIGURATION / ADD DATABASE / ENABLE CONFIGURATION. Press Enter to
+      continue, or Ctrl+C then A to abort.
+  run_once: true
+
+# ============================================================================
+# 7.3 — Clear manual log_archive_dest_2 (Broker manages it once enabled)
+# ============================================================================
+- name: "Primary: write SQL to check current log_archive_dest_2 value"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_primary_lad2_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo off heading off feedback off pagesize 0 linesize 200 tab off
+      select value from v$parameter where name = 'log_archive_dest_2';
+      exit;
+
+- name: "Primary: check current log_archive_dest_2 value"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_broker_primary_lad2_check.sql
+  register: dg_broker_primary_lad2_check
+  changed_when: false
+
+- name: "Primary: write SQL to clear log_archive_dest_2"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_primary_lad2_clear.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 pagesize 100 tab off
+      alter system set log_archive_dest_2='' scope=both sid='*';
+      exit;
+  when: dg_broker_primary_lad2_check.stdout | trim | length > 0
+
+- name: "Primary: clear log_archive_dest_2 (only if currently non-empty)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_broker_primary_lad2_clear.sql
+  register: dg_broker_primary_lad2_clear
+  when: dg_broker_primary_lad2_check.stdout | trim | length > 0
+
+- name: Show primary log_archive_dest_2 clear output
+  debug:
+    var: dg_broker_primary_lad2_clear.stdout_lines
+  when: dg_broker_primary_lad2_check.stdout | trim | length > 0
+
+- name: "Standby: write SQL to check current log_archive_dest_2 value"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_standby_lad2_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo off heading off feedback off pagesize 0 linesize 200 tab off
+      select value from v$parameter where name = 'log_archive_dest_2';
+      exit;
+
+- name: "Standby: check current log_archive_dest_2 value"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_broker_standby_lad2_check.sql
+  register: dg_broker_standby_lad2_check
+  changed_when: false
+
+- name: "Standby: write SQL to clear log_archive_dest_2"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_standby_lad2_clear.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 pagesize 100 tab off
+      alter system set log_archive_dest_2='' scope=both sid='*';
+      exit;
+  when: dg_broker_standby_lad2_check.stdout | trim | length > 0
+
+- name: "Standby: clear log_archive_dest_2 (only if currently non-empty)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_nodes'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus / as sysdba @{{ staging_dir }}/sql/dg_broker_standby_lad2_clear.sql
+  register: dg_broker_standby_lad2_clear
+  when: dg_broker_standby_lad2_check.stdout | trim | length > 0
+
+- name: Show standby log_archive_dest_2 clear output
+  debug:
+    var: dg_broker_standby_lad2_clear.stdout_lines
+  when: dg_broker_standby_lad2_check.stdout | trim | length > 0
+
+# ============================================================================
+# 7.4 — Check whether a Broker configuration already exists (idempotency gate)
+# ============================================================================
+- name: "Write DGMGRL script: SHOW CONFIGURATION (check only)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_show_config.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      show configuration;
+  run_once: true
+
+- name: "Run: SHOW CONFIGURATION (check whether a Broker configuration already exists)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_broker_show_config.dgc
+  register: dg_broker_show_config_raw
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Show SHOW CONFIGURATION output (password redacted regardless of DGMGRL's echo behavior — see header note)
+  debug:
+    msg: "{{ (dg_broker_show_config_raw.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+
+- name: "Set fact: does a Broker configuration already exist (ORA-16532 = no configuration — standard Broker error when SHOW CONFIGURATION is run with nothing created yet; verify this code matches if the first real run reports otherwise)"
+  set_fact:
+    dg_broker_config_exists: "{{ not (dg_broker_show_config_raw.stdout is search('ORA-16532')) }}"
+  run_once: true
+
+- name: "Remove the SHOW CONFIGURATION script (contained a live password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_broker_show_config.dgc"
+    state: absent
+  run_once: true
+
+# ============================================================================
+# 7.5 — CREATE CONFIGURATION / ADD DATABASE / ENABLE CONFIGURATION
+# ============================================================================
+# Update — first real run: this used to be ONE combined script gated on a
+# single "does a configuration exist at all" check. That real run created
+# the configuration successfully but then ADD DATABASE failed with
+# ORA-16571 (see the standby broker-restart fix earlier in this file) — so
+# the configuration now genuinely exists, but with only apexdb as a member,
+# no standby, MaxPerformance mode by default. The old single gate would
+# have permanently skipped ADD DATABASE from here on, since "a
+# configuration exists" was already true. Split into three independently
+# gated steps instead: CREATE CONFIGURATION gated on whether a
+# configuration exists at all; ADD DATABASE gated separately on whether the
+# standby specifically is already a member (checked by searching the
+# earlier SHOW CONFIGURATION output for its db_unique_name); ENABLE
+# CONFIGURATION always attempted last (harmless/idempotent against an
+# already-enabled configuration).
+- name: "Set fact: is the standby already a member of the Broker configuration (searches the SHOW CONFIGURATION output above for its db_unique_name)"
+  set_fact:
+    dg_broker_standby_is_member: "{{ dg_broker_show_config_raw.stdout is search(dg_standby_db_unique_name) }}"
+  run_once: true
+
+- name: "Write DGMGRL script: CREATE CONFIGURATION (apexdb_DGMGRL connect identifier — any-state connectivity for switchover/failover)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_create.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      create configuration {{ dg_broker_config_name }} as primary database is {{ db_name }} connect identifier is apexdb_DGMGRL;
+      show configuration;
+  run_once: true
+  when: not dg_broker_config_exists
+
+- name: "Run: CREATE CONFIGURATION"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_broker_create.dgc
+  register: dg_broker_create_result
+  run_once: true
+  when: not dg_broker_config_exists
+
+- name: Show CREATE CONFIGURATION output (password redacted)
+  debug:
+    msg: "{{ (dg_broker_create_result.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+  when: not dg_broker_config_exists
+
+- name: "Remove the CREATE CONFIGURATION script (contained a live password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_broker_create.dgc"
+    state: absent
+  run_once: true
+  when: not dg_broker_config_exists
+
+- name: Report Broker configuration already exists (skip branch)
+  debug:
+    msg: "A Broker configuration already exists ({{ dg_broker_config_name }}) — CREATE CONFIGURATION skipped. See the SHOW CONFIGURATION output above for its current state."
+  run_once: true
+  when: dg_broker_config_exists
+
+- name: "Write DGMGRL script: ADD DATABASE (apexdb_stby_DGMGRL connect identifier — any-state connectivity for switchover/failover)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_add.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      add database {{ dg_standby_db_unique_name }} as connect identifier is apexdb_stby_DGMGRL maintained as physical;
+      show configuration;
+  run_once: true
+  when: not dg_broker_standby_is_member
+
+- name: "Run: ADD DATABASE"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_broker_add.dgc
+  register: dg_broker_add_result
+  run_once: true
+  when: not dg_broker_standby_is_member
+
+- name: "Show ADD DATABASE output (password redacted) — a failure here (e.g. ORA-16571) usually means the standby's DMON never successfully created its own local broker config file; see the standby broker-restart step earlier in this run"
+  debug:
+    msg: "{{ (dg_broker_add_result.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+  when: not dg_broker_standby_is_member
+
+- name: "Remove the ADD DATABASE script (contained a live password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_broker_add.dgc"
+    state: absent
+  run_once: true
+  when: not dg_broker_standby_is_member
+
+- name: Report standby already a member (skip branch)
+  debug:
+    msg: "{{ dg_standby_db_unique_name }} is already a member of {{ dg_broker_config_name }} — ADD DATABASE skipped."
+  run_once: true
+  when: dg_broker_standby_is_member
+
+- name: "Write DGMGRL script: ENABLE CONFIGURATION (always attempted — harmless/idempotent against an already-enabled configuration)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_enable.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      enable configuration;
+      show configuration;
+  run_once: true
+
+- name: "Run: ENABLE CONFIGURATION"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_broker_enable.dgc
+  register: dg_broker_enable_result
+  changed_when: false
+  run_once: true
+
+- name: Show ENABLE CONFIGURATION output (password redacted)
+  debug:
+    msg: "{{ (dg_broker_enable_result.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+
+- name: "Remove the ENABLE CONFIGURATION script (contained a live password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_broker_enable.dgc"
+    state: absent
+  run_once: true
+
+# ============================================================================
+# 7.6 — MAA properties: LogXptMode=SYNC (both — required for MaxAvailability,
+# NOT async), StandbyFileManagement=AUTO (standby), FastStartFailoverTarget
+# (both, prep-only — FSFO itself is not enabled by this role)
+# ============================================================================
+- name: "Write DGMGRL script: MAA properties"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_properties.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      edit database {{ db_name }} set property logxptmode='SYNC';
+      edit database {{ dg_standby_db_unique_name }} set property logxptmode='SYNC';
+      edit database {{ dg_standby_db_unique_name }} set property standbyfilemanagement='AUTO';
+      edit database {{ db_name }} set property faststartfailovertarget='{{ dg_standby_db_unique_name }}';
+      edit database {{ dg_standby_db_unique_name }} set property faststartfailovertarget='{{ db_name }}';
+      show database verbose {{ db_name }};
+      show database verbose {{ dg_standby_db_unique_name }};
+  run_once: true
+
+- name: "Run: set MAA properties"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_broker_properties.dgc
+  register: dg_broker_properties_result
+  run_once: true
+
+- name: Show MAA properties output (password redacted)
+  debug:
+    msg: "{{ (dg_broker_properties_result.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+
+- name: "Remove the properties script (contained a live password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_broker_properties.dgc"
+    state: absent
+  run_once: true
+
+# ============================================================================
+# 7.7 — Protection mode: MaxAvailability (requires LogXptMode=SYNC above to
+# already be in effect — order matters, see header note 2)
+# ============================================================================
+- name: "Write DGMGRL script: SHOW CONFIGURATION (check current protection mode)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_show_mode.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      show configuration;
+  run_once: true
+
+- name: "Run: check current protection mode"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_broker_show_mode.dgc
+  register: dg_broker_mode_check
+  changed_when: false
+  run_once: true
+
+- name: Show current protection mode output (password redacted)
+  debug:
+    msg: "{{ (dg_broker_mode_check.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+
+- name: "Remove the mode-check script (contained a live password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_broker_show_mode.dgc"
+    state: absent
+  run_once: true
+
+- name: "Set fact: is protection mode already MaxAvailability"
+  set_fact:
+    dg_broker_mode_is_maxavailability: "{{ dg_broker_mode_check.stdout is search('MaxAvailability') }}"
+  run_once: true
+
+- name: "Write DGMGRL script: EDIT CONFIGURATION SET PROTECTION MODE AS MaxAvailability"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_protection_mode.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      edit configuration set protection mode as MaxAvailability;
+      show configuration;
+  run_once: true
+  when: not dg_broker_mode_is_maxavailability
+
+- name: "Run: EDIT CONFIGURATION SET PROTECTION MODE AS MaxAvailability"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_broker_protection_mode.dgc
+  register: dg_broker_protection_mode_result
+  run_once: true
+  when: not dg_broker_mode_is_maxavailability
+
+- name: Show protection mode change output (password redacted)
+  debug:
+    msg: "{{ (dg_broker_protection_mode_result.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+  when: not dg_broker_mode_is_maxavailability
+
+- name: "Remove the protection-mode script (contained a live password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_broker_protection_mode.dgc"
+    state: absent
+  run_once: true
+  when: not dg_broker_mode_is_maxavailability
+
+- name: Report protection mode already MaxAvailability (skip branch)
+  debug:
+    msg: "Protection mode is already MaxAvailability — EDIT CONFIGURATION skipped."
+  run_once: true
+  when: dg_broker_mode_is_maxavailability
+
+# ============================================================================
+# 7.8 — Validate static connect identifiers (both databases) — DROPPED
+# ============================================================================
+# Update — first real run: tried twice, both real DGMGRL syntax attempts
+# ("VALIDATE STATIC CONNECT IDENTIFIER FOR <db>" then, after getting that
+# wrong the first time, the corrected word order "VALIDATE DATABASE <db>
+# STATIC CONNECT IDENTIFIER") failed with the identical "Syntax error
+# before or at 'static'" both times. Verified via web search rather than
+# guessing a third time: "VALIDATE STATIC CONNECT IDENTIFIER FOR <db>" —
+# my ORIGINAL syntax — is in fact the real, correct DGMGRL command... but
+# it was introduced in Oracle Database 18c. This lab's DGMGRL is 12.2.0.1.0
+# (every DGMGRL banner in every real run confirms this), predating the
+# command entirely — no wording fix could have made it work on this
+# release. Dropped outright rather than left broken: there is no working
+# equivalent on 12.2 DGMGRL. The plain TNS-alias connectivity tests
+# dataguard_net_config already runs (tnsping + a real sqlplus login via
+# apexdb_DGMGRL/apexdb_stby_DGMGRL) are this project's actual static-
+# identifier validation on this version — not a DGMGRL-native command, but
+# the same practical guarantee (the alias resolves and authenticates).
+- name: "Static connect identifier validation — not run: VALIDATE STATIC CONNECT IDENTIFIER FOR <db> requires DGMGRL 18c+, this lab is 12.2.0.1.0 (confirmed from every DGMGRL banner in this role's real runs). dataguard_net_config's own tnsping + sqlplus connectivity tests against apexdb_DGMGRL/apexdb_stby_DGMGRL are the practical equivalent on this version."
+  debug:
+    msg: "Skipped — see task name."
+  run_once: true
+
+# ============================================================================
+# 7.9 — Final health check: SHOW CONFIGURATION VERBOSE + SHOW DATABASE VERBOSE
+# ============================================================================
+- name: "Write DGMGRL script: final health check"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  no_log: true
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_broker_final_check.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0600"
+    content: |
+      connect sys/{{ sys_password }}@apexdb_DGMGRL as sysdba
+      show configuration verbose;
+      show database verbose {{ db_name }};
+      show database verbose {{ dg_standby_db_unique_name }};
+  run_once: true
+
+- name: "Run: final health check"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    {{ db_home }}/bin/dgmgrl < {{ staging_dir }}/sql/dg_broker_final_check.dgc
+  register: dg_broker_final_check_result
+  changed_when: false
+  run_once: true
+
+- name: Show final health check output (password redacted) — expect Protection Mode MaxAvailability, both databases status SUCCESS, Fast-Start Failover DISABLED (not configured by this role)
+  debug:
+    msg: "{{ (dg_broker_final_check_result.stdout | regex_replace('sys/' ~ (sys_password | regex_escape) ~ '@', 'sys/***@')).split('\n') }}"
+  run_once: true
+
+- name: "Remove the final-check script (contained a live password)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  file:
+    path: "{{ staging_dir }}/sql/dg_broker_final_check.dgc"
+    state: absent
+  run_once: true
+
+- name: "Phase 7 (Broker) summary"
+  debug:
+    msg: >-
+      Data Guard Broker configuration {{ dg_broker_config_name }} is ENABLED,
+      protection mode MaxAvailability, LogXptMode=SYNC on both databases.
+      Fast-Start Failover target properties are set but FSFO itself is NOT
+      enabled (a deliberate, separate decision — `enable fast_start failover;`
+      is not run by this role). Run --tags dataguard_switchover_test
+      (roles/dataguard_switchover_test — a separate, standalone role, not part
+      of this one) to exercise a real SWITCHOVER TO {{ dg_standby_db_unique_name }}
+      test and confirm Phase 8's role-based services (apexdb_rw/apexdb_ro)
+      flip automatically on a real role change.
+  run_once: true
+
+# Update: the switchover test used to live here, gated behind
+# dg_broker_test_switchover. Pulled out into its own standalone role
+# (roles/dataguard_switchover_test) — James's own call, so the test isn't
+# tangled up inside this role's normal idempotent re-run path and can be
+# invoked deliberately, on its own, in either direction (switch over, then
+# switch back is the SAME command re-run — the role detects current
+# primary/standby via SHOW CONFIGURATION rather than hardcoding a
+# direction). See that role and site.yml's own "Data Guard Broker —
+# switchover test" play.

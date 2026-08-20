@@ -1,0 +1,1094 @@
+---
+# Data Guard Phase 8 — Role-Based Services (apexdb_rw / apexdb_ro).
+#
+# Where this sits in the build: known-risks.md consistently refers to Broker
+# configuration as "Phase 7" (#98, #99), and dg_primary_role_service_rw/_ro
+# (apexdb_rw/apexdb_ro) were reserved as named variables back in known-risks.md
+# #76, when the whole SOP naming convention was first laid out — before either
+# phase was built. Phase 7 (Broker) and Phase 8 (this role) are the only two
+# phases the top of high-availability/README.md still lists as "not yet
+# built", so this is Phase 8 by elimination as much as by the reserved names.
+#
+# Built AHEAD of Phase 7 on purpose, not by accident — James's own call,
+# since these srvctl commands are self-contained and don't need Broker to
+# exist to register/start correctly today. What Phase 7 actually buys this
+# role: automatic role-based start/stop DURING a live switchover/failover.
+# Without Broker, "-policy AUTOMATIC" + "-role" only means each service
+# starts automatically alongside its instance if the database is ALREADY in
+# the matching role at that moment — it will not, on its own, flip apexdb_rw
+# off and apexdb_ro on mid-switchover. That live-flip behavior needs Broker
+# actually configured and a real switchover exercised — not yet true. See
+# docs/known-risks.md #136.
+#
+# Runs against BOTH clusters from one role (hosts: localhost + delegate_to,
+# same pattern as dataguard_convert_rac/dataguard_net_config) — apexdb on
+# usatclust1, apexdb_stby on usatclust2 get the exact same treatment: both
+# services registered, whichever one matches the database's ACTUAL CURRENT
+# role (queried via SQL, not assumed) gets started, the other gets stopped.
+# Querying the real role rather than hardcoding "apexdb=PRIMARY,
+# apexdb_stby=PHYSICAL STANDBY" is deliberate — that assumption is true
+# today, but would silently go stale and mis-start services after any future
+# switchover; a re-run of this role should always reflect whatever the
+# database's role actually is at that moment.
+#
+# apexdb_stby also gets its own precondition before its services are
+# touched, James's own explicit instruction: a service needs its database
+# OPEN — and actively APPLYING — to actually serve anything or ever receive
+# a service definition via redo. Checks gv$database's real open_mode first
+# and, only if it isn't already READ ONLY WITH APPLY on EVERY instance:
+# cancels any current recovery, opens each instance read only individually,
+# THEN restarts real-time apply (USING CURRENT LOGFILE DISCONNECT FROM
+# SESSION — this order matters, see finding #2 below), verifies MRP/RFS,
+# and re-verifies — hard fail if it still isn't READ ONLY WITH APPLY
+# everywhere afterward. This is a durable state change, not a one-off:
+# apexdb_stby moves from MOUNT (apply-only, Sections 11/12's terminal state)
+# to OPEN READ ONLY WITH APPLY (Active Data Guard, real-time apply) as this
+# role's own end state, and stays there on every future run.
+#
+# Real-run findings, two separate real executions:
+#
+# First run fixed three things:
+# 1. `tab off` was missing from this role's own SQL scripts — literal \t
+#    characters were showing up in output (same bug class as known-risks.md
+#    #122, just not yet applied here).
+# 2. The OPEN READ ONLY precondition only ever touched instance 1
+#    (oradbserv09) — GV$DATABASE.OPEN_MODE is backed by the shared control
+#    file, so instance 2's row can misleadingly APPEAR READ ONLY once
+#    instance 1 opens, without instance 2 having completed its own open
+#    transition. Now loops over both standby instances explicitly for the
+#    OPEN step, and the "already done" / final-fail checks require no
+#    MOUNTED row anywhere, not just a READ ONLY match anywhere.
+# 3. `srvctl start service -db apexdb_stby -service apexdb_ro` failed with
+#    ORA-44304 ("service does not exist") even though `srvctl config
+#    database` showed it as registered — that registration is CRS/OCR-level
+#    only. A role=PHYSICAL_STANDBY service's actual database-dictionary
+#    definition only exists once it's been started (even briefly) on the
+#    PRIMARY and shipped to the standby via redo. Fixed reactively: the
+#    standby's own start is still attempted first (normal path, works
+#    unmodified once this has succeeded once); only if THAT fails does this
+#    role bootstrap apexdb_ro on the primary (start, 3 forced log switches,
+#    stop) and retry the standby's start up to 3x/20s apart. See
+#    docs/known-risks.md #136's update and blog.iarsov.com/oracle/active-
+#    services-on-physical-standby-database / dbakalyan.wordpress.com's 2013
+#    post on the same failure signature.
+#
+# Second run (against the first run's own fix) hung indefinitely on the
+# second standby instance's OPEN task, and separately, James's own manual
+# by-hand testing found the REAL root cause of #3 above: opening a standby
+# read only silently kills whatever managed-recovery process was already
+# running — the original order (restart apply, THEN open) throws the apply
+# away the instant OPEN runs, so nothing ever actually applies afterward, no
+# matter how many times a service start is retried. Fixed:
+# 4. The precondition SQL script `dg_role_services_open_ro.sql` was only
+#    ever written to `dg_role_services_standby.node` (a single node), but
+#    the OPEN task loops delegate_to across BOTH standby nodes — on the
+#    second node, `sqlplus @<missing file>` errored, dropped to an
+#    interactive prompt, and hung waiting on stdin Ansible never closes.
+#    Fixed: the copy task now loops over `dg_role_services_standby_
+#    instances` too, so the script exists on both nodes before the OPEN
+#    loop runs.
+# 5. Reordered to cancel recovery -> open each instance -> restart real-time
+#    apply -> verify MRP/RFS -> re-verify, and the desired end-state is now
+#    explicitly `READ ONLY WITH APPLY`, not bare `READ ONLY`. Also added a
+#    direct dictionary-level check (`SELECT name, network_name FROM
+#    dba_services WHERE name IN (...)`) on both the primary and the standby
+#    — a stronger signal than `srvctl`, straight from James's own tested
+#    SOP, since it's the actual data dictionary rather than CRS/OCR state.
+#
+# Third run: the reordering fix (finding #5) actually worked — apexdb_stby
+# genuinely reached READ ONLY WITH APPLY on both instances — but the role
+# still reported failure. Two more findings:
+# 6. `column open_mode format a16` was too narrow for the string 'READ ONLY
+#    WITH APPLY' (21 characters) — SQL*Plus word-wrapped it onto a second
+#    output line ("READ ONLY WITH A" / "PPLY"), so the literal substring
+#    never appeared contiguously in stdout and every `is search('READ ONLY
+#    WITH APPLY')` check failed despite the real state being correct.
+#    Widened to a25 (and database_role/protection_mode given matching
+#    headroom).
+# 7. `srvctl add service` was being treated as sufficient to make a service
+#    exist — it isn't. Per James's own real-run finding, only actually
+#    STARTING a service invokes DBMS_SERVICE and writes it into
+#    dba_services; `-policy AUTOMATIC` doesn't retroactively start a
+#    service on an instance that's already running when the service is
+#    added, it only auto-starts alongside a future instance startup. Both
+#    apexdb_rw and apexdb_ro sat registered-but-never-started on the
+#    primary. Fixed: a new, mandatory (not reactive) block right after the
+#    services are added — start both on the primary, verify both now exist
+#    in dba_services (hard fail if not), stop apexdb_ro again — runs BEFORE
+#    any standby work, gated on dba_services so idempotent repeat runs skip
+#    it once it's succeeded. The old reactive-only-on-failure ORA-44304
+#    remediation is kept as a lightweight fallback further down (retry +
+#    one more log-switch push), but shouldn't normally trigger anymore.
+#
+# Every srvctl command in this role now has a matching debug task showing
+# its raw stdout — James's other real-run feedback ("doesn't provide enough
+# output of the commands including srvctl commands").
+
+- name: "Preflight: confirm both databases are registered and reachable via srvctl before adding any service"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl config database -db {{ item.db_unique_name }}"
+  register: dg_role_services_preflight
+  changed_when: false
+  failed_when: false
+  loop:
+    - { db_unique_name: "{{ db_unique_name }}", node: "{{ groups['rac_node1'][0] }}", label: "primary (usatclust1)" }
+    - { db_unique_name: "{{ dg_standby_db_unique_name }}", node: "{{ groups['standby_nodes'][0] }}", label: "standby (usatclust2)" }
+  loop_control:
+    label: "{{ item.label }}"
+
+- name: "Fail if either database isn't registered/reachable — role-based services need both databases up first"
+  fail:
+    msg: >
+      srvctl config database -db {{ item.item.db_unique_name }} failed
+      (rc={{ item.rc }}) on {{ item.item.node }} ({{ item.item.label }}).
+      This role adds services against both apexdb and apexdb_stby — both
+      must already be CRS-registered and reachable. Real output:
+      {{ item.stdout }} {{ item.stderr }}
+  loop: "{{ dg_role_services_preflight.results }}"
+  loop_control:
+    label: "{{ item.item.label }}"
+  when: item.rc != 0
+
+- name: "Show raw srvctl config database output (preflight, both clusters)"
+  debug:
+    msg: "{{ item.item.label }}: {{ item.stdout_lines }}"
+  loop: "{{ dg_role_services_preflight.results }}"
+  loop_control:
+    label: "{{ item.item.label }}"
+
+# --- Discovery: what's registered, what role is each DB actually in right now, what's running ---
+- name: "Check whether apexdb_rw is already registered on each database"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl config service -db {{ item.db_unique_name }} -service {{ dg_primary_role_service_rw }}"
+  register: dg_role_services_rw_check
+  changed_when: false
+  failed_when: false
+  loop:
+    - { db_unique_name: "{{ db_unique_name }}", node: "{{ groups['rac_node1'][0] }}", label: "primary (usatclust1)" }
+    - { db_unique_name: "{{ dg_standby_db_unique_name }}", node: "{{ groups['standby_nodes'][0] }}", label: "standby (usatclust2)" }
+  loop_control:
+    label: "{{ item.label }}"
+
+- name: "Show raw srvctl config service output — apexdb_rw registration check"
+  debug:
+    msg: "{{ item.item.label }}: {{ item.stdout_lines | default(['(not registered — rc=' ~ item.rc ~ ')']) }}"
+  loop: "{{ dg_role_services_rw_check.results }}"
+  loop_control:
+    label: "{{ item.item.label }}"
+
+- name: "Check whether apexdb_ro is already registered on each database"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl config service -db {{ item.db_unique_name }} -service {{ dg_primary_role_service_ro }}"
+  register: dg_role_services_ro_check
+  changed_when: false
+  failed_when: false
+  loop:
+    - { db_unique_name: "{{ db_unique_name }}", node: "{{ groups['rac_node1'][0] }}", label: "primary (usatclust1)" }
+    - { db_unique_name: "{{ dg_standby_db_unique_name }}", node: "{{ groups['standby_nodes'][0] }}", label: "standby (usatclust2)" }
+  loop_control:
+    label: "{{ item.label }}"
+
+- name: "Show raw srvctl config service output — apexdb_ro registration check"
+  debug:
+    msg: "{{ item.item.label }}: {{ item.stdout_lines | default(['(not registered — rc=' ~ item.rc ~ ')']) }}"
+  loop: "{{ dg_role_services_ro_check.results }}"
+  loop_control:
+    label: "{{ item.item.label }}"
+
+- name: "Write SQL script: report this database's real, current role"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_role_services_check_role.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off linesize 200 pagesize 0 tab off
+      select database_role from v$database;
+      exit;
+  loop:
+    - { node: "{{ groups['rac_node1'][0] }}", label: "primary (usatclust1)" }
+    - { node: "{{ groups['standby_nodes'][0] }}", label: "standby (usatclust2)" }
+  loop_control:
+    label: "{{ item.label }}"
+
+- name: "Query each database's real, current role (never assumed — a re-run after a future switchover must still get this right)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_role_services_check_role.sql
+  register: dg_role_services_role_check
+  changed_when: false
+  loop:
+    - { db_unique_name: "{{ db_unique_name }}", node: "{{ groups['rac_node1'][0] }}", label: "primary (usatclust1)" }
+    - { db_unique_name: "{{ dg_standby_db_unique_name }}", node: "{{ groups['standby_nodes'][0] }}", label: "standby (usatclust2)" }
+  loop_control:
+    label: "{{ item.label }}"
+
+- name: "Set fact: this database's real current role, trimmed (PRIMARY or PHYSICAL STANDBY)"
+  set_fact:
+    dg_role_services_plan: >-
+      {{ dg_role_services_plan | default([]) + [
+        {
+          'db_unique_name': item.0.item.db_unique_name,
+          'node': item.0.item.node,
+          'label': item.0.item.label,
+          'role': (item.0.stdout | trim),
+          'rw_registered': (item.1.rc == 0),
+          'ro_registered': (item.2.rc == 0)
+        }
+      ] }}
+  loop: "{{ dg_role_services_role_check.results | zip(dg_role_services_rw_check.results, dg_role_services_ro_check.results) | list }}"
+  loop_control:
+    label: "{{ item.0.item.label }}"
+
+- name: "Report the plan for both clusters before touching anything"
+  debug:
+    msg: >-
+      {{ item.label }} ({{ item.db_unique_name }}): real current role is
+      '{{ item.role }}'. apexdb_rw {{ 'already registered' if item.rw_registered else 'will be added (role=PRIMARY)' }}.
+      apexdb_ro {{ 'already registered' if item.ro_registered else 'will be added (role=PHYSICAL_STANDBY)' }}.
+      Will START {{ dg_primary_role_service_rw if item.role == 'PRIMARY' else dg_primary_role_service_ro }}
+      and STOP {{ dg_primary_role_service_ro if item.role == 'PRIMARY' else dg_primary_role_service_rw }}
+      on this database, matching its real role — not a hardcoded assumption.
+  loop: "{{ dg_role_services_plan }}"
+  loop_control:
+    label: "{{ item.label }}"
+
+- name: "PAUSE — review the plan above before adding/starting/stopping any service"
+  pause:
+    prompt: |
+
+      Reviewed the real current role of both databases and what this role is
+      about to do, above. This adds apexdb_rw (role=PRIMARY) and apexdb_ro
+      (role=PHYSICAL_STANDBY) to BOTH apexdb and apexdb_stby if not already
+      present, then starts BOTH on the PRIMARY and verifies both exist in
+      apexdb's dba_services (srvctl add alone never actually creates them —
+      only starting does), stopping apexdb_ro again afterward — this has to
+      happen before any standby work, since nothing can propagate that was
+      never started in the first place. Then — for apexdb_stby specifically
+      — checks it's OPEN READ ONLY WITH APPLY on BOTH instances (cancels
+      recovery, opens each instance, THEN restarts real-time apply — opening
+      kills whatever apply was running before it, so apply has to come
+      after), then starts whichever service matches each database's real
+      current role and stops the other. If apexdb_ro still fails to start on
+      the standby with ORA-44304, a fallback retries with one more forced
+      log-switch push, up to 3 times.
+
+      Not yet true: automatic role-flip during a live switchover — that
+      needs Data Guard Broker (Phase 7, not yet built). This only gets each
+      service into the CORRECT state for right now.
+
+      Press Enter to continue. Ctrl+C then A aborts this run instead.
+
+# --- Apply: add whichever service isn't registered yet -----------------------
+- name: "Add apexdb_rw (role=PRIMARY) where not already registered"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: >-
+    {{ db_home }}/bin/srvctl add service -db {{ item.db_unique_name }}
+    -service {{ dg_primary_role_service_rw }}
+    -preferred {{ sid_prefix }}1,{{ sid_prefix }}2
+    -role PRIMARY -policy AUTOMATIC -notification TRUE
+    -clbgoal SHORT -rlbgoal SERVICE_TIME
+  register: dg_role_services_add_rw
+  changed_when: dg_role_services_add_rw.rc == 0
+  failed_when: dg_role_services_add_rw.rc != 0
+  loop: "{{ dg_role_services_plan }}"
+  loop_control:
+    label: "{{ item.label }}"
+  when: not item.rw_registered
+
+- name: "Show raw srvctl add service output — apexdb_rw"
+  debug:
+    msg: "{{ item.item.label }}: {{ item.stdout_lines | default(['(skipped — already registered)']) }}"
+  loop: "{{ dg_role_services_add_rw.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.label | default('n/a') }}"
+  when: dg_role_services_add_rw.results is defined
+
+- name: "Add apexdb_ro (role=PHYSICAL_STANDBY) where not already registered"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: >-
+    {{ db_home }}/bin/srvctl add service -db {{ item.db_unique_name }}
+    -service {{ dg_primary_role_service_ro }}
+    -preferred {{ sid_prefix }}1,{{ sid_prefix }}2
+    -role PHYSICAL_STANDBY -policy AUTOMATIC -notification TRUE
+    -clbgoal SHORT -rlbgoal SERVICE_TIME
+  register: dg_role_services_add_ro
+  changed_when: dg_role_services_add_ro.rc == 0
+  failed_when: dg_role_services_add_ro.rc != 0
+  loop: "{{ dg_role_services_plan }}"
+  loop_control:
+    label: "{{ item.label }}"
+  when: not item.ro_registered
+
+- name: "Show raw srvctl add service output — apexdb_ro"
+  debug:
+    msg: "{{ item.item.label }}: {{ item.stdout_lines | default(['(skipped — already registered)']) }}"
+  loop: "{{ dg_role_services_add_ro.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.label | default('n/a') }}"
+  when: dg_role_services_add_ro.results is defined
+
+# Set once, early — used later, reactively, if/when the standby's apexdb_ro
+# turns out not to be propagated yet (see the ORA-44304 remediation block
+# further down, right before the standby's service start).
+- name: "Set fact: this run's primary entry from the plan (apexdb specifically)"
+  set_fact:
+    dg_role_services_primary: "{{ dg_role_services_plan | selectattr('db_unique_name', 'equalto', db_unique_name) | first }}"
+
+# James's own SOP check — dba_services is the actual data dictionary, a
+# stronger signal than srvctl config/status (which only reflect CRS/OCR
+# registration, the exact distinction behind the ORA-44304 root cause).
+# Written to both the primary node and the standby node now so the script
+# is already in place when the reactive ORA-44304 remediation block below
+# needs to run the same query against the standby later.
+- name: "Write SQL script: check apexdb_rw/apexdb_ro in dba_services (dictionary-level, not just srvctl/CRS)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_role_services_check_dba_services.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 pagesize 100 tab off
+      column name format a20
+      column network_name format a20
+      SELECT name, network_name
+      FROM   dba_services
+      WHERE  name IN ('{{ dg_primary_role_service_rw }}', '{{ dg_primary_role_service_ro }}')
+      ORDER BY name;
+      exit;
+  loop:
+    - "{{ groups['rac_node1'][0] }}"
+    - "{{ groups['standby_nodes'][0] }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: "Verify apexdb_rw/apexdb_ro exist in the PRIMARY's own dictionary (dba_services)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_role_services_check_dba_services.sql
+  register: dg_role_services_primary_dba_services
+  changed_when: false
+
+- name: Show apexdb_rw/apexdb_ro in the primary's dba_services
+  debug:
+    var: dg_role_services_primary_dba_services.stdout_lines
+
+# James's own real-run finding: `srvctl add service` alone never creates the
+# dba_services row — only actually STARTING a service invokes DBMS_SERVICE
+# and writes it into the dictionary. `-policy AUTOMATIC` doesn't retroactively
+# start a service on an instance that's already up when the service is
+# added; it only auto-starts alongside a future instance startup. Both
+# apexdb_rw and apexdb_ro were sitting registered-but-never-started on the
+# primary — nothing to ever ship to the standby. This block makes that
+# explicit and mandatory, BEFORE any standby work: start both, verify both
+# now exist in dba_services (hard fail if not — "if you do not start the
+# services it will not be created inside the database"), then stop
+# apexdb_ro again (its role never matches on the primary; apexdb_rw stays
+# running, that's its correct steady state). Gated on the dba_services
+# check above so repeat runs, once this has succeeded, skip straight past
+# it — idempotent, not just a one-time fixup.
+- name: "Set fact: does the primary's dba_services already show BOTH apexdb_rw and apexdb_ro"
+  set_fact:
+    dg_role_services_primary_needs_bootstrap: >-
+      {{ not ((dg_role_services_primary_dba_services.stdout is search(dg_primary_role_service_rw))
+              and (dg_role_services_primary_dba_services.stdout is search(dg_primary_role_service_ro))) }}
+
+- name: "Notify — apexdb_rw/apexdb_ro not yet in the primary's dba_services; starting both now"
+  debug:
+    msg: >-
+      apexdb_rw and/or apexdb_ro don't show up in apexdb's dba_services yet
+      (real output above) — `srvctl add service` only registers with CRS,
+      it doesn't start anything. Starting both explicitly now so they're
+      actually written into the primary's data dictionary, then stopping
+      apexdb_ro again (apexdb_rw stays running — its role matches here).
+  when: dg_role_services_primary_needs_bootstrap
+
+- name: "Start apexdb_rw on the PRIMARY explicitly (role matches, but AUTOMATIC policy doesn't retroactively start it on an already-running instance)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_primary.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl start service -db {{ dg_role_services_primary.db_unique_name }} -service {{ dg_primary_role_service_rw }}"
+  register: dg_role_services_primary_rw_start
+  changed_when: dg_role_services_primary_rw_start.rc == 0
+  failed_when: false
+  when: dg_role_services_primary_needs_bootstrap
+
+- name: "Show raw srvctl output — apexdb_rw start on primary"
+  debug:
+    var: dg_role_services_primary_rw_start.stdout_lines
+  when: dg_role_services_primary_needs_bootstrap
+
+- name: "Start apexdb_ro on the PRIMARY — required once so its definition is written into the primary's data dictionary and can ship to the standby via redo"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_primary.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl start service -db {{ dg_role_services_primary.db_unique_name }} -service {{ dg_primary_role_service_ro }}"
+  register: dg_role_services_primary_ro_start
+  changed_when: dg_role_services_primary_ro_start.rc == 0
+  failed_when: false
+  when: dg_role_services_primary_needs_bootstrap
+
+- name: "Show raw srvctl output — apexdb_ro start on primary"
+  debug:
+    var: dg_role_services_primary_ro_start.stdout_lines
+  when: dg_role_services_primary_needs_bootstrap
+
+- name: "Re-verify apexdb_rw/apexdb_ro now exist in the primary's dba_services"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_role_services_check_dba_services.sql
+  register: dg_role_services_primary_dba_services_reverify
+  changed_when: false
+  when: dg_role_services_primary_needs_bootstrap
+
+- name: Show re-verified apexdb_rw/apexdb_ro in the primary's dba_services
+  debug:
+    var: dg_role_services_primary_dba_services_reverify.stdout_lines
+  when: dg_role_services_primary_needs_bootstrap
+
+- name: "Fail if apexdb_rw/apexdb_ro STILL don't show up in the primary's dba_services after starting both — nothing will ever propagate to the standby like this"
+  fail:
+    msg: >-
+      Started apexdb_rw and apexdb_ro on apexdb (the primary) but at least
+      one still isn't in dba_services. Real output:
+      {{ dg_role_services_primary_dba_services_reverify.stdout }}.
+      Investigate by hand (check the raw srvctl start output above for
+      errors) before re-running this role — nothing will ever reach
+      apexdb_stby's dictionary if the primary's own dictionary doesn't have
+      it first.
+  when:
+    - dg_role_services_primary_needs_bootstrap
+    - (dg_role_services_primary_dba_services_reverify.stdout is not search(dg_primary_role_service_rw))
+      or (dg_role_services_primary_dba_services_reverify.stdout is not search(dg_primary_role_service_ro))
+
+- name: "Stop apexdb_ro on the PRIMARY again — its role never matches there, it was only started to seed the data dictionary"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_primary.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl stop service -db {{ dg_role_services_primary.db_unique_name }} -service {{ dg_primary_role_service_ro }}"
+  register: dg_role_services_primary_ro_stop
+  changed_when: dg_role_services_primary_ro_stop.rc == 0
+  failed_when: false
+  when: dg_role_services_primary_needs_bootstrap
+
+- name: "Show raw srvctl output — apexdb_ro stop on primary"
+  debug:
+    var: dg_role_services_primary_ro_stop.stdout_lines
+  when: dg_role_services_primary_needs_bootstrap
+
+- name: "Report: apexdb_rw/apexdb_ro already in the primary's dba_services — nothing to bootstrap"
+  debug:
+    msg: "apexdb_rw and apexdb_ro already both show up in apexdb's dba_services (real output above) — skipping the start/verify/stop sequence."
+  when: not dg_role_services_primary_needs_bootstrap
+
+# --- Standby precondition: apexdb_stby must be OPEN READ ONLY before its
+# services are touched — James's own explicit instruction. A service
+# resource needs its underlying database OPEN (in some mode) to come up
+# meaningfully; a MOUNT-only standby has nothing for apexdb_ro to actually
+# serve. Checked and, if needed, fixed here — never assumed, same "verify
+# real state" idiom as the role check above. Only the standby needs this;
+# the primary is already OPEN READ WRITE by definition once it's PRIMARY.
+- name: "Set fact: this run's standby entry from the plan (apexdb_stby specifically)"
+  set_fact:
+    dg_role_services_standby: "{{ dg_role_services_plan | selectattr('db_unique_name', 'equalto', dg_standby_db_unique_name) | first }}"
+
+# James's own explicit instruction: "open the database readonly in both nodes
+# not just oradbserv09." GV$DATABASE.OPEN_MODE is backed by the shared
+# control file, so one instance opening can make the OTHER instance's row
+# *appear* READ ONLY too before that other instance has actually completed
+# its own open transition — each RAC instance genuinely needs its own ALTER
+# DATABASE OPEN issued in its own session. This fact drives that per-instance
+# loop instead of only ever touching groups['standby_nodes'][0].
+- name: "Set fact: apexdb_stby's individual instances (both RAC nodes) — each needs its own OPEN transition"
+  set_fact:
+    dg_role_services_standby_instances: >-
+      {{ dg_role_services_standby_instances | default([]) + [
+        { 'node': item, 'sid': sid_prefix ~ (idx + 1) }
+      ] }}
+  loop: "{{ groups['standby_nodes'] }}"
+  loop_control:
+    index_var: idx
+    label: "{{ item }}"
+
+- name: "Write SQL script: check apexdb_stby's real open_mode/role/protection_mode (all instances)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_standby.node }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_role_services_check_open_mode.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 pagesize 100 tab off
+      column open_mode format a25
+      column database_role format a20
+      column protection_mode format a20
+      SELECT inst_id, open_mode, database_role, protection_mode
+      FROM   gv$database
+      ORDER BY inst_id;
+      exit;
+
+- name: "Check apexdb_stby's real open_mode (gv$database, all instances)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_standby.node }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_role_services_check_open_mode.sql
+  register: dg_role_services_open_mode_check
+  changed_when: false
+
+- name: Show apexdb_stby's current open_mode/role/protection_mode
+  debug:
+    var: dg_role_services_open_mode_check.stdout_lines
+
+- name: "Set fact: is apexdb_stby already OPEN READ ONLY WITH APPLY on EVERY instance"
+  # James's real-run finding, not in the original design: OPENING the
+  # standby cancels/kills whatever managed-recovery process was running
+  # before the open — restarting recovery BEFORE the open (the role's
+  # original order) gets silently thrown away the moment OPEN READ ONLY
+  # runs. The database must show 'READ ONLY WITH APPLY' (real-time apply
+  # ACTIVE alongside the open), not bare 'READ ONLY' — a bare READ ONLY here
+  # means recovery is dead and nothing shipped via redo will ever actually
+  # apply, which is exactly why apexdb_ro's service definition never landed
+  # in the standby's dictionary before. Still requires no MOUNTED row too —
+  # same both-instances tolerance as before.
+  set_fact:
+    dg_role_services_stby_already_read_only: >-
+      {{ (dg_role_services_open_mode_check.stdout is search('READ ONLY WITH APPLY'))
+         and (dg_role_services_open_mode_check.stdout is not search('MOUNTED')) }}
+
+- name: "Notify — apexdb_stby is not OPEN READ ONLY WITH APPLY yet; will cancel recovery, open, then restart apply, in that order"
+  debug:
+    msg: >-
+      apexdb_stby is not currently OPEN READ ONLY WITH APPLY (real output
+      above, expected OPEN_MODE=READ ONLY WITH APPLY / DATABASE_ROLE=
+      PHYSICAL STANDBY). Bringing it there now, in this specific order:
+      cancel any current managed recovery, ALTER DATABASE OPEN READ ONLY on
+      each instance, THEN restart real-time apply (USING CURRENT LOGFILE
+      DISCONNECT FROM SESSION) and verify MRP/RFS. Restarting apply BEFORE
+      the open doesn't survive the open — Oracle terminates managed recovery
+      as part of the mount-to-open transition, so apply has to be started
+      again afterward or it silently sits dead.
+  when: not dg_role_services_stby_already_read_only
+
+- name: "Write SQL script: cancel any current managed recovery (tolerant if none is running)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_standby.node }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_role_services_cancel_recovery.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 pagesize 100 tab off
+      alter database recover managed standby database cancel;
+      exit;
+  when: not dg_role_services_stby_already_read_only
+
+- name: "Cancel any current managed recovery (tolerated if nothing was running — SQL*Plus continues to exit; either way)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_standby.node }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_role_services_cancel_recovery.sql
+  register: dg_role_services_cancel
+  changed_when: "'Database altered' in dg_role_services_cancel.stdout"
+  when: not dg_role_services_stby_already_read_only
+
+- name: Show cancel-recovery output
+  debug:
+    var: dg_role_services_cancel.stdout_lines
+  when: not dg_role_services_stby_already_read_only
+
+- name: "Write SQL script: open the standby read only (both standby nodes — the OPEN task right after this delegates to each one individually)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_role_services_open_ro.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 pagesize 100 tab off
+      alter database open read only;
+      exit;
+  loop: "{{ dg_role_services_standby_instances }}"
+  loop_control:
+    label: "{{ item.node }}"
+  when: not dg_role_services_stby_already_read_only
+
+# Loops over BOTH standby instances — James's explicit instruction. Each RAC
+# instance needs its OWN "ALTER DATABASE OPEN READ ONLY" issued in its own
+# session; an instance that's already open will throw ORA-01507/similar here,
+# which is expected and harmless (SQL*Plus reaches `exit;` regardless, same
+# per-statement tolerance idiom used throughout this project) — the real
+# pass/fail check is the combined re-verify against gv$database right after.
+# Runs BEFORE apply is restarted — cancel (above) already tore down any
+# managed recovery, so there's nothing running for OPEN to conflict with or
+# kill out from under itself.
+- name: "Open apexdb_stby read only — once per instance ({{ groups['standby_nodes'] | join(', ') }})"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ item.sid }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ item.sid }}
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_role_services_open_ro.sql
+  register: dg_role_services_open_ro
+  changed_when: "'Database altered' in dg_role_services_open_ro.stdout"
+  failed_when: false
+  loop: "{{ dg_role_services_standby_instances }}"
+  loop_control:
+    label: "{{ item.node }} ({{ item.sid }})"
+  when: not dg_role_services_stby_already_read_only
+
+- name: "Show OPEN READ ONLY output (both instances)"
+  debug:
+    msg: "{{ item.item.node }} ({{ item.item.sid }}): {{ item.stdout_lines }}"
+  loop: "{{ dg_role_services_open_ro.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.node }}"
+  when: not dg_role_services_stby_already_read_only
+
+# THIS is the step James's real run showed was missing entirely: opening
+# read only does NOT resume managed recovery on its own. Without this,
+# apexdb_stby sits at plain OPEN READ ONLY forever — no real-time apply,
+# nothing from the primary's redo (including the apexdb_ro service
+# definition) ever actually gets applied, no matter how many times
+# `srvctl start service` is retried on the standby side.
+- name: "Write SQL script: restart managed recovery in real-time-apply mode (AFTER the open, not before)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_standby.node }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_role_services_restart_apply.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 pagesize 100 tab off
+      alter database recover managed standby database using current logfile disconnect from session;
+      exit;
+  when: not dg_role_services_stby_already_read_only
+
+- name: "Restart managed recovery with real-time apply — gets apexdb_stby to READ ONLY WITH APPLY"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_standby.node }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_role_services_restart_apply.sql
+  register: dg_role_services_restart_apply
+  changed_when: "'Database altered' in dg_role_services_restart_apply.stdout"
+  when: not dg_role_services_stby_already_read_only
+
+- name: Show restart-apply output
+  debug:
+    var: dg_role_services_restart_apply.stdout_lines
+  when: not dg_role_services_stby_already_read_only
+
+- name: "Write SQL script: verify MRP/RFS are running"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_standby.node }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_role_services_verify_mrp.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading on feedback off linesize 200 pagesize 100 tab off
+      column process format a8
+      column status format a14
+      -- gv$managed_standby, not v$managed_standby: in RAC, MRP can be
+      -- running on EITHER standby instance, not necessarily the one this
+      -- script happens to be connected to. Querying the local v$ view only
+      -- would miss it if apply landed on the other node.
+      SELECT inst_id, process, status, thread#, sequence#, block#, blocks
+      FROM   gv$managed_standby
+      WHERE  process LIKE 'MRP%' OR process LIKE 'RFS%'
+      ORDER BY inst_id;
+      exit;
+  when: not dg_role_services_stby_already_read_only
+
+- name: "Verify MRP/RFS processes are running (both instances)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_standby.node }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_role_services_verify_mrp.sql
+  register: dg_role_services_mrp_check
+  changed_when: false
+  when: not dg_role_services_stby_already_read_only
+
+- name: Show MRP/RFS verification output
+  debug:
+    var: dg_role_services_mrp_check.stdout_lines
+  when: not dg_role_services_stby_already_read_only
+
+- name: "Re-verify apexdb_stby is now OPEN READ ONLY WITH APPLY (gv$database, all instances)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_standby.node }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_role_services_check_open_mode.sql
+  register: dg_role_services_open_mode_reverify
+  changed_when: false
+  when: not dg_role_services_stby_already_read_only
+
+- name: Show re-verified open_mode/role/protection_mode
+  debug:
+    var: dg_role_services_open_mode_reverify.stdout_lines
+  when: not dg_role_services_stby_already_read_only
+
+- name: "Fail if apexdb_stby is STILL not OPEN READ ONLY WITH APPLY on every instance — not safe to start apexdb_ro against it"
+  fail:
+    msg: >-
+      apexdb_stby did not reach OPEN READ ONLY WITH APPLY after cancelling
+      recovery, opening each of {{ groups['standby_nodes'] | join(', ') }},
+      and restarting real-time apply. A bare READ ONLY (no APPLY) means
+      redo — including any service definition shipped from the primary —
+      will never actually get applied here. Real output:
+      {{ dg_role_services_open_mode_reverify.stdout }}. Investigate by hand
+      before re-running this role.
+  when:
+    - not dg_role_services_stby_already_read_only
+    - (dg_role_services_open_mode_reverify.stdout is not search('READ ONLY WITH APPLY')) or
+      (dg_role_services_open_mode_reverify.stdout is search('MOUNTED'))
+
+- name: "Report: apexdb_stby was already OPEN READ ONLY WITH APPLY — nothing to do here"
+  debug:
+    msg: "apexdb_stby is already OPEN READ ONLY WITH APPLY (real output above) — skipping the cancel/open/restart-apply sequence."
+  when: dg_role_services_stby_already_read_only
+
+# --- Apply: start whichever service matches this database's real role, stop the other ---
+- name: "Check current running status of apexdb_rw and apexdb_ro on each database"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl status service -db {{ item.db_unique_name }}"
+  register: dg_role_services_status
+  changed_when: false
+  failed_when: false
+  loop: "{{ dg_role_services_plan }}"
+  loop_control:
+    label: "{{ item.label }}"
+
+- name: "Show raw srvctl status service output (before start/stop)"
+  debug:
+    msg: "{{ item.item.label }}: {{ item.stdout_lines }}"
+  loop: "{{ dg_role_services_status.results }}"
+  loop_control:
+    label: "{{ item.item.label }}"
+
+- name: "Start the role-matching service, only if it isn't already running"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.0.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  vars:
+    dg_role_services_start_target: "{{ dg_primary_role_service_rw if item.0.role == 'PRIMARY' else dg_primary_role_service_ro }}"
+  command: "{{ db_home }}/bin/srvctl start service -db {{ item.0.db_unique_name }} -service {{ dg_role_services_start_target }}"
+  register: dg_role_services_start_result
+  changed_when: dg_role_services_start_result.rc == 0
+  failed_when: false
+  when: "'Service ' ~ dg_role_services_start_target ~ ' is running' not in item.1.stdout"
+  loop: "{{ dg_role_services_plan | zip(dg_role_services_status.results) | list }}"
+  loop_control:
+    label: "{{ item.0.label }}"
+
+- name: "Show raw srvctl start service output"
+  debug:
+    msg: "{{ item.item.0.label }}: {{ item.stdout_lines | default(['(skipped — already running)']) }}"
+  loop: "{{ dg_role_services_start_result.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0.label | default('n/a') }}"
+  when: dg_role_services_start_result.results is defined
+
+# --- Self-healing retry: apexdb_ro's definition is now guaranteed to exist
+# on the primary (the mandatory bootstrap block earlier in this run, well
+# before this point), but the standby can still fail its OWN start with
+# ORA-44304 on the very first run if the redo carrying that definition
+# hasn't finished shipping/applying yet. A bounded retry (3 attempts, 20s
+# apart — same shape as dataguard_srl_cleanup's log-switch retry,
+# known-risks.md #122) covers that residual lag instead of hard-failing the
+# whole play over a timing race.
+- name: "Set fact: did the standby's apexdb_ro start actually fail with ORA-44304"
+  set_fact:
+    dg_role_services_ro_start_failed: >-
+      {{ (dg_role_services_start_result.results | default([])
+          | selectattr('item.0.db_unique_name', 'equalto', dg_standby_db_unique_name)
+          | selectattr('item.0.role', 'equalto', 'PHYSICAL STANDBY')
+          | selectattr('rc', 'defined')
+          | selectattr('rc', 'ne', 0)
+          | list | length) > 0 }}
+
+# Defensive fallback only — the mandatory primary bootstrap earlier in this
+# run already starts apexdb_ro on the primary and force-switches redo, so
+# apexdb_ro's definition should already be reachable by the time the
+# standby's own start is attempted below. This block only matters if that
+# didn't finish propagating in time.
+- name: "Write SQL script: switch logfile on the primary (fallback re-push)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_primary.node }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/dg_role_services_primary_switch.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0640"
+    content: |
+      set echo on heading off feedback off linesize 200 pagesize 0 tab off
+      alter system switch logfile;
+      exit;
+  when: dg_role_services_ro_start_failed
+
+# 3 switches, not 1 — same dose as known-risks.md #122's own log-switch
+# remedy for redo that's stuck/queued and needs a push through. apexdb_stby
+# is genuinely applying now (the reordered precondition above got it to
+# READ ONLY WITH APPLY before this block ever runs), so these switches
+# should actually get consumed this time instead of just queuing up.
+- name: "Force 3 log switches on the primary to ship the apexdb_ro service definition"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_primary.node }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_role_services_primary_switch.sql
+  register: dg_role_services_primary_switch
+  changed_when: "'System altered' in dg_role_services_primary_switch.stdout"
+  loop: "{{ range(1, 4) | list }}"
+  loop_control:
+    label: "switch {{ item }}"
+  when: dg_role_services_ro_start_failed
+
+- name: "Show log switch output (all 3)"
+  debug:
+    msg: "switch {{ item.item }}: {{ item.stdout_lines }}"
+  loop: "{{ dg_role_services_primary_switch.results | default([]) }}"
+  loop_control:
+    label: "switch {{ item.item }}"
+  when: dg_role_services_ro_start_failed
+
+- name: "Confirm apexdb_ro isn't left running on the PRIMARY (defensive — the mandatory bootstrap earlier should have already stopped it; harmless no-op if it's already stopped)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_primary.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl stop service -db {{ dg_role_services_primary.db_unique_name }} -service {{ dg_primary_role_service_ro }}"
+  register: dg_role_services_primary_ro_stop
+  changed_when: dg_role_services_primary_ro_stop.rc == 0
+  failed_when: false
+  when: dg_role_services_ro_start_failed
+
+- name: "Show raw srvctl output — apexdb_ro stop on primary (fallback path)"
+  debug:
+    var: dg_role_services_primary_ro_stop.stdout_lines
+  when: dg_role_services_ro_start_failed
+
+# Direct dictionary-level confirmation, on the standby itself, before
+# retrying srvctl start — reuses the script already written to
+# dg_role_services_standby.node earlier in the run (the primary/standby
+# dba_services check, right after the "Add apexdb_ro" step).
+- name: "Check whether apexdb_ro has actually landed in the standby's own dba_services yet"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_standby.node }}"
+  shell: |
+    export ORACLE_HOME={{ db_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/dg_role_services_check_dba_services.sql
+  register: dg_role_services_standby_dba_services
+  changed_when: false
+  when: dg_role_services_ro_start_failed
+
+- name: Show apexdb_ro in the standby's dba_services (after the primary bootstrap + log switches)
+  debug:
+    var: dg_role_services_standby_dba_services.stdout_lines
+  when: dg_role_services_ro_start_failed
+
+- name: "ORA-44304 retry — apexdb_ro didn't start on the standby; waiting for redo propagation and retrying (up to 3 attempts)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ dg_role_services_standby.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl start service -db {{ dg_role_services_standby.db_unique_name }} -service {{ dg_primary_role_service_ro }}"
+  register: dg_role_services_ro_retry
+  until: dg_role_services_ro_retry.rc == 0
+  retries: 3
+  delay: 20
+  failed_when: false
+  when: dg_role_services_ro_start_failed
+
+- name: "Show raw srvctl output — apexdb_ro retry on standby"
+  debug:
+    var: dg_role_services_ro_retry.stdout_lines
+  when: dg_role_services_ro_start_failed
+
+- name: "Fail with manual-intervention info if apexdb_ro still won't start on the standby after 3 retries"
+  fail:
+    msg: >-
+      apexdb_ro still won't start on apexdb_stby after the primary bootstrap
+      (start+log-switch+stop on apexdb) and 3 retries 20s apart. Real output:
+      {{ dg_role_services_ro_retry.stdout }} {{ dg_role_services_ro_retry.stderr }}.
+      Manual recovery: confirm apexdb_stby is OPEN READ ONLY on both
+      instances, confirm redo from the forced log switch has actually been
+      applied (check v$archived_log / v$dataguard_stats on the standby for
+      the sequence# from the switch above), force another
+      `alter system switch logfile;` on the primary, then retry
+      `srvctl start service -db {{ dg_standby_db_unique_name }} -service {{ dg_primary_role_service_ro }}`
+      by hand.
+  when:
+    - dg_role_services_ro_start_failed
+    - dg_role_services_ro_retry.rc != 0
+
+- name: "Stop the role-mismatched service, only if it's actually running (defensive — it should never have auto-started, but don't assume)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.0.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  vars:
+    dg_role_services_stop_target: "{{ dg_primary_role_service_ro if item.0.role == 'PRIMARY' else dg_primary_role_service_rw }}"
+  command: "{{ db_home }}/bin/srvctl stop service -db {{ item.0.db_unique_name }} -service {{ dg_role_services_stop_target }}"
+  register: dg_role_services_stop_result
+  changed_when: dg_role_services_stop_result.rc == 0
+  failed_when: false
+  when: "'Service ' ~ dg_role_services_stop_target ~ ' is running' in item.1.stdout"
+  loop: "{{ dg_role_services_plan | zip(dg_role_services_status.results) | list }}"
+  loop_control:
+    label: "{{ item.0.label }}"
+
+- name: "Show raw srvctl stop service output"
+  debug:
+    msg: "{{ item.item.0.label }}: {{ item.stdout_lines | default(['(skipped — not running)']) }}"
+  loop: "{{ dg_role_services_stop_result.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.0.label | default('n/a') }}"
+  when: dg_role_services_stop_result.results is defined
+
+# --- Verify -------------------------------------------------------------------
+- name: "Show final service configuration on each database"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl config service -db {{ item.db_unique_name }}"
+  register: dg_role_services_final_config
+  changed_when: false
+  loop: "{{ dg_role_services_plan }}"
+  loop_control:
+    label: "{{ item.label }}"
+
+- name: "Show final service running status on each database"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ item.node }}"
+  environment:
+    ORACLE_HOME: "{{ db_home }}"
+    ORACLE_SID: "{{ sid_prefix }}1"
+  command: "{{ db_home }}/bin/srvctl status service -db {{ item.db_unique_name }}"
+  register: dg_role_services_final_status
+  changed_when: false
+  loop: "{{ dg_role_services_plan }}"
+  loop_control:
+    label: "{{ item.label }}"
+
+- name: "Report final state — config and running status, both clusters"
+  debug:
+    msg:
+      - "{{ item.0.label }} config: {{ item.1.stdout_lines }}"
+      - "{{ item.0.label }} status: {{ item.2.stdout_lines }}"
+  loop: "{{ dg_role_services_plan | zip(dg_role_services_final_config.results, dg_role_services_final_status.results) | list }}"
+  loop_control:
+    label: "{{ item.0.label }}"
+
+- name: "Reminder — this only covers today's static role; live role-flip on switchover needs Phase 7 (Broker) built and exercised"
+  debug:
+    msg: >-
+      apexdb_rw/apexdb_ro are now registered and started/stopped correctly
+      for each database's CURRENT role. They will NOT automatically flip
+      during a future switchover/failover until Data Guard Broker (Phase 7,
+      high-availability/README.md Section 14, not yet built) is configured
+      and a real switchover has been exercised against it. See
+      docs/known-risks.md #136.
