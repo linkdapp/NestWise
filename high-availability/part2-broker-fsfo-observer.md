@@ -61,7 +61,7 @@ See `known-risks.md` #137 for the full debugging journey.
    BOTH clusters (`+DATA01/apexdb/DG`, `+RECO01/apexdb/DG` on the primary;
    the equivalent pair under `apexdb_stby` on the standby) — closes the gap
    `known-risks.md` #98/#99 left open. ASM has no `mkdir -p`; the parent
-   `{{ db_unique_name }}/` directory already existed (DBCA created it), so
+   `{% raw %}{{ db_unique_name }}{% endraw %}/` directory already existed (DBCA created it), so
    this is one check-then-create step per diskgroup, not a multi-level walk.
    ```
    # -- On the Primary

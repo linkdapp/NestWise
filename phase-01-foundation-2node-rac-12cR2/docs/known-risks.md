@@ -1,3 +1,4 @@
+{% raw %}
 # Known risks and gotchas — read before running anything
 
 Written up front, deliberately, because a showcase post with no friction in it reads as
@@ -2772,7 +2773,7 @@ write literal `{%`, `%}`, `{{`, or `}}` character sequences inside a `.j2`
 file's own comments when describing Jinja syntax in prose — Jinja parses the
 entire file for those delimiters regardless of what non-Jinja comment
 convention (`#`, `--`, `//`, etc.) the *rendered output* format uses. Wrap
-literal Jinja syntax in `{% raw %}...{% endraw %}` if it genuinely needs to
+literal Jinja syntax in Liquid's raw/endraw block tags if it genuinely needs to
 appear verbatim, or just describe it in plain English instead, as done here.
 
 ## 73. `config.sh` failed `[INS-08109] ... / by zero` at `CreateASMDiskGroup` — `AUSize=0` isn't a valid allocation-unit size, it's a literal divisor
@@ -7399,3 +7400,4 @@ an oversight or something still being scoped: the induced-failover mechanism
 itself is now proven end to end by hand (this entry), and automating the
 drill into its own repeatable role is deliberately deferred rather than
 treated as an immediate next step.
+{% endraw %}

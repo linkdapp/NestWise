@@ -153,7 +153,7 @@ Once you recognize these, reading any `tasks/main.yml` in this repo gets much fa
   shown via a `debug: var: X.stdout_lines` task. That's deliberate: it's the same
   output you'd see running the command by hand, surfaced back into the Ansible run
   rather than left invisible on the remote host.
-- **`run_once: true` + `delegate_to: "{{ groups['rac_nodes'][0] }}"`** on the software
+- **`run_once: true` + `delegate_to: "{% raw %}{{ groups['rac_nodes'][0] }}{% endraw %}"`** on the software
   staging/install tasks in `grid_silent_install`/`db_silent_install`. This matches real
   Oracle behavior, not just a staging choice: OUI copies the home to every node in the
   response file's node list over SSH equivalence as part of one invocation — you don't

@@ -347,7 +347,7 @@ ansible-playbook -i inventory/hosts.ini site.yml --tags gi_db_home_clone
    `gridSetup.sh`/`runInstaller` do their own node-to-node propagation
    later.
 4. Extracts both on `oradbserv09`.
-5. Re-asserts the setuid bit on `{{ db_home }}/bin/oracle`, which
+5. Re-asserts the setuid bit on `{% raw %}{{ db_home }}{% endraw %}/bin/oracle`, which
    `unarchive` doesn't reliably preserve (`known-risks.md` #107).
 
 ```bash
@@ -817,7 +817,7 @@ ansible-playbook -i inventory/hosts.ini site.yml --tags dataguard_net_config
    just `run_once`.
 
 **6.1 — TNS aliases for redo transport.** Adds 4 entries to
-`{{ db_home }}/network/admin/tnsnames.ora` on all 4 nodes, leaving
+`{% raw %}{{ db_home }}{% endraw %}/network/admin/tnsnames.ora` on all 4 nodes, leaving
 NetCA/DBCA's own pre-existing `APEXDB` entry above them untouched: `apexdb`
 and `apexdb_stby` (plain connect aliases), plus `apexdb_dg`/`apexdb_stby_dg`
 (`UR=A` so Broker/RMAN can connect before the database is open).
@@ -1087,7 +1087,7 @@ ansible-playbook -i inventory/hosts.ini site.yml --tags dataguard_duplicate -e s
 7. Checks the primary's own archive-destination status (8.3.5) — real
    output and the gap that step originally exposed are below.
 
-Real RMAN cmdfile (`{{ staging_dir }}/sql/dg_duplicate.rman` on
+Real RMAN cmdfile (`{% raw %}{{ staging_dir }}{% endraw %}/sql/dg_duplicate.rman` on
 `oradbserv09`) — password redacted here and in the repo, per
 `known-risks.md` #45:
 
