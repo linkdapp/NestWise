@@ -7,8 +7,10 @@ role-based services — everything needed for a working Active Data Guard standb
 covers the Data Guard Broker, a real switchover test, and Fast-Start Failover with the
 Observer. [Part 3](part3-post-checks.md) covers post-standby validation. Start here.
 
-Status: 🟨 In progress — Section 10 (RMAN duplicate) done by hand against the live lab, not
-yet confirmed to reproduce cleanly on a second, unattended run.
+Status: 🟩 Confirmed — all 13 sections in this part have run clean against the live lab,
+including Section 10 (RMAN duplicate), whose earlier flakiness traced back to a
+`tnsnames.ora` misconfiguration on the standby's Data Guard aliases — fixed, and a
+subsequent full re-run confirmed it reproduces cleanly.
 
 | # | Section | Status |
 |---|---|---|
@@ -21,7 +23,7 @@ yet confirmed to reproduce cleanly on a second, unattended run.
 | 7 | SSH equivalence | 🟩 Confirmed |
 | 8 | Clone GI + DB Oracle Homes | 🟩 Confirmed |
 | 9 | Configure the usatclust2 cluster | 🟩 Confirmed |
-| 10 | Create the standby database (RMAN duplicate) | 🟨 Done by hand, not yet clean |
+| 10 | Create the standby database (RMAN duplicate) | 🟩 Confirmed |
 | 11 | Remove the multiplexed standby redo log member | 🟩 Confirmed |
 | 12 | Convert the standby to RAC | 🟩 Confirmed |
 | 13 | Role-based services (`apexdb_rw`/`apexdb_ro`) | 🟩 Confirmed |
@@ -35,18 +37,17 @@ actually real — see
 components online, `DATA01` (NORMAL, 3 voting files) and `RECO01` (NORMAL, matching
 DATA01 — see #110) are both `MOUNTED`, OCR is healthy.
 
-**Section 10** (the RMAN-duplicate standby build, 8 SOP phases) is where the one
-genuinely open item lives. Phase 1 (prepare the primary database) and Phase 2
-(Oracle Net configuration) are fully green, all 4 nodes, real passwords confirmed
-(#81-#91); Phase 3 (prepare the standby host) is fully green, `apexdb1` started
-`NOMOUNT` on `oradbserv09` (#93-#100); Phase 4 (RMAN `DUPLICATE ... FOR STANDBY FROM
-ACTIVE DATABASE`) **completed against the real lab, but not cleanly** — 8 more real
-bugs (#106-#113) had to be found and fixed along the way, and getting `apexdb_stby`
-to a genuinely stable, fully-caught-up standby took manual intervention beyond what
-the `dataguard_duplicate` role automates end to end. Treat Phase 4 as "done once, by
-hand, with the automation mostly but not entirely keeping up" — **not yet confirmed
-to reproduce cleanly on a second, unattended run.** See the honesty note at the top
-of Phase 4's write-up below before relying on this for a rebuild.
+**Section 10** (the RMAN-duplicate standby build, 8 SOP phases) is now **confirmed
+clean end to end**. Phase 1 (prepare the primary database) and Phase 2 (Oracle Net
+configuration) are fully green, all 4 nodes, real passwords confirmed (#81-#91);
+Phase 3 (prepare the standby host) is fully green, `apexdb1` started `NOMOUNT` on
+`oradbserv09` (#93-#100); Phase 4 (RMAN `DUPLICATE ... FOR STANDBY FROM ACTIVE
+DATABASE`) needed 8 real bugs found and fixed along the way (#106-#113), and the
+remaining gap after that — `apexdb_stby` not settling into a genuinely stable,
+fully-caught-up standby — traced back to `tnsnames.ora` not being configured
+correctly for the standby's Data Guard aliases (see step 8.3.5 below and
+`known-risks.md` #115). Fixed, and a subsequent full re-run of Phase 4 against the
+live lab confirmed it reproduces cleanly — no longer just "done once, by hand."
 
 **Sections 11 and 12** (Phases 5 and 6 of the same SOP) are both now confirmed
 clean. Phase 5 (remove the multiplexed standby redo log member — James's own
@@ -106,7 +107,7 @@ naming convention as `installation/`'s Section 15.
 7. [🟩 Confirmed — SSH equivalence for grid/oracle across usatclust2](#7-confirmed--ssh-equivalence-for-gridoracle-across-usatclust2)
 8. [🟩 Confirmed — Clone GI + DB Oracle Homes from oradbserv05](#8-confirmed--clone-gi--db-oracle-homes-from-oradbserv05)
 9. [🟩 Confirmed — Configure the usatclust2 cluster](#9-confirmed--configure-the-usatclust2-cluster)
-10. [🟨 Done by hand, not yet clean — Create the standby database (RMAN duplicate)](#10-done-by-hand-not-yet-clean--create-the-standby-database-rman-duplicate)
+10. [🟩 Confirmed — Create the standby database (RMAN duplicate)](#10-confirmed--create-the-standby-database-rman-duplicate)
 11. [🟩 Confirmed — Remove the multiplexed standby redo log member](#11-confirmed--remove-the-multiplexed-standby-redo-log-member)
 12. [🟩 Confirmed — Convert the standby to RAC](#12-confirmed--convert-the-standby-to-rac)
 13. [🟩 Confirmed — Role-based services](#13-confirmed--role-based-services-apexdb_rwapexdb_ro)
@@ -549,7 +550,7 @@ oradbserv09-grid-+ASM1$
 
 ---
 
-## 10. 🟨 Done by hand, not yet clean — Create the standby database (RMAN duplicate)
+## 10. 🟩 Confirmed — Create the standby database (RMAN duplicate)
 
 Built from a real, MAA-grounded SOP James provided
 (`standby_dataguard_creation.txt`): `RMAN DUPLICATE ... FOR STANDBY FROM ACTIVE
@@ -1062,7 +1063,8 @@ Full real run, both `PLAY RECAP`s clean:
 📸 *Screenshot: dataguard_standby_prep.png.*
 
 **Phase 4 — RMAN `DUPLICATE ... FOR STANDBY FROM ACTIVE DATABASE` (built
-from the SOP's section 8, run for real — completed, but not cleanly):**
+from the SOP's section 8, run for real — confirmed clean after the `tnsnames.ora`
+fix in 8.3.5 below):**
 role
 [`dataguard_duplicate`](../phase-01-foundation-2node-rac-12cR2/ansible/roles/dataguard_duplicate/tasks/main.yml),
 runs entirely on `oradbserv09` — RMAN connects `TARGET`/`AUXILIARY` outbound
@@ -1270,7 +1272,9 @@ it directly: `apexdb_stby`/`apexdb_stby_dg` now connect via the standby's
 own node hostname instead of SCAN, and `log_archive_dest_2` on both sides
 now points at the plain `apexdb`/`apexdb_stby` aliases rather than the
 `_dg`-suffixed ones. Managed recovery confirmed working end-to-end after
-the fix.
+the fix. A subsequent full re-run of Phase 4 against the live lab, with the
+corrected `tnsnames.ora` in place, confirmed the entire duplicate-and-catch-up
+sequence completes cleanly — closing out Section 10.
 
 
 ## 11. 🟩 Confirmed — Remove the multiplexed standby redo log member

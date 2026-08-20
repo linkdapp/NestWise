@@ -1,0 +1,51 @@
+# Application-facing TNS entries for apexdb_rw / apexdb_ro
+#
+# Written by James while debugging Section 16 (Swingbench-driven switchover
+# validation) — see part3-post-checks.md.
+#
+# Why this looks different from the DBA-facing aliases in Part 1/Part 2
+# (apexdb, apexdb_dg, apexdb_stby, apexdb_stby_dg, apexdb_DGMGRL,
+# apexdb_stby_DGMGRL, all built by dataguard_net_config): those aliases each
+# point at ONE specific database, on ONE specific cluster, and are meant for
+# DBA/Broker tooling that already knows which side is primary vs standby.
+#
+# apexdb_rw / apexdb_ro are role-based services (Section 13,
+# dataguard_role_services) — the same service name means a different thing
+# depending on which cluster currently holds the primary role. This lab's
+# Data Guard setup spans two SEPARATE clusters (usatclust1 for the primary,
+# usatclust2 for the standby), each with its own SCAN listener — not one
+# shared SCAN the way a lot of single-cluster Data Guard examples work. So
+# an application client (or a benchmark tool like Swingbench) that wants to
+# survive a real switchover has to list BOTH clusters' SCAN listeners as
+# alternate ADDRESS entries under one DESCRIPTION — Oracle Net's own
+# connect-time failover then tries each address until it finds the one that
+# currently has the requested SERVICE_NAME registered.
+#
+# Confirmed the hard way: an earlier connect string here that only listed
+# scan-usatclust1.usat.com worked fine right up until the first real
+# switchover, at which point apexdb_rw relocated to usatclust2 and every
+# reconnect attempt kept hitting usatclust1's listener forever — endless
+# ORA-12514/SQLRecoverableException, not an Application Continuity gap.
+# Switching to the two-address form below fixed it immediately.
+
+# Application
+apexdb_rw =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = scan-usatclust1.usat.com)(PORT = 1521))
+    (ADDRESS = (PROTOCOL = TCP)(HOST = scan-usatclust2.usat.com)(PORT = 1521))
+    (CONNECT_DATA =
+      (SERVER = DEDICATED)
+      (SERVICE_NAME = apexdb_rw)
+    )
+  )
+
+apexdb_ro =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = scan-usatclust1.usat.com)(PORT = 1521))
+    (ADDRESS = (PROTOCOL = TCP)(HOST = scan-usatclust2.usat.com)(PORT = 1521))
+    (CONNECT_DATA =
+      (SERVER = DEDICATED)
+      (SERVICE_NAME = apexdb_ro)
+      (UR = A)
+    )
+  )

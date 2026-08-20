@@ -336,15 +336,222 @@ $ ansible-playbook -i inventory/hosts.ini site.yml --tags dataguard_fsfo -e sys_
    ```
 
    📸 *Screenshot: show_fast_start_fail_over.png
-   
-   
-**What's left, stated plainly:** the induced-failover test — actually killing the
-primary and watching the Observer auto-promote `apexdb_stby` — lives in its own
-standalone role (`roles/dataguard_fsfo_test`, `--tags dataguard_fsfo_test`, same
-separation-of-concerns reasoning as the switchover test) and hasn't been built or
-run yet. Everything confirmed above is FSFO *armed*, not yet exercised against a
-real outage. See [Part 3](part3-post-checks.md) for the remaining post-standby
-validation work.
+
+**Real induced-failover drill — confirmed manually, not yet Ansible-automated.**
+Everything above proves FSFO *armed*. This proves it *exercised*: a real primary
+outage — not a graceful switchover — with the Observer detecting it and promoting
+the standby with no human triggering the failover itself. Run by hand, following
+the same separation-of-concerns reasoning as `dataguard_switchover_test`. A
+dedicated `roles/dataguard_fsfo_test` role that automates this drill the way
+`dataguard_switchover_test` automates a planned switchover **is explicitly on
+hold — James's call**, not an oversight: the mechanism itself is now proven
+end to end by hand, and automating the drill is deliberately deferred rather
+than treated as an immediate next step.
+
+Baseline confirmed healthy first, via the standing monitoring scripts
+([`scripts/monitor_dataguard.sh`](scripts/monitor_dataguard.sh) on both clusters,
+[`scripts/montor_manage_observer.sh status`](scripts/montor_manage_observer.sh)
+here) — `apexdb` PRIMARY on both `usatclust1` instances, `apexdb_stby` PHYSICAL
+STANDBY READ ONLY WITH APPLY on both `usatclust2` instances, Observer `HEALTHY`
+(PID confirmed running, `Last Ping to Primary: 2 seconds ago`).
+
+**17:32:29 — the outage, induced for real.** An aborted instance, not a graceful
+shutdown — closer to an actual crash than any planned switchover:
+
+```bash
+srvctl stop database -d apexdb -o abort
+```
+
+Swingbench (`SOE_Client_Side_AC`, same as Section 16) was running against the
+primary through this outage, Application Continuity engaged:
+
+![Swingbench SOE_Client_Side_AC — TPS/DML dip and recovery across the induced failover, 16 users throughout](screenshots/show_swingbench_failover_app_con.png)
+
+Real numbers off that chart, correlated against the Observer log and SQL
+evidence below, not just eyeballed: throughput held strong (TPS in the
+100-150+ range, TX/Min around 7,000-8,000) until roughly **5:33:16 PM**, then
+Transactions Per Second and DML Operations both dropped to near zero — a
+real, visible stall, not a graceful slowdown — bottoming out around
+**5:34:28-5:34:42 PM** before climbing back to pre-outage levels by
+**5:35:00 PM** and holding there through the end of the run. That's roughly
+an **86-second measurable impact window**, closely matching the ~89-second
+RTO computed independently from the Observer log below (`17:32:29` abort to
+`17:33:58` failover succeeded) — two different measurements of the same
+real event landing within a few seconds of each other, not contradicting
+one another. `Logged on Users` never dropped from 16 — Application
+Continuity kept sessions intact through the outage rather than dropping and
+recreating them.
+
+**Worth being honest about, compared to Section 16's planned switchover:**
+the response-time spike here is far more severe — the 5-second moving
+average shoots up toward the top of an 18,651ms-scale axis during the worst
+of the stall, versus a few hundred milliseconds for the planned switchover.
+That's expected, not a regression in how well this is handled: a graceful
+switchover coordinates the handoff in advance, while a real crash has to be
+*detected*, wait out the Observer's confirmation window, and only then fail
+over — the cost of that detection delay shows up directly in client-side
+response time, even though both scenarios end in a full, unassisted
+recovery.
+
+**The Observer's own log, real-time** — the actual FSFO decision sequence, not a
+summary of it:
+
+```
+Unable to connect to database using apexdb_dgmgrl
+[W000 2026-08-19T17:33:41.463-04:00] Fast-Start Failover is not possible because primary last contacted the standby within FastStartFailoverThreshold seconds.
+[W000 2026-08-19T17:33:44.489-04:00] Check if the standby is ready for failover.
+[P025 2026-08-19T17:33:44.493-04:00] Failed to attach to apexdb_dgmgrl.
+ORA-12514: TNS:listener does not currently know of service requested in connect descriptor
+[S026 2026-08-19T17:33:44.507-04:00] Fast-Start Failover started...
+Initiating Fast-Start Failover to database "apexdb_stby"...
+Performing failover NOW, please wait...
+Failover succeeded, new primary is "apexdb_stby"
+[S026 2026-08-19T17:33:58.948-04:00] Fast-Start Failover finished...
+[W000 2026-08-19T17:33:58.948-04:00] Failover succeeded. Restart pinging.
+[W000 2026-08-19T17:33:58.980-04:00] Primary database has changed to apexdb_stby.
+[W000 2026-08-19T17:34:07.346-04:00] The standby apexdb needs to be reinstated
+[S030 2026-08-19T17:34:07.353-04:00] Failed to attach to apexdb_dgmgrl.
+ORA-12514: TNS:listener does not currently know of service requested in connect descriptor
+```
+
+The early `"not possible ... within FastStartFailoverThreshold seconds"` warning
+is the Observer's own safety check doing its job — refusing to fail over until it
+can confirm the outage has genuinely persisted, not reacting to a single missed
+ping. Once that confirmed, the whole sequence — detect, verify, fail over — ran in
+about 17 seconds (`17:33:41` to `17:33:58`). The `ORA-12514` after `"needs to be
+reinstated"` is expected, not a new problem: the old primary's instances were still
+down from the abort, so an automatic reinstate attempt had nothing to attach to yet.
+
+**In RPO/RTO terms, same framing as Section 16, now for an actual unplanned
+failover instead of a planned switchover:**
+
+- **RPO: zero.** `LAST_FAILOVER_REASON` in `gv$fs_failover_stats` (checked
+  afterward, both instances agree) reads `Primary Disconnected` — not a lag-based
+  reason — and `Lag Limit: 30 seconds (not in use)` in the Broker's own
+  configuration confirms this failover happened in genuine Zero Data Loss Mode, not
+  a lag-limited fallback. No committed transaction was lost.
+- **RTO: about a minute and a half**, end to end — `17:32:29` (abort issued) to
+  `17:33:58` (`"Failover succeeded"`, independently confirmed by
+  `gv$fs_failover_stats.LAST_FAILOVER_TIME = 08/19/2026 17:33:53`, a few seconds'
+  offset between the dictionary's own timestamp and the log line, expected). Close
+  to Section 16's planned-switchover RTO (~1 minute) despite this being a genuine
+  crash, not a coordinated role swap — the Observer's own 30-second confirmation
+  window is most of the difference.
+
+**Real SQL, after the failover, before reinstating** — connected to the new
+primary (`apexdb_stby`) directly, not trusting the Observer log alone:
+
+```
+DGMGRL> show configuration verbose
+Configuration - apexdb_dg
+  Protection Mode: MaxAvailability
+  Members:
+  apexdb_stby - Primary database
+    Warning: ORA-16824: multiple warnings, including fast-start failover-related warnings, detected for the database
+    apexdb      - (*) Physical standby database (disabled)
+      ORA-16661: the standby database needs to be reinstated
+  FastStartFailoverAutoReinstate  = 'TRUE'
+Fast-Start Failover: Enabled in Zero Data Loss Mode
+  Active Target:      apexdb
+  Observer:           oemserver01_observer
+  Auto-reinstate:     TRUE
+Configuration Status:
+WARNING
+```
+
+`Configuration Status: WARNING`, not `ERROR` — the configuration itself is
+functioning correctly; it's honestly reporting that one member needs attention,
+which is exactly the state a real failover with `AutoReinstate` still pending
+should show. `SHOW DATABASE apexdb StatusReport` returned `ORA-16548: Message
+16548 not found` — a genuine minor rough edge (an empty message-catalog lookup
+against the disabled old primary), left as-is rather than guessed at further;
+`SHOW DATABASE apexdb_stby StatusReport` was the more useful one, returning
+`ORA-16817: unsynchronized fast-start failover configuration` and `ORA-16869:
+fast-start failover target not initialized` — both expected while the old primary
+is still down and unreinstated, not new problems.
+
+Confirmed independently via the data dictionary, not just DGMGRL's own report:
+
+```sql
+set linesize 200
+col LAST_FAILOVER_REASON for a22SELECT * FROM gv$fs_failover_stats;
+-- LAST_FAILOVER_REASON: Primary Disconnected (both instances agree)
+
+set linesize 200
+col fs_failover_observer_host for a28
+SELECT fs_failover_status, fs_failover_current_target, fs_failover_threshold,
+       fs_failover_observer_present, fs_failover_observer_host FROM gv$database;
+	   
+-- FS_FAILOVER_STATUS: REINSTATE REQUIRED, target apexdb, threshold 30,
+-- observer present, host oemserver01.usat.com
+
+col force_logging for a3 heading "FL"
+col flashback_on for a10 heading "FLASHB ON"
+col open_mode for a11
+col db_unique_name for a16
+set linesize 200
+SELECT db_unique_name, database_role, open_mode, protection_mode,
+       protection_level, switchover_status, force_logging, flashback_on FROM gv$database;
+	   
+-- apexdb_stby: PRIMARY, READ WRITE, MAXIMUM AVAILABILITY, level RESYNCHRONIZATION
+-- (not yet MaxAvailability-level — can't be, with no synced standby), SWITCHOVER_STATUS
+-- NOT ALLOWED (correct — nothing to switch over to yet), FORCE_LOGGING/FLASHBACK_ON both YES
+```
+
+**The missing step, confirmed:** `REINSTATE DATABASE` does not start a down
+instance on its own — Broker's reinstate workflow can resync a mounted
+instance via Flashback Database, but it has nothing to attach to if the
+instance isn't even mounted yet. `oradbserv05`/`oradbserv06` needed an
+explicit manual start, in `MOUNT` (not `OPEN` — reinstating a still-disabled
+standby member isn't a normal startup), before reinstate would succeed:
+
+```bash
+# On oradbserv06, at 18:31:32 — about 57 minutes after the failover, once
+# the old primary's instances were confirmed still down and diagnosed:
+srvctl start database -d apexdb -o mount
+```
+
+**Reinstating the old primary as the new standby**, connected to the current
+primary (`apexdb_stby`), now that `apexdb`'s instances are actually mounted
+and reachable:
+
+```
+DGMGRL> reinstate database apexdb;
+Reinstating database "apexdb", please wait...
+Reinstatement of database "apexdb" succeeded
+```
+
+📸 *Screenshots: `reinstate_database_apexdb_dgmgrl.png`,
+`reinstate_database_apexdb_alertlog.png`,
+`Show_configuration_after_reinstate.png`.*
+
+**Worth carrying forward, even with the automated test on hold:** a real
+FSFO failover leaves the old primary needing a manual `srvctl start ... -o
+mount` before it can be reinstated — `FastStartFailoverAutoReinstate=TRUE`
+covers the *resync*, not the *restart*. Anyone running this drill for real
+should expect to do that step by hand.
+
+**Ongoing Observer monitoring.** Once the Observer is running, it needs its own
+health check — an Observer process dying quietly defeats the entire point of FSFO,
+since a primary outage with no live Observer just becomes an outage, not an
+automatic failover.
+[`scripts/montor_manage_observer.sh`](scripts/montor_manage_observer.sh) (filename
+as committed — its own header comment calls itself `manage_observer.sh`, worth
+knowing if you go looking for it by the "correct" spelling) covers `start`/`stop`/
+`status` against this same Observer, wallet-authenticated via the same
+`/@apexdb_dgmgrl` connection built above:
+
+```bash
+./montor_manage_observer.sh start    # START OBSERVER, same as step 6 above
+./montor_manage_observer.sh stop     # DISABLE FAST-START FAILOVER, then STOP OBSERVER
+./montor_manage_observer.sh status   # OS process check + SHOW OBSERVER; emails MAIL_TO on failure
+```
+
+`status` is the one worth scheduling — it checks both the OS process
+(`pgrep -f "dgmgrl.*oemserver01_observer"`) and the Broker's own view
+(`SHOW OBSERVER`), and only alerts if either says the Observer is actually gone,
+not just quiet. Update `MAIL_TO` (currently the script's own placeholder,
+`dba@yourcompany.com`) before relying on the email alert.
 
 ---
 
