@@ -1,0 +1,38 @@
+---
+# Phase 6: 12.2.0.1 -> 19c rolling upgrade via Data Guard / DBMS_ROLLING.
+# Separate top-level playbook from site.yml — same precedent as clone-node.yml —
+# since this is a distinct, one-time operational event against an already-live
+# production-representative database, not part of the normal build sequence.
+#
+# THIS FIRST PASS covers only the safe, fully reversible groundwork:
+#   1. Disable FSFO (required before DBMS_ROLLING.BUILD_PLAN will even succeed)
+#   2. Install the new, patched 19c DB software on BOTH clusters
+# Nothing here touches the running 12.2.0.1 database, its dictionary, or the
+# Data Guard configuration's actual role/state. DBMS_ROLLING's own phases
+# (BUILD_PLAN / START_PLAN / the AutoUpgrade run against the transient logical
+# standby / SWITCHOVER / FINISH_PLAN, plus re-enabling FSFO afterward) are a
+# deliberately separate, not-yet-written playbook — built and verified only
+# after this groundwork is confirmed clean against the real environment.
+#
+# Run with --tags to control scope, same convention as site.yml, e.g.:
+#   ansible-playbook upgrade-19c-rolling.yml --tags rolling_fsfo_disable
+#   ansible-playbook upgrade-19c-rolling.yml --tags db19c_stage,db19c_install_software
+
+- name: "Disable FSFO — required before DBMS_ROLLING.BUILD_PLAN"
+  hosts: observer_nodes
+  gather_facts: no
+  tags: [rolling_fsfo_disable]
+  roles:
+    - rolling_upgrade_fsfo
+
+- name: "Install patched 19c DB software — primary cluster (usatclust1)"
+  hosts: rac_nodes
+  tags: [db19c_stage, db19c_install_software]
+  roles:
+    - db19c_software_install
+
+- name: "Install patched 19c DB software — standby cluster (usatclust2)"
+  hosts: standby_nodes
+  tags: [db19c_stage, db19c_install_software]
+  roles:
+    - db19c_software_install

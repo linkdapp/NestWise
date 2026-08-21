@@ -1,0 +1,76 @@
+---
+# Phase 6 (12.2.0.1 -> 19c rolling upgrade): FSFO must be fully stopped before
+# DBMS_ROLLING.BUILD_PLAN — confirmed against Oracle's own DBMS_ROLLING
+# documentation that the broker rejects any attempt to even ENABLE fast-start
+# failover while a rolling upgrade is in progress. Wraps James's existing
+# manage_observer.sh rather than reimplementing observer control — that script
+# predates this Ansible role and isn't managed by this project's automation
+# otherwise.
+#
+# ASSUMPTION, not yet confirmed: manage_observer_script (group_vars/all.yml)
+# lives on oemserver01 (observer_nodes) — inferred from its /u01/app/oracle/...
+# path matching that host's own oracle_base convention, and because that's
+# where the Observer itself already runs. Confirm this role's `hosts:` target
+# is correct before a real run — if the script actually lives somewhere else
+# (e.g. one of the RAC nodes), this role's target group needs to change to
+# match, not just this comment.
+
+- name: "Confirm manage_observer.sh is actually staged where expected"
+  stat:
+    path: "{{ manage_observer_script }}"
+  register: manage_observer_stat
+  tags: [rolling_fsfo_disable]
+
+- name: "Fail with a clear message if manage_observer.sh isn't where group_vars/all.yml expects"
+  fail:
+    msg: >
+      Expected {{ manage_observer_script }} on {{ inventory_hostname }} — not found.
+      Confirm which host actually has this script and update manage_observer_script /
+      this role's target group in the top-level playbook if it's not oemserver01.
+  when: not manage_observer_stat.stat.exists
+  tags: [rolling_fsfo_disable]
+
+- name: "Check current FSFO/observer status before touching anything"
+  become: true
+  become_user: "{{ oracle_user }}"
+  command: "{{ manage_observer_script }} status"
+  register: fsfo_status_before
+  changed_when: false
+  tags: [rolling_fsfo_disable]
+
+- name: "Show current FSFO/observer status"
+  debug:
+    var: fsfo_status_before.stdout_lines
+  tags: [rolling_fsfo_disable]
+
+- name: "PAUSE — about to stop the Observer / disable FSFO. Confirm this is really wanted now."
+  pause:
+    prompt: >
+      About to run `{{ manage_observer_script }} stop` on {{ inventory_hostname }}.
+      This disables Fast-Start Failover for the duration of the rolling upgrade —
+      required by DBMS_ROLLING, but it also means NO automatic failover protection
+      until rolling_upgrade_fsfo (or an equivalent manual step) re-enables it after
+      DBMS_ROLLING.FINISH_PLAN completes, later in this phase. Press ENTER to
+      proceed, Ctrl+C to stop here.
+  tags: [rolling_fsfo_disable]
+
+- name: "Stop the Observer (disables FSFO)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  command: "{{ manage_observer_script }} stop"
+  register: fsfo_stop_result
+  changed_when: "'stopped' in fsfo_stop_result.stdout | lower or fsfo_stop_result.rc == 0"
+  tags: [rolling_fsfo_disable]
+
+- name: "Confirm FSFO/observer status after stop"
+  become: true
+  become_user: "{{ oracle_user }}"
+  command: "{{ manage_observer_script }} status"
+  register: fsfo_status_after
+  changed_when: false
+  tags: [rolling_fsfo_disable]
+
+- name: "Show FSFO/observer status after stop"
+  debug:
+    var: fsfo_status_after.stdout_lines
+  tags: [rolling_fsfo_disable]

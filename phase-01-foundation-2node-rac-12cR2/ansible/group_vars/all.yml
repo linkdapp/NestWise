@@ -640,3 +640,42 @@ install_local_oracleasmlib_rpm: true
 # compat-libcap1 — cluvfy's PRVF-7532 prereq check (`compat-libcap1-1.10`) — genuinely
 # EL7-era, natively available via yum on OL7 (see os_prep's task comment, which
 # installs it directly — no local file needed).
+
+# --- Phase 6: 12.2.0.1 -> 19c rolling upgrade (Data Guard / DBMS_ROLLING) ----
+# NEW 19c DATABASE home — separate from grid_home (also 19.3.0, already installed
+# in Phase 1) and separate from db_home (stays 12.2.0.1 until this phase actually
+# completes — db_home itself is NOT touched by this role). Same OFA shape as
+# db_home, next major-version segment.
+db19c_home: /u01/app/oracle/product/19.3.0/db_1
+db19c_target_version: "19"   # AutoUpgrade config: upg1.target_version
+
+# Software + patches staged by James directly (not yet downloaded via any Ansible
+# task) — confirm actual presence with the role's own stat/fail-fast check before
+# trusting these paths on a real run, same pattern as gi_software_zip/db_software_zip.
+db19c_software_zip: "{{ staging_dir }}/software/LINUX.X64_193000_db_home.zip"
+db19c_ru_patch_id: "39467003"   # same combo RU already used for GI (19.32.0.0.260721) —
+# per GI RU's own comment above, this combo contains 39472050 (Database RU) which
+# applies to "both Oracle home and Grid home for RAC" — so no separate DB-only RU
+# zip is needed, this same combo directory covers the new 19c DB home too.
+db19c_ru_patch_path: "{{ staging_dir }}/patches/{{ db19c_ru_patch_id }}"
+db19c_ru_zip: "{{ staging_dir }}/patches/p39467003_190000_Linux-x86-64.zip"
+# OPatch for the new 19c DB home — same zip already used for grid_home (gi_opatch_zip)
+# is explicitly fine to reuse per that var's own comment ("grabbing the newest
+# available OPatch build across release lines is common practice") — confirm with
+# `opatch version` in db19c_home after unzipping, same as every other OPatch step
+# in this project.
+db19c_opatch_zip: "{{ gi_opatch_zip }}"
+
+# AutoUpgrade jar — staged by James. Drives the actual dictionary upgrade against
+# the transient logical standby once DBMS_ROLLING.START_PLAN has instantiated it
+# (a later phase, not this role) — not used by db19c_software_install itself.
+autoupgrade_jar: "{{ staging_dir }}/software/AutoUpgrade_25.6_build_version_25.6.251016.jar"
+
+# FSFO must be fully down before DBMS_ROLLING.BUILD_PLAN — the broker rejects any
+# attempt to even ENABLE fast-start failover while a rolling upgrade is in
+# progress, confirmed against Oracle's own DBMS_ROLLING documentation. James's
+# existing script (not written by this project's Ansible, already in place before
+# this phase started) — assumed to live on oemserver01 (observer_nodes) since
+# that's where the Observer itself runs and where fsfo_dir/fsfo_wallet_dir already
+# live; confirm this path is correct on oemserver01 before the first real run.
+manage_observer_script: /u01/app/oracle/scripts/monitoring/manage_observer.sh

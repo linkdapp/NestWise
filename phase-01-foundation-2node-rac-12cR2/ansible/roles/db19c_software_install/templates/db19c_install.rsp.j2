@@ -1,0 +1,44 @@
+################################################################################
+# Database 19.0.0.0 silent response file — Phase 6 (12.2.0.1 -> 19c rolling
+# upgrade). Installed WITH -applyRU (unlike db_install.rsp.j2's 12.2.0.1 install,
+# which had to be software-only because the 12.2.0.1 installer rejects -applyRU
+# outright — see db_silent_install's own role header, known-risks.md #35). 18c+
+# installers DO support -applyRU per that same confirmed finding, so this home
+# comes up already at 19.32.0.0.260721, no separate post-install opatchauto pass
+# needed the way db_home required.
+#
+# Run against EITHER cluster (rac_nodes for the primary's future post-switchover
+# home, standby_nodes for the transient logical standby DBMS_ROLLING will
+# instantiate) — {{ nodes }} already resolves to the correct cluster's node list
+# via group_vars/standby_nodes.yml's redirection, same mechanism every other
+# per-cluster template in this project relies on.
+#
+# CAVEAT, same as db_install.rsp.j2: diff against the real db_install.rsp shipped
+# inside LINUX.X64_193000_db_home.zip before trusting the exact schema version
+# string below on a real run — not yet confirmed against this project's actual
+# staged media.
+################################################################################
+
+oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v19.0.0
+
+oracle.install.option=INSTALL_DB_SWONLY
+
+ORACLE_HOSTNAME={{ inventory_hostname }}.{{ domain }}
+UNIX_GROUP_NAME=oinstall
+INVENTORY_LOCATION={{ inventory_loc }}
+ORACLE_BASE={{ oracle_base }}
+ORACLE_HOME={{ db19c_home }}
+
+oracle.install.db.InstallEdition=EE
+oracle.install.db.OSDBA_GROUP=dba
+oracle.install.db.OSOPER_GROUP=oper
+oracle.install.db.OSBACKUPDBA_GROUP=dba
+oracle.install.db.OSDGDBA_GROUP=dba
+oracle.install.db.OSKMDBA_GROUP=dba
+oracle.install.db.OSRACDBA_GROUP=dba
+
+oracle.install.db.CLUSTER_NODES={{ nodes | map(attribute='name') | join(',') }}
+oracle.install.db.isRACOneInstall=false
+
+DECLINE_SECURITY_UPDATES=true
+SECURITY_UPDATES_VIA_MYORACLESUPPORT=false

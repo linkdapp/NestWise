@@ -1,0 +1,177 @@
+---
+# Phase 6 (12.2.0.1 -> 19c rolling upgrade): install a NEW, patched 19c DB home,
+# separate from db_home (stays 12.2.0.1, untouched by this role) and separate
+# from grid_home (already 19.3.0, also untouched — this is the DATABASE home
+# only). Run this role twice from the top-level playbook — once with
+# hosts: rac_nodes, once with hosts: standby_nodes — since these are two
+# genuinely independent RAC clusters, not one CLUSTER_NODES list spanning both.
+#
+# Includes -applyRU at install time (patch 39467003, the same 19.32 combo
+# already used for GI) — confirmed by db_silent_install's own history that 18c+
+# DB installers support -applyRU, unlike 12.2.0.1's. So unlike db_home's
+# software-only-then-opatchauto path, this home should come up already patched
+# to 19.32.0.0.260721 in one pass. NOT yet confirmed against a real run of THIS
+# specific zip — verify the -applyRU flag is actually accepted before trusting
+# this fully; fall back to the software-only + opatchauto pattern from
+# db_silent_install if it isn't (same as GI's own patch_before_config role
+# already does for its OPatch-update-before-applyRU sequencing).
+
+- name: "Stage 19c DB software: extract, update OPatch, confirm RU staged"
+  tags: [db19c_stage]
+  block:
+    - name: Render db19c_install.rsp
+      template:
+        src: db19c_install.rsp.j2
+        dest: "{{ staging_dir }}/response-files/db19c_install.rsp"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: "0644"
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+
+    - name: Ensure db19c_home exists and is owned by the oracle user
+      file:
+        path: "{{ db19c_home }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: "0775"
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+
+    - name: Confirm the 19c DB software zip is staged
+      stat:
+        path: "{{ db19c_software_zip }}"
+      register: db19c_software_zip_stat
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+
+    - name: Fail with a clear message if the 19c DB software zip isn't staged
+      fail:
+        msg: "Expected {{ db19c_software_zip }} — not found on {{ inventory_hostname }}."
+      when: not db19c_software_zip_stat.stat.exists
+      run_once: true
+
+    - name: Confirm the 19c RU combo zip is staged (patch 39467003)
+      stat:
+        path: "{{ db19c_ru_zip }}"
+      register: db19c_ru_zip_stat
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+
+    - name: Fail with a clear message if the 19c RU zip isn't staged
+      fail:
+        msg: "Expected {{ db19c_ru_zip }} — not found on {{ inventory_hostname }}."
+      when: not db19c_ru_zip_stat.stat.exists
+      run_once: true
+
+    - name: Extract 19c DB software to a staging location (NOT db19c_home — same reasoning as db_silent_install)
+      unarchive:
+        src: "{{ db19c_software_zip }}"
+        dest: "{{ staging_dir }}/software/db19c"
+        remote_src: true
+        owner: "{{ oracle_user }}"
+        group: oinstall
+      args:
+        creates: "{{ staging_dir }}/software/db19c/runInstaller"
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+
+    - name: Extract the 19c RU combo patch to the staging patches directory
+      unarchive:
+        src: "{{ db19c_ru_zip }}"
+        dest: "{{ staging_dir }}/patches"
+        remote_src: true
+        owner: "{{ oracle_user }}"
+        group: oinstall
+      args:
+        creates: "{{ db19c_ru_patch_path }}"
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+
+    - name: Confirm the 19c DB OPatch zip is staged
+      stat:
+        path: "{{ db19c_opatch_zip }}"
+      register: db19c_opatch_zip_stat
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+
+    - name: Fail with a clear message if the 19c DB OPatch zip isn't staged
+      fail:
+        msg: "Expected {{ db19c_opatch_zip }} — not found on {{ inventory_hostname }}."
+      when: not db19c_opatch_zip_stat.stat.exists
+      run_once: true
+
+- name: "Install 19c DB software with -applyRU + root.sh"
+  tags: [db19c_install_software]
+  block:
+    - name: "Check whether the 19c DB software install has already completed"
+      stat:
+        path: "{{ db19c_home }}/root.sh"
+      register: db19c_root_sh_stat
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+
+    - name: "Set install-check result"
+      set_fact:
+        db19c_install_check_rc: "{{ 0 if db19c_root_sh_stat.stat.exists else 1 }}"
+      run_once: true
+
+    - name: Report 19c DB software install status
+      debug:
+        msg: >
+          19c DB software install {{ 'already completed — ' + db19c_home + '/root.sh exists.
+          Skipping runInstaller re-invocation.' if db19c_install_check_rc == '0' else
+          'not yet done — running runInstaller now, with -applyRU (' + db19c_ru_patch_path + ').' }}
+      run_once: true
+
+    # Same -waitforcompletion requirement as db_silent_install's 12.2.0.1 install —
+    # documented OUI behavior (detached background process without it), not
+    # specific to either version. -applyRU here is the actual difference from
+    # db_install.rsp's install: confirmed acceptable by 18c+ installers per
+    # db_silent_install's own header comment.
+    - name: Run runInstaller silently, with -applyRU
+      become: true
+      become_user: "{{ oracle_user }}"
+      command: >
+        {{ staging_dir }}/software/db19c/runInstaller -silent -waitforcompletion
+        -responseFile {{ staging_dir }}/response-files/db19c_install.rsp
+        -applyRU {{ db19c_ru_patch_path }}
+        {{ '-ignorePrereq -ignoreSysPrereqs' if (use_ignore_prereq or db_ignore_prereq) else '' }}
+      register: db19c_install_result
+      failed_when: db19c_install_result.rc not in [0, 6]
+      changed_when: db19c_install_result.rc == 0
+      when: db19c_install_check_rc == '1'
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+
+    - name: Show runInstaller output
+      debug:
+        var: db19c_install_result.stdout_lines
+      when: db19c_install_check_rc == '1'
+      run_once: true
+
+    - name: Run root.sh for the 19c DB home (per node — has to run on both)
+      become: true
+      command: "{{ db19c_home }}/root.sh"
+      register: db19c_root_sh
+      changed_when: "'has already been run' not in db19c_root_sh.stdout"
+
+    - name: "Check 19c DB OPatch version, update if needed (defensive — should already be current from -applyRU)"
+      command: "{{ db19c_home }}/OPatch/opatch version"
+      register: db19c_opatch_version
+      changed_when: false
+
+    - name: Report 19c OPatch version
+      debug:
+        msg: "OPatch in {{ db19c_home }} on {{ inventory_hostname }}: {{ db19c_opatch_version.stdout_lines[0] }}"
+
+    - name: "PAUSE — 19c DB software installed and patched. Confirm before continuing to the next node/cluster."
+      pause:
+        prompt: >
+          19c DB home ({{ db19c_home }}) is installed on {{ inventory_hostname }},
+          with -applyRU already applied (19.32.0.0.260721) and root.sh run. Confirm
+          `opatch lsinventory` looks right before continuing — this software home
+          is NOT yet wired into anything (no listener, no CRS registration, no
+          database). Press ENTER to continue, Ctrl+C to stop here.
+      run_once: true
