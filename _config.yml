@@ -2,6 +2,9 @@ theme: minima
 title: NestWise
 description: Oracle DBA POC and learning resources
 
+url: "https://linkdapp.github.io"
+baseurl: "/NestWise"
+
 # Curated top-nav. Without this, minima defaults to listing every markdown file
 # in the repo that Jekyll treats as a page (GitHub Pages auto-derives a title from
 # each file's first heading via jekyll-titles-from-headings even with no front
