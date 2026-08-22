@@ -39,7 +39,6 @@ what Oracle HA is supposed to look like, it's a record of building it.
 
 ## For the technical reader
 
-## For the technical reader
 
 ```mermaid
 flowchart TB
@@ -72,6 +71,8 @@ flowchart TB
     class RAC,OEM,DG built
     class APEX next
     class MONGO,GG planned
+	```
+	```
 	```
 
 🟩 Built &nbsp;&nbsp; 🟨 In progress — up next &nbsp;&nbsp; ⬜ Planned
