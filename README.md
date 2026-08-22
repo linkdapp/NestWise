@@ -1,6 +1,3 @@
----
-title: ""
----
 
 # NestWise — a real application, running on a real Oracle high-availability platform
 
@@ -42,7 +39,9 @@ what Oracle HA is supposed to look like, it's a record of building it.
 
 ## For the technical reader
 
-<pre class="mermaid">
+## For the technical reader
+
+```mermaid
 flowchart TB
     subgraph APP["Application Layer — NestWise"]
         APEX["APEX + ORDS<br/>(Oracle-native app)"]
@@ -73,7 +72,7 @@ flowchart TB
     class RAC,OEM,DG built
     class APEX next
     class MONGO,GG planned
-</pre>
+	```
 
 🟩 Built &nbsp;&nbsp; 🟨 In progress — up next &nbsp;&nbsp; ⬜ Planned
 
