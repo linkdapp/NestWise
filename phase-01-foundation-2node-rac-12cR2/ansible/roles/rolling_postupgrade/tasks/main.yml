@@ -7,8 +7,10 @@
 # standard (see maintenance/part2 §10, high-availability/), not something
 # DBMS_ROLLING or Oracle's own whitepaper requires. Oracle's whitepaper
 # stops at "primary mounted, apply running" — six steps below restore the
-# original apexdb=PRIMARY / apexdb_stby=STANDBY configuration and take a
-# baseline backup.
+# original apexdb=PRIMARY / apexdb_stby=STANDBY configuration. Fast-Start
+# Failover re-enable and the RMAN baseline backup are deliberately NOT in
+# this role — see the note below and ../../rolling-postupgrade.yml's own
+# header comment for the full ordering rationale.
 #
 # Expected starting state (asserted below, not assumed):
 #   apexdb_stby — PRIMARY, OPEN            (became primary at rolling_switchover)
@@ -30,17 +32,23 @@
 #      SQL/srvctl, not just DGMGRL's own report). This also satisfies §10
 #      step 5 ("check role-based services") — no separate task needed here.
 #   6. Re-open apexdb_stby (now standby again) read-only with apply.
-#   7. RMAN Level 0 backup FROM apexdb_stby (the standby, post-switchback)
-#      to /media/sf_hrman/rman_backups/<SID>.
 #
-# Fast-Start Failover re-enable (§10 step 6) is NOT in this role — it has to
-# run against oemserver01 (observer_nodes), a genuinely different host, and
-# dataguard_fsfo's own tasks rely on the PLAY's hosts: being observer_nodes
-# directly (they don't delegate_to internally, unlike dataguard_switchover_test).
-# include_role-ing it from this rac_node1 play would run its tasks against
-# the WRONG host. See ../../rolling-postupgrade.yml's second play, which
-# reuses dataguard_fsfo wholesale (every task in it already checks "already
-# enabled/running, skip" — safe to just run the whole role again).
+# Fast-Start Failover re-enable (roles/rolling_postupgrade_fsfo) is NOT in
+# this role — it has to run against oemserver01 (observer_nodes), a
+# genuinely different host, and its own tasks rely on the PLAY's hosts:
+# being observer_nodes directly (no internal delegate_to, unlike
+# dataguard_switchover_test). include_role-ing it from this rac_node1 play
+# would run its tasks against the WRONG host.
+#
+# The RMAN Level 0 backup (roles/rolling_postupgrade_backup) is ALSO not in
+# this role, for a different reason: it deliberately runs AFTER FSFO
+# re-enable, not before, so the backup is taken once the whole HA
+# configuration is confirmed restored, not mid-sequence. It still targets
+# rac_node1/standby_node1 like this role does — it's split out purely
+# because Ansible plays can't interleave two host groups (rac_node1, then
+# observer_nodes, then rac_node1 again) within a single play. See
+# ../../rolling-postupgrade.yml's header comment for the full ordering
+# rationale.
 #
 # Home used throughout: db19c_home, hardcoded (not rediscovered). Safe here
 # in a way it wasn't during rolling_finish (see dbms_rolling_upgrade's own
@@ -120,11 +128,11 @@
     label: "{{ item.db }}"
   tags: [rolling_postupgrade]
 
-- name: "Fail loudly if the starting state isn't apexdb_stby=PRIMARY(OPEN) / apexdb=PHYSICAL STANDBY(MOUNTED) — this role assumes that direction throughout steps 1-4"
+- name: "Fail loudly if the starting state isn't apexdb_stby=PRIMARY / apexdb=PHYSICAL STANDBY — this role assumes that direction throughout steps 1-4 (open_mode is NOT checked here — step 3 below already handles apexdb being MOUNTED, READ ONLY, or READ ONLY WITH APPLY idempotently)"
   fail:
     msg: >-
-      Expected apexdb_stby PRIMARY|... and apexdb PHYSICAL STANDBY|MOUNTED
-      (the state rolling_finish should have left things in). Got:
+      Expected apexdb_stby database_role=PRIMARY and apexdb
+      database_role=PHYSICAL STANDBY. Got:
       apexdb={{ (rpu_preflight_role.results | selectattr('item.db','equalto','apexdb') | first).stdout }},
       apexdb_stby={{ (rpu_preflight_role.results | selectattr('item.db','equalto','apexdb_stby') | first).stdout }}.
       Read maintenance/part2-finish-plan-and-troubleshooting.md §9 and
@@ -132,18 +140,21 @@
       to guess which database to treat as "current primary".
   when: >-
     (rpu_preflight_role.results | selectattr('item.db','equalto','apexdb_stby') | first).stdout is not search('PRIMARY\|')
-    or (rpu_preflight_role.results | selectattr('item.db','equalto','apexdb') | first).stdout is not search('PHYSICAL STANDBY\|MOUNTED')
+    or (rpu_preflight_role.results | selectattr('item.db','equalto','apexdb') | first).stdout is not search('PHYSICAL STANDBY\|')
   tags: [rolling_postupgrade]
 
-- name: "PAUSE — about to run post-upgrade normalization (supplemental logging, management policy, open apexdb read-only) then switch back to apexdb=PRIMARY / apexdb_stby=STANDBY, then take an RMAN Level 0 backup from the standby"
+- name: "PAUSE — about to run post-upgrade normalization (supplemental logging, management policy, open apexdb read-only) then switch back to apexdb=PRIMARY / apexdb_stby=STANDBY"
   pause:
     prompt: >
-      Preflight confirmed apexdb_stby=PRIMARY(OPEN), apexdb=PHYSICAL
-      STANDBY(MOUNTED). About to: disable supplemental logging on
+      Preflight confirmed apexdb_stby database_role=PRIMARY, apexdb
+      database_role=PHYSICAL STANDBY (open_mode not checked here — the next
+      steps handle apexdb already being MOUNTED, READ ONLY, or READ ONLY
+      WITH APPLY idempotently). About to: disable supplemental logging on
       apexdb_stby, reset management policy to AUTOMATIC on both, open
-      apexdb read-only with apply, log-switch test, SWITCHOVER BACK to
-      apexdb=PRIMARY, re-open apexdb_stby read-only with apply, then run an
-      RMAN Level 0 backup from apexdb_stby. Press ENTER to continue, Ctrl+C
+      apexdb read-only with apply (if not already), log-switch test,
+      SWITCHOVER BACK to apexdb=PRIMARY, re-open apexdb_stby read-only with
+      apply. Fast-Start Failover re-enable and the RMAN Level 0 backup run
+      afterward, as separate plays. Press ENTER to continue, Ctrl+C
       then A to abort.
   tags: [rolling_postupgrade]
 
@@ -179,7 +190,11 @@
     export ORACLE_SID={{ sid_prefix }}1
     {{ db19c_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/rpu_supplemental_log_disable.sql
   register: rpu_supplemental_log_result
-  changed_when: "'SUPPLEMENTAL_LOG_DATA_MIN=YES' in rpu_supplemental_log_result.stdout"
+  # ADD-then-DROP always executes (no when: gate above) — this genuinely
+  # changes on-disk supplemental-logging state every run, regardless of
+  # what it reads back afterward. changed_when tied to the post-DROP value
+  # would be backwards (that value is expected to read NO if this worked).
+  changed_when: true
   tags: [rolling_postupgrade, rolling_postupgrade_normalize]
 
 - name: Show supplemental logging disable output
@@ -242,7 +257,7 @@
 # issuing either ALTER, so a resumed run doesn't hit ORA-16004/already-active
 # errors on a database that's already in the target state.
 # ============================================================================
-- name: "Write SQL: check apexdb's open_mode + whether MRP is applying"
+- name: "Write SQL: check apexdb's database_role + open_mode + whether MRP is applying"
   become: true
   become_user: "{{ oracle_user }}"
   delegate_to: "{{ groups['rac_node1'][0] }}"
@@ -253,11 +268,11 @@
     mode: "0644"
     content: |
       set echo off heading off feedback off pagesize 0 linesize 200 tab off
-      select open_mode || '|' || (select count(*) from v$managed_standby where process like 'MRP%' and status='APPLYING_LOG') from v$database;
+      select database_role || '|' || open_mode || '|' || (select count(*) from v$managed_standby where process like 'MRP%' and status='APPLYING_LOG') from v$database;
       exit;
   tags: [rolling_postupgrade, rolling_postupgrade_normalize]
 
-- name: "Run: check apexdb's open_mode + apply status"
+- name: "Run: check apexdb's database_role + open_mode + apply status"
   become: true
   become_user: "{{ oracle_user }}"
   delegate_to: "{{ groups['rac_node1'][0] }}"
@@ -269,15 +284,38 @@
   changed_when: false
   tags: [rolling_postupgrade, rolling_postupgrade_normalize]
 
-- name: "Set facts: apexdb's current open_mode / whether apply is running"
+- name: "Set facts: apexdb's current database_role / open_mode / whether apply is running"
   set_fact:
-    rpu_apexdb_open_mode: "{{ rpu_apexdb_state_raw.stdout | trim | split('|') | first }}"
+    rpu_apexdb_role: "{{ rpu_apexdb_state_raw.stdout | trim | split('|') | first }}"
+    rpu_apexdb_open_mode: "{{ (rpu_apexdb_state_raw.stdout | trim | split('|'))[1] }}"
     rpu_apexdb_applying: "{{ (rpu_apexdb_state_raw.stdout | trim | split('|') | last | int) > 0 }}"
   tags: [rolling_postupgrade, rolling_postupgrade_normalize]
 
 - name: Show apexdb state before opening read-only
   debug:
-    msg: "apexdb: open_mode={{ rpu_apexdb_open_mode }}, MRP applying={{ rpu_apexdb_applying }}"
+    msg: "apexdb: database_role={{ rpu_apexdb_role }}, open_mode={{ rpu_apexdb_open_mode }}, MRP applying={{ rpu_apexdb_applying }}"
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize]
+
+# Real failure this guard exists to catch: dataguard_switchover_test's own
+# verification (step 5, above) checks the role right after SWITCHOVER
+# completes — it doesn't re-check it again here, moments later, before this
+# role goes on to touch apexdb/apexdb_stby further. If anything left either
+# database NOT actually converted to a standby controlfile (SWITCHOVER
+# reported success but the role flip didn't fully take, CRS restarted an
+# instance per a stale -startoption, etc.), ALTER DATABASE RECOVER MANAGED
+# STANDBY DATABASE fails with ORA-01665 ("control file is not a standby
+# control file") — a real, correct-but-cryptic error to hit blind. Check the
+# role directly first and fail with a clear message instead.
+- name: "Fail loudly if apexdb's database_role isn't PHYSICAL STANDBY — do not attempt standby recovery against a database whose controlfile isn't actually a standby controlfile"
+  fail:
+    msg: >-
+      apexdb's database_role is '{{ rpu_apexdb_role }}', not PHYSICAL
+      STANDBY. Something upstream (the switchback in step 5, or CRS/policy
+      state) left this database not actually converted to a standby — do
+      not proceed. Check `dgmgrl> show configuration;` and real SQL
+      (database_role, open_mode) on BOTH apexdb and apexdb_stby by hand
+      before re-running.
+  when: rpu_apexdb_role != 'PHYSICAL STANDBY'
   tags: [rolling_postupgrade, rolling_postupgrade_normalize]
 
 - name: "Open apexdb read-only (only if currently MOUNTED)"
@@ -293,6 +331,20 @@
     EOF
   register: rpu_apexdb_open_result
   when: rpu_apexdb_open_mode == 'MOUNTED'
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize]
+
+- name: "Show ALTER DATABASE OPEN READ ONLY output (apexdb)"
+  debug:
+    msg: "{{ rpu_apexdb_open_result.stdout_lines }}"
+  when: rpu_apexdb_open_mode == 'MOUNTED'
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize]
+
+- name: "Fail loudly if ALTER DATABASE OPEN READ ONLY reported an ORA- error (sqlplus returns rc 0 even on a failed statement without WHENEVER SQLERROR — same non-trusting-rc discipline as every other check in this project)"
+  fail:
+    msg: >-
+      ALTER DATABASE OPEN READ ONLY on apexdb reported an ORA- error — read
+      the output above before proceeding.
+  when: rpu_apexdb_open_mode == 'MOUNTED' and rpu_apexdb_open_result.stdout is search('ORA-')
   tags: [rolling_postupgrade, rolling_postupgrade_normalize]
 
 - name: "Report: apexdb already open, skipped ALTER DATABASE OPEN READ ONLY"
@@ -314,6 +366,20 @@
     EOF
   register: rpu_apexdb_apply_result
   when: not rpu_apexdb_applying
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize]
+
+- name: "Show RECOVER MANAGED STANDBY DATABASE output (apexdb)"
+  debug:
+    msg: "{{ rpu_apexdb_apply_result.stdout_lines }}"
+  when: not rpu_apexdb_applying
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize]
+
+- name: "Fail loudly if RECOVER MANAGED STANDBY DATABASE reported an ORA- error on apexdb"
+  fail:
+    msg: >-
+      ALTER DATABASE RECOVER MANAGED STANDBY DATABASE on apexdb reported an
+      ORA- error — read the output above before proceeding.
+  when: not rpu_apexdb_applying and rpu_apexdb_apply_result.stdout is search('ORA-')
   tags: [rolling_postupgrade, rolling_postupgrade_normalize]
 
 - name: "Report: apexdb apply already running, skipped RECOVER MANAGED STANDBY DATABASE"
@@ -351,6 +417,19 @@
     EOF
   register: rpu_logswitch_result
   changed_when: true
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize]
+
+- name: "Show log-switch output (apexdb_stby)"
+  debug:
+    msg: "{{ rpu_logswitch_result.stdout_lines }}"
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize]
+
+- name: "Fail loudly if ALTER SYSTEM SWITCH LOGFILE reported an ORA- error on apexdb_stby"
+  fail:
+    msg: >-
+      ALTER SYSTEM SWITCH LOGFILE on apexdb_stby reported an ORA- error —
+      read the output above before proceeding.
+  when: rpu_logswitch_result.stdout is search('ORA-')
   tags: [rolling_postupgrade, rolling_postupgrade_normalize]
 
 - name: "Write SQL: check the 5 most recent archived log sequences + applied status on apexdb"
@@ -409,10 +488,29 @@
 # in use), stale now. Both databases are confirmed on 19c by this role's own
 # preflight, so override db_home -> db19c_home for the duration of this
 # include only (task vars on include_role outrank group_vars).
+#
+# --- Real bug, hit on the first live run, root-caused and fixed here -------
+# `include_role` is a DYNAMIC include — `tags:` on the include task itself
+# only governs whether Ansible enters the include at all; it does NOT, on
+# its own, propagate into the child role's own tasks for tag-based
+# selection (that's genuinely how Ansible behaves, not a typo on my part —
+# see the `apply:` keyword in Ansible's own tags documentation). Since
+# dataguard_switchover_test's tasks carry no tags of their own, running
+# this repo's own standard invocation — `--tags rolling_postupgrade` — hit
+# exactly that gap: the include was entered, but Ansible found zero
+# effectively-tagged child tasks inside it and silently ran NONE of them.
+# No error, no warning — the play just continued straight to step 6 as if
+# the switchover had already happened. It hadn't: apexdb_stby was still
+# PRIMARY, which is what then made step 6 hit a real ORA-01665 ("control
+# file is not a standby control file") trying to start managed recovery
+# against it. `apply:` below forwards these same tags onto every task
+# inside the include, closing the gap.
 # ============================================================================
 - name: "Switch back to apexdb=PRIMARY / apexdb_stby=STANDBY (reuses dataguard_switchover_test)"
   include_role:
     name: dataguard_switchover_test
+    apply:
+      tags: [rolling_postupgrade, rolling_postupgrade_switchback]
   vars:
     db_home: "{{ db19c_home }}"
   tags: [rolling_postupgrade, rolling_postupgrade_switchback]
@@ -425,7 +523,7 @@
 # management policy was already set to AUTOMATIC on both databases in step 2
 # (unaffected by a role switch).
 # ============================================================================
-- name: "Write SQL: check apexdb_stby's open_mode + whether MRP is applying"
+- name: "Write SQL: check apexdb_stby's database_role + open_mode + whether MRP is applying"
   become: true
   become_user: "{{ oracle_user }}"
   delegate_to: "{{ groups['standby_node1'][0] }}"
@@ -436,11 +534,11 @@
     mode: "0644"
     content: |
       set echo off heading off feedback off pagesize 0 linesize 200 tab off
-      select open_mode || '|' || (select count(*) from v$managed_standby where process like 'MRP%' and status='APPLYING_LOG') from v$database;
+      select database_role || '|' || open_mode || '|' || (select count(*) from v$managed_standby where process like 'MRP%' and status='APPLYING_LOG') from v$database;
       exit;
   tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
 
-- name: "Run: check apexdb_stby's open_mode + apply status"
+- name: "Run: check apexdb_stby's database_role + open_mode + apply status"
   become: true
   become_user: "{{ oracle_user }}"
   delegate_to: "{{ groups['standby_node1'][0] }}"
@@ -452,15 +550,27 @@
   changed_when: false
   tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
 
-- name: "Set facts: apexdb_stby's current open_mode / whether apply is running"
+- name: "Set facts: apexdb_stby's current database_role / open_mode / whether apply is running"
   set_fact:
-    rpu_apexdb_stby_open_mode: "{{ rpu_apexdb_stby_state_raw.stdout | trim | split('|') | first }}"
+    rpu_apexdb_stby_role: "{{ rpu_apexdb_stby_state_raw.stdout | trim | split('|') | first }}"
+    rpu_apexdb_stby_open_mode: "{{ (rpu_apexdb_stby_state_raw.stdout | trim | split('|'))[1] }}"
     rpu_apexdb_stby_applying: "{{ (rpu_apexdb_stby_state_raw.stdout | trim | split('|') | last | int) > 0 }}"
   tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
 
 - name: Show apexdb_stby state before opening read-only
   debug:
-    msg: "apexdb_stby: open_mode={{ rpu_apexdb_stby_open_mode }}, MRP applying={{ rpu_apexdb_stby_applying }}"
+    msg: "apexdb_stby: database_role={{ rpu_apexdb_stby_role }}, open_mode={{ rpu_apexdb_stby_open_mode }}, MRP applying={{ rpu_apexdb_stby_applying }}"
+  tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
+
+- name: "Fail loudly if apexdb_stby's database_role isn't PHYSICAL STANDBY — do not attempt standby recovery against a database whose controlfile isn't actually a standby controlfile (this is the exact check that would have caught the real ORA-01665 failure hit in testing, with a clear message instead of a cryptic one)"
+  fail:
+    msg: >-
+      apexdb_stby's database_role is '{{ rpu_apexdb_stby_role }}', not
+      PHYSICAL STANDBY. The switchback in step 5 above did not leave this
+      database converted to a standby — do not proceed. Check
+      `dgmgrl> show configuration;` and real SQL (database_role, open_mode)
+      on BOTH apexdb and apexdb_stby by hand before re-running.
+  when: rpu_apexdb_stby_role != 'PHYSICAL STANDBY'
   tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
 
 - name: "Open apexdb_stby read-only (only if currently MOUNTED)"
@@ -476,6 +586,20 @@
     EOF
   register: rpu_apexdb_stby_open_result
   when: rpu_apexdb_stby_open_mode == 'MOUNTED'
+  tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
+
+- name: "Show ALTER DATABASE OPEN READ ONLY output (apexdb_stby)"
+  debug:
+    msg: "{{ rpu_apexdb_stby_open_result.stdout_lines }}"
+  when: rpu_apexdb_stby_open_mode == 'MOUNTED'
+  tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
+
+- name: "Fail loudly if ALTER DATABASE OPEN READ ONLY reported an ORA- error (apexdb_stby)"
+  fail:
+    msg: >-
+      ALTER DATABASE OPEN READ ONLY on apexdb_stby reported an ORA- error —
+      read the output above before proceeding.
+  when: rpu_apexdb_stby_open_mode == 'MOUNTED' and rpu_apexdb_stby_open_result.stdout is search('ORA-')
   tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
 
 - name: "Report: apexdb_stby already open, skipped ALTER DATABASE OPEN READ ONLY"
@@ -499,6 +623,20 @@
   when: not rpu_apexdb_stby_applying
   tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
 
+- name: "Show RECOVER MANAGED STANDBY DATABASE output (apexdb_stby)"
+  debug:
+    msg: "{{ rpu_apexdb_stby_apply_result.stdout_lines }}"
+  when: not rpu_apexdb_stby_applying
+  tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
+
+- name: "Fail loudly if RECOVER MANAGED STANDBY DATABASE reported an ORA- error on apexdb_stby"
+  fail:
+    msg: >-
+      ALTER DATABASE RECOVER MANAGED STANDBY DATABASE on apexdb_stby
+      reported an ORA- error — read the output above before proceeding.
+  when: not rpu_apexdb_stby_applying and rpu_apexdb_stby_apply_result.stdout is search('ORA-')
+  tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
+
 - name: "Report: apexdb_stby apply already running, skipped RECOVER MANAGED STANDBY DATABASE"
   debug:
     msg: "apexdb_stby MRP was already APPLYING_LOG — skipped."
@@ -520,197 +658,11 @@
       apexdb is PRIMARY, apexdb_stby is STANDBY (OPEN READ ONLY, apply
       running) — original configuration restored. Role-based service flip
       already verified above by dataguard_switchover_test's own checks.
-      Fast-Start Failover re-enable runs separately, against oemserver01 —
-      see rolling-postupgrade.yml's second play (--tags rolling_postupgrade_fsfo).
-      Proceeding to the RMAN Level 0 backup from apexdb_stby.
+      Next: rolling-postupgrade.yml's second play (--tags
+      rolling_postupgrade_fsfo) re-enables Fast-Start Failover against
+      oemserver01, THEN its third play (--tags rolling_postupgrade_backup)
+      takes the RMAN Level 0 baseline backup from apexdb_stby — in that
+      order, deliberately, so the backup is taken once the whole HA
+      configuration (role + FSFO + observer) is confirmed back to normal,
+      not before.
   tags: [rolling_postupgrade, rolling_postupgrade_renormalize]
-
-# ============================================================================
-# Step 7 — RMAN Level 0 backup, from apexdb_stby (the standby, post-
-# switchback), to /media/sf_hrman/rman_backups/<SID>.
-#
-# Why from the standby: offloads backup I/O from the production primary — a
-# standard, well-documented Data-Guard-aware backup pattern, and exactly
-# what James asked for.
-#
-# Practices applied, and why:
-#   - CONFIGURE CONTROLFILE AUTOBACKUP ON — without this, restoring this
-#     backup later requires separately locating a controlfile/spfile copy.
-#     With it, RMAN backs up the controlfile+spfile automatically after
-#     every backup/structural change.
-#   - CONFIGURE BACKUP OPTIMIZATION ON — skips re-backing-up datafiles RMAN
-#     already has an identical copy of; matters once this becomes a repeated
-#     job, harmless for this one-time run.
-#   - CONFIGURE RETENTION POLICY TO REDUNDANCY {{ rman_retention_redundancy }}
-#     — Oracle's own default is REDUNDANCY 1 (a single backup satisfies
-#     retention); explicitly setting a minimum of 2 is standard practice
-#     rather than leaving it implicit.
-#   - CONFIGURE DEVICE TYPE DISK PARALLELISM {{ rman_channels }} ... BACKUP
-#     TYPE TO COMPRESSED BACKUPSET — persistent, config-driven parallelism
-#     and compression rather than ad hoc ALLOCATE CHANNEL in a RUN block;
-#     {{ rman_channels }} is deliberately modest (this is a lab VM, not a
-#     production-sized box).
-#   - INCREMENTAL LEVEL 0 DATABASE ... PLUS ARCHIVELOG — a level 0 is a full
-#     backup that also serves as the baseline for a future incremental
-#     strategy (backup-recovery/ is scoped for exactly that as later work).
-#   - PLUS ARCHIVELOG uses NOT BACKED UP 1 TIMES, and this job does NOT
-#     delete input archivelogs. Deliberate: this is a physical standby, and
-#     its archivelogs may still be needed by Data Guard apply / by other
-#     retention policy elsewhere in the broker configuration. A one-time
-#     ad hoc backup job deleting archivelogs out from under Data Guard on
-#     the standby is a real, avoidable risk — not done here.
-#   - CROSSCHECK BACKUP + LIST BACKUP SUMMARY + RESTORE DATABASE VALIDATE —
-#     a backup that's never been checked isn't a verified backup. VALIDATE
-#     reads every block RMAN would need for a restore without actually
-#     restoring anything.
-#
-# Deliberately NOT done here (out of scope for this one-time job, called out
-# rather than silently skipped): CONFIGURE ARCHIVELOG DELETION POLICY TO
-# APPLIED ON ALL STANDBY — this is a broker-wide governance setting that
-# belongs on the PRIMARY and affects when Data Guard considers archivelogs
-# safe to purge everywhere, not something to set incidentally from a single
-# standby-side backup script. Worth doing as its own deliberate step when
-# backup-recovery/ gets built out properly.
-# ============================================================================
-- name: "PAUSE — about to take an RMAN Level 0 backup of apexdb_stby to {{ rman_backup_base_dir }}/{{ sid_prefix }}1"
-  pause:
-    prompt: >
-      About to run an RMAN Level 0 (full) backup of apexdb_stby to
-      {{ rman_backup_base_dir }}/{{ sid_prefix }}1, then CROSSCHECK +
-      RESTORE DATABASE VALIDATE against it. This can take a while depending
-      on database size. Press ENTER to continue, Ctrl+C then A to abort.
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]
-
-- name: "Preflight: confirm the backup mount point exists and is a directory (does NOT attempt to mount it — /media/sf_hrman is expected to be an already-mounted VirtualBox shared folder)"
-  stat:
-    path: "{{ rman_backup_base_dir }}"
-  delegate_to: "{{ groups['standby_node1'][0] }}"
-  register: rpu_backup_mount_stat
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]
-
-- name: "Fail loudly if the backup mount point is missing — likely means the VirtualBox shared folder isn't mounted on this node"
-  fail:
-    msg: >-
-      {{ rman_backup_base_dir }} does not exist on
-      {{ groups['standby_node1'][0] }}. This looks like a VirtualBox shared
-      folder path (sf_ prefix) — confirm it's actually mounted (VirtualBox
-      Devices menu -> Shared Folders, or `mount | grep vboxsf` on the guest)
-      before re-running. Not something this role can fix by creating a
-      plain directory in its place.
-  when: not rpu_backup_mount_stat.stat.exists or not rpu_backup_mount_stat.stat.isdir
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]
-
-- name: "Create the SID-specific backup subdirectory ({{ rman_backup_base_dir }}/{{ sid_prefix }}1)"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['standby_node1'][0] }}"
-  file:
-    path: "{{ rman_backup_base_dir }}/{{ sid_prefix }}1"
-    state: directory
-    owner: "{{ oracle_user }}"
-    group: oinstall
-    mode: "0750"
-  register: rpu_backup_dir_result
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]
-
-- name: "Fail loudly if the oracle user can't actually write to the backup directory — common vboxsf gotcha (host-side folder permissions / oracle not in the vboxsf group)"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['standby_node1'][0] }}"
-  shell: |
-    touch "{{ rman_backup_base_dir }}/{{ sid_prefix }}1/.rpu_write_test" && rm -f "{{ rman_backup_base_dir }}/{{ sid_prefix }}1/.rpu_write_test"
-  register: rpu_backup_write_test
-  changed_when: false
-  failed_when: rpu_backup_write_test.rc != 0
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]
-
-- name: "Write RMAN script: Level 0 backup of apexdb_stby"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['standby_node1'][0] }}"
-  copy:
-    dest: "{{ staging_dir }}/sql/rpu_rman_l0_backup.rman"
-    owner: "{{ oracle_user }}"
-    group: oinstall
-    mode: "0644"
-    content: |
-      CONFIGURE CONTROLFILE AUTOBACKUP ON;
-      CONFIGURE CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE DISK TO '{{ rman_backup_base_dir }}/{{ sid_prefix }}1/%F';
-      CONFIGURE BACKUP OPTIMIZATION ON;
-      CONFIGURE RETENTION POLICY TO REDUNDANCY {{ rman_retention_redundancy }};
-      CONFIGURE DEVICE TYPE DISK PARALLELISM {{ rman_channels }} BACKUP TYPE TO COMPRESSED BACKUPSET;
-      CONFIGURE DEFAULT DEVICE TYPE TO DISK;
-
-      BACKUP AS COMPRESSED BACKUPSET INCREMENTAL LEVEL 0 DATABASE
-        TAG 'POST_ROLLING_UPGRADE_L0'
-        FORMAT '{{ rman_backup_base_dir }}/{{ sid_prefix }}1/%d_DB_%T_%U.bkp'
-        PLUS ARCHIVELOG
-        TAG 'POST_ROLLING_UPGRADE_ARCH'
-        FORMAT '{{ rman_backup_base_dir }}/{{ sid_prefix }}1/%d_ARCH_%T_%U.bkp'
-        NOT BACKED UP 1 TIMES;
-
-      CROSSCHECK BACKUP;
-      LIST BACKUP SUMMARY;
-      RESTORE DATABASE VALIDATE;
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]
-
-- name: "Run: RMAN Level 0 backup of apexdb_stby (this can take a while — no fixed timeout override here on purpose, let it run)"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['standby_node1'][0] }}"
-  shell: |
-    export ORACLE_HOME={{ db19c_home }}
-    export ORACLE_SID={{ sid_prefix }}1
-    {{ db19c_home }}/bin/rman target / cmdfile={{ staging_dir }}/sql/rpu_rman_l0_backup.rman log={{ staging_dir }}/sql/rpu_rman_l0_backup.log
-  register: rpu_rman_backup_result
-  changed_when: true
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]
-
-- name: "Fetch the RMAN log for inspection (rman's own rc can be 0 even when an internal RMAN-0xxxx error occurred mid-script — same non-trusting-rc discipline as every DGMGRL task in this project)"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['standby_node1'][0] }}"
-  command: "cat {{ staging_dir }}/sql/rpu_rman_l0_backup.log"
-  register: rpu_rman_backup_log
-  changed_when: false
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]
-
-- name: Show RMAN backup log
-  debug:
-    msg: "{{ rpu_rman_backup_log.stdout_lines }}"
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]
-
-- name: "Fail loudly if the RMAN log shows any RMAN- error, or rc != 0, or VALIDATE didn't report success"
-  fail:
-    msg: >-
-      RMAN reported a problem — read the full log above
-      ({{ staging_dir }}/sql/rpu_rman_l0_backup.log on
-      {{ groups['standby_node1'][0] }}) before assuming this backup is
-      usable. rc={{ rpu_rman_backup_result.rc }}.
-  when: >-
-    rpu_rman_backup_result.rc != 0
-    or rpu_rman_backup_log.stdout is search('RMAN-0')
-    or rpu_rman_backup_log.stdout is not search('finished successfully')
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]
-
-- name: "Remove the RMAN cmdfile (no password in it — OS-authenticated target /) but keep the log for reference"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['standby_node1'][0] }}"
-  file:
-    path: "{{ staging_dir }}/sql/rpu_rman_l0_backup.rman"
-    state: absent
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]
-
-- name: "RMAN Level 0 backup summary"
-  debug:
-    msg: >-
-      RMAN Level 0 backup of apexdb_stby completed and validated. Backup
-      pieces + controlfile autobackup are under
-      {{ rman_backup_base_dir }}/{{ sid_prefix }}1 on
-      {{ groups['standby_node1'][0] }}. Full RMAN log kept at
-      {{ staging_dir }}/sql/rpu_rman_l0_backup.log for reference. Post-
-      upgrade normalization + switchback + baseline backup complete. Run
-      rolling-postupgrade.yml's second play (--tags rolling_postupgrade_fsfo)
-      against observer_nodes to finish with Fast-Start Failover re-enable.
-  tags: [rolling_postupgrade, rolling_postupgrade_backup]

@@ -1,48 +1,169 @@
 ---
-# Phase 6 continued: post-upgrade normalization + role switchback + RMAN
-# Level 0 backup. Run this AFTER dbms-rolling-execute.yml --tags
-# rolling_finish has completed successfully and
-# maintenance/part2-finish-plan-and-troubleshooting.md §9's confirmation
+# Phase 6 continued: post-upgrade normalization + role switchback, FSFO
+# re-enable, and RMAN Level 0 backup. Run this AFTER
+# dbms-rolling-execute.yml --tags rolling_finish has completed successfully
+# and maintenance/part2-finish-plan-and-troubleshooting.md §9's confirmation
 # (apexdb_stby PRIMARY/OPEN, apexdb PHYSICAL STANDBY/MOUNTED) matches reality.
 #
-# Two plays, two host groups — same shape as upgrade-19c-rolling.yml, because
-# the work genuinely spans two different targets:
-#   1. rac_node1 — supplemental logging, management policy, opening the
-#      current standby read-only+apply, log-switch test, the switchback
-#      itself (reuses dataguard_switchover_test unmodified via include_role),
-#      re-normalizing the new standby, and the RMAN Level 0 backup. All via
-#      delegate_to, same pattern as dbms-rolling-execute.yml and
-#      dataguard_switchover_test itself.
-#   2. observer_nodes (oemserver01) — re-enabling Fast-Start Failover and
-#      restarting the Observer, by reusing dataguard_fsfo's own role
-#      wholesale. Has to be its own play: dataguard_fsfo's tasks rely on the
-#      PLAY's hosts: being observer_nodes directly (no internal delegate_to,
-#      unlike dataguard_switchover_test) — same reasoning
-#      upgrade-19c-rolling.yml already applied when it added a separate
-#      observer_nodes play for rolling_upgrade_fsfo. Every task in
-#      dataguard_fsfo already checks "already enabled/running, skip" — safe
-#      to just run the whole role again as the re-enable path.
+# Three plays, alternating between two host groups — rac_node1, then
+# observer_nodes, then rac_node1 again. That alternation is deliberate, not
+# incidental: it enforces a strict order —
+#   1. rac_node1 (roles/rolling_postupgrade) — supplemental logging,
+#      management policy, opening the current standby read-only+apply,
+#      log-switch test, the switchback itself (reuses
+#      dataguard_switchover_test unmodified via include_role), and
+#      re-normalizing the new standby. All via delegate_to, same pattern as
+#      dbms-rolling-execute.yml and dataguard_switchover_test itself.
+#   2. observer_nodes (oemserver01, roles/rolling_postupgrade_fsfo) —
+#      re-enabling Fast-Start Failover and restarting the Observer via
+#      manage_observer.sh start ALONE, as its one and only action — no
+#      separate explicit DGMGRL ENABLE FAST-START FAILOVER step. Direct,
+#      repeated, tested operational experience with the real script deployed
+#      on oemserver01 confirmed it handles BOTH re-enabling FSFO and starting
+#      the observer on the start side, the same way it already handles both
+#      disabling FSFO and stopping the observer on the stop side (used by
+#      rolling_upgrade_fsfo earlier in this same phase). This repo's own
+#      checked-in copy of the script
+#      (high-availability/scripts/montor_manage_observer.sh) shows
+#      start_observer() with only a bare START OBSERVER call and no enable
+#      step — that copy is evidently stale relative to what's actually
+#      deployed and tested on oemserver01; the live script is the source of
+#      truth, not the repo copy. roles/rolling_postupgrade_fsfo's own job is
+#      read-only preflight before the script runs, then read-only
+#      verification strictly after it (SHOW CONFIGURATION, SHOW FAST_START
+#      FAILOVER, SHOW OBSERVERS via DGMGRL) — confirming the real end state
+#      rather than trusting the script's exit code. Has to be its own play:
+#      this role's tasks rely on the PLAY's hosts: being observer_nodes
+#      directly (no internal delegate_to, unlike dataguard_switchover_test)
+#      — same reasoning upgrade-19c-rolling.yml already applied for
+#      rolling_upgrade_fsfo.
+#   3. rac_node1 again (roles/rolling_postupgrade_backup) — the RMAN Level 0
+#      baseline backup from apexdb_stby. Deliberately LAST, after FSFO
+#      re-enable, not folded into play 1: the backup should be taken once
+#      the whole HA configuration — role switchback AND Fast-Start Failover
+#      AND the observer — is confirmed back to normal, not mid-sequence
+#      while FSFO is still down. This is why play 3 exists as its own play
+#      rather than just being the tail end of play 1: Ansible plays run
+#      strictly top-to-bottom, and a play's hosts: target doesn't change
+#      until the play ends — there's no way to pause play 1, run play 2,
+#      then resume play 1's remaining tasks. Interleaving rac_node1 ->
+#      observer_nodes -> rac_node1 in that order requires three separate
+#      plays. (The alternative — rewriting rolling_postupgrade_fsfo to run
+#      via delegate_to from inside a single flat rac_node1 play, instead of
+#      targeting observer_nodes directly — was considered and rejected: it
+#      would mean reworking an already-tested role for no functional gain
+#      over the three-play split.)
+#
+# REQUIRED: -e sys_password ---------------------------------------------
+# group_vars/all.yml deliberately ships this as a placeholder
+# ("CHANGE_ME_sys_password"), not a real value — play 1's preflight
+# `assert` fails immediately if it's still the placeholder. Stated here, up
+# front, because otherwise the only way to discover this is to run the
+# playbook and read the assert's fail_msg:
+#   - Play 1 (rolling_postupgrade) needs -e sys_password=... — used by
+#     dataguard_switchover_test's DGMGRL CONNECT for the actual switchover.
+#   - Play 2 (rolling_postupgrade_fsfo) needs NO password at all — every
+#     DGMGRL call it makes is wallet-based (/@apexdb_DGMGRL), matching
+#     manage_observer.sh's own design, and the wallet already exists from
+#     the original Phase 9 FSFO build. If that wallet is somehow broken,
+#     this role fails loudly and points back to dataguard_fsfo to rebuild
+#     it — it does not try to recreate the wallet itself.
+#   - Play 3 (rolling_postupgrade_backup) needs NO password either — RMAN
+#     connects OS-authenticated (target /).
+#
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade -e sys_password='...'
 #
 # Run with --tags, same convention as every other playbook in this project:
-#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade
-# (runs both plays, in order — every task in both carries this tag)
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade -e sys_password='...'
+# (runs all three plays, in order — every task in all three carries this tag)
 #
 # Or narrower, if only part of this is needed:
-#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_normalize    (play 1: steps 1-4, pre-switchback)
-#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_switchback   (play 1: step 5, the actual role flip)
-#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_renormalize  (play 1: step 6, post-switchback)
-#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_backup       (play 1: step 7, RMAN Level 0)
-#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_fsfo         (play 2: FSFO/observer re-enable)
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_normalize    -e sys_password='...'   (play 1: steps 1-4, pre-switchback)
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_switchback   -e sys_password='...'   (play 1: step 5, the actual role flip)
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_renormalize  -e sys_password='...'   (play 1: step 6, post-switchback)
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_fsfo                                 (play 2: FSFO/observer re-enable — no password needed, wallet-based)
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_backup                               (play 3: RMAN Level 0 — no password needed, OS-authenticated)
+#
+# Logging: `ansible.cfg`'s `log_path = ../logs/ansible.log` already captures
+# every run of every playbook in this directory, full task-by-task output,
+# automatically — see docs/ansible-architecture-and-debugging.md. That log is
+# one continuously-growing file shared by every playbook, so the pre_tasks/
+# post_tasks banners below exist purely to make ONE run of THIS playbook easy
+# to find inside it: `grep -A2 'ROLLING-POSTUPGRADE RUN STARTED' logs/ansible.log`
+# jumps straight to every past invocation. The banners don't replace
+# log_path — they can't; log_path is read at ansible-playbook startup, before
+# any task (including these) runs, so nothing in this file can turn logging on
+# or off. They just mark boundaries inside a log that was already being kept.
+# Every SQL/RMAN/srvctl command this playbook actually runs is captured the
+# same way the rest of this project always has: register + an immediate
+# debug task showing the real output — see roles/rolling_postupgrade/tasks/
+# main.yml, fresh-eyes-reviewed to make sure that pattern is applied after
+# every consequential command, not just most of them (four ALTER DATABASE
+# calls and one RMAN success check were missing it before this pass).
 
-- name: "Post-upgrade normalization + switchback + RMAN Level 0 backup (against rac_node1, delegate_to per database throughout)"
+- name: "Post-upgrade normalization + switchback (against rac_node1, delegate_to per database throughout)"
   hosts: rac_node1
   gather_facts: no
+  pre_tasks:
+    - name: "LOG BANNER — ROLLING-POSTUPGRADE RUN STARTED"
+      debug:
+        msg:
+          - "===== ROLLING-POSTUPGRADE RUN STARTED ====="
+          - "Started (control node clock): {{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S%z') }}"
+          - "Tags requested: {{ ansible_run_tags | default(['(none — --tags not set, would run everything)']) }}"
+      run_once: true
+      tags: [always]
   roles:
     - rolling_postupgrade
+  post_tasks:
+    - name: "LOG BANNER — ROLLING-POSTUPGRADE PLAY 1 COMPLETE"
+      debug:
+        msg:
+          - "===== ROLLING-POSTUPGRADE PLAY 1 (rac_node1) COMPLETE ====="
+          - "Finished (control node clock): {{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S%z') }}"
+          - "Next: play 2 (observer_nodes, FSFO re-enable) if --tags included rolling_postupgrade_fsfo or the umbrella rolling_postupgrade tag."
+      run_once: true
+      tags: [always]
 
-- name: "Re-enable Fast-Start Failover + restart Observer (oemserver01) — whole dataguard_fsfo role reused, fully idempotent"
+- name: "Re-enable Fast-Start Failover + restart Observer (oemserver01) — manage_observer.sh start alone, no separate enable step"
   hosts: observer_nodes
   gather_facts: no
   tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+  pre_tasks:
+    - name: "LOG BANNER — ROLLING-POSTUPGRADE PLAY 2 (FSFO) STARTED"
+      debug:
+        msg:
+          - "===== ROLLING-POSTUPGRADE PLAY 2 (observer_nodes, FSFO re-enable) STARTED ====="
+          - "Started (control node clock): {{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S%z') }}"
+      run_once: true
   roles:
-    - dataguard_fsfo
+    - rolling_postupgrade_fsfo
+  post_tasks:
+    - name: "LOG BANNER — ROLLING-POSTUPGRADE PLAY 2 (FSFO) COMPLETE"
+      debug:
+        msg:
+          - "===== ROLLING-POSTUPGRADE PLAY 2 (observer_nodes, FSFO re-enable) COMPLETE ====="
+          - "Finished (control node clock): {{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S%z') }}"
+          - "Next: play 3 (rac_node1, RMAN Level 0 backup) if --tags included rolling_postupgrade_backup or the umbrella rolling_postupgrade tag."
+      run_once: true
+
+- name: "RMAN Level 0 baseline backup from apexdb_stby (against rac_node1, delegate_to standby_node1) — runs LAST, after FSFO/observer are confirmed back up"
+  hosts: rac_node1
+  gather_facts: no
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+  pre_tasks:
+    - name: "LOG BANNER — ROLLING-POSTUPGRADE PLAY 3 (RMAN BACKUP) STARTED"
+      debug:
+        msg:
+          - "===== ROLLING-POSTUPGRADE PLAY 3 (rac_node1, RMAN Level 0 backup) STARTED ====="
+          - "Started (control node clock): {{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S%z') }}"
+      run_once: true
+  roles:
+    - rolling_postupgrade_backup
+  post_tasks:
+    - name: "LOG BANNER — ROLLING-POSTUPGRADE RUN COMPLETE"
+      debug:
+        msg:
+          - "===== ROLLING-POSTUPGRADE RUN COMPLETE ====="
+          - "Finished (control node clock): {{ lookup('pipe', 'date +%Y-%m-%dT%H:%M:%S%z') }}"
+      run_once: true

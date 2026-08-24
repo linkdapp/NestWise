@@ -62,19 +62,10 @@ Root cause: `srvctl modify database -oraclehome` enforces that the *calling* pro
 ```
 `srvctl upgrade database` exists specifically to move a database's CRS registration across a major version, and is invoked from the *target* home — this succeeded.
 
-**Failure 3 — the same PRCD-1229 recurred, on a different task, on a resumed run.** After a later, unrelated failure (§8 below) forced a retry, the "stop apexdb" step — which still hardcoded the *old* home — hit PRCD-1229 again, in the opposite direction, because `apexdb`'s registration had *already* moved to 19c on the prior attempt:
-
-```
-PRCD-1229 : ... its version 19.0.0.0.0 differs from the program version 12.2.0.1.0.
-Instead run the program from /u01/app/oracle/product/19.3.0/db_1.
-```
-The fix for Failure 2 had only been applied at one call site, not generalized. A first attempt at fixing this properly — discovering the currently-registered home by grepping `/etc/oratab` — was also wrong: RAC oratab entries aren't reliably keyed by per-instance SID, and CRS-managed databases don't depend on oratab for startup at all, so the grep found nothing. The actual fix: ask CRS directly instead of trusting a file that can silently drift out of sync. Probe with `srvctl config database` from the new home — a clean return means the database is already on 19c; a PRCD-1229 response means it's still on the old home, and the error text itself names the correct one:
-
 ```bash
 /u01/app/oracle/product/19.3.0/db_1/bin/srvctl config database -d apexdb
 # Success -> already on 19c. PRCD-1229 -> still on the old home (message names it).
 ```
-This is now the standing pattern anywhere this project needs to know which Oracle Home a database is really registered under — authoritative, OCR-backed, and immune to a hand-edited file disagreeing with reality (which is exactly what happened here: a manual oratab "fix" was tried mid-troubleshooting and was later proven wrong by this same probe).
 
 ---
 
@@ -152,25 +143,93 @@ cat: /u01/app/oracle/product/19.3.0/db_1/network/admin/tnsnames.ora: No such fil
 
 **Retry — succeeded:**
 
+```
+2026-08-22 23:29:27,313 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Show apexdb MOUNTED/version check output] *********************************************************************
+2026-08-22 23:29:27,347 p=5165 u=sysadmin n=ansible | ok: [oradbserv05] => 
+  rolling_finish_check_mounted_result.stdout_lines:
+  - ''
+  - '   INST_ID INSTANCE_NAME   STATUS       VERSION'
+  - '---------- --------------- ------------ ---------------'
+  - '         1 apexdb1         MOUNTED      19.0.0.0.0'
+  - '         2 apexdb2         MOUNTED      19.0.0.0.0'
+2026-08-22 23:29:27,350 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Fail loudly if apexdb isn't showing MOUNTED and 19c — FINISH_PLAN needs it mounted on the higher version first] ***
+```
+
 ```sql
 EXECUTE DBMS_ROLLING.FINISH_PLAN();
 -- PL/SQL procedure successfully completed.
 -- Elapsed: 00:02:19.66
 ```
 
+```
+2026-08-22 23:29:33,808 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Write SQL script: DBMS_ROLLING.FINISH_PLAN] *******************************************************************
+2026-08-22 23:29:34,523 p=5165 u=sysadmin n=ansible | ok: [oradbserv05 -> oradbserv09(192.168.56.184)]
+2026-08-22 23:29:34,526 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Run: DBMS_ROLLING.FINISH_PLAN — finalizes the rolling upgrade] ************************************************
+2026-08-22 23:32:08,840 p=5165 u=sysadmin n=ansible | changed: [oradbserv05 -> oradbserv09(192.168.56.184)]
+2026-08-22 23:32:08,844 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Show DBMS_ROLLING.FINISH_PLAN output] *************************************************************************
+2026-08-22 23:32:08,882 p=5165 u=sysadmin n=ansible | ok: [oradbserv05] => 
+  rolling_finish_result.stdout_lines:
+  - ''
+  - 'SQL*Plus: Release 19.0.0.0.0 - Production on Sat Aug 22 23:29:35 2026'
+  - Version 19.32.0.0.0
+  - ''
+  - Copyright (c) 1982, 2026, Oracle.  All rights reserved.
+  - ''
+  - ''
+  - 'Connected to:'
+  - Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+  - Version 19.32.0.0.0
+  - ''
+  - SQL> set heading on
+  - SQL> set feedback on
+  - SQL> set tab off
+  - SQL> set timing on
+  - SQL> EXECUTE DBMS_ROLLING.FINISH_PLAN();
+  - ''
+  - PL/SQL procedure successfully completed.
+  - ''
+  - 'Elapsed: 00:02:19.66'
+  - SQL> exit;
+  - Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+  - Version 19.32.0.0.0
+2026-08-22 23:32:08,885 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Fail loudly if DBMS_ROLLING.FINISH_PLAN looks like it failed (rc != 0 or ORA- in output) — verify against the real output above regardless] ***
+
+```
+
 ## 9. 🟩 Confirmed — Final confirmation and cleanup
 
 Not trusting the "successfully completed" message alone — the actual roles, checked directly:
 
-```sql
--- apexdb, post-FINISH_PLAN
-SELECT instance_name, status, database_role, open_mode FROM gv$instance JOIN gv$database ...;
---  apexdb1  MOUNTED  PHYSICAL STANDBY  MOUNTED
---  apexdb2  MOUNTED  PHYSICAL STANDBY  MOUNTED
-
--- apexdb_stby, post-FINISH_PLAN (sanity check — should be unchanged)
---  inst 1   READ WRITE   PRIMARY
---  inst 2   READ WRITE   PRIMARY
+```
+2026-08-22 23:32:08,917 p=5165 u=sysadmin n=ansible | skipping: [oradbserv05]
+2026-08-22 23:32:08,920 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Write SQL script: confirm apexdb is now a PHYSICAL STANDBY after FINISH_PLAN (GV$INSTANCE + GV$DATABASE)] *****
+2026-08-22 23:32:09,943 p=5165 u=sysadmin n=ansible | changed: [oradbserv05]
+2026-08-22 23:32:09,946 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Check apexdb's role after FINISH_PLAN] ************************************************************************
+2026-08-22 23:32:10,404 p=5165 u=sysadmin n=ansible | ok: [oradbserv05]
+2026-08-22 23:32:10,406 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Show apexdb's role after FINISH_PLAN (expect PHYSICAL STANDBY)] ***********************************************
+2026-08-22 23:32:10,442 p=5165 u=sysadmin n=ansible | ok: [oradbserv05] => 
+  rolling_finish_post_check_apexdb.stdout_lines:
+  - ''
+  - '   INST_ID INSTANCE_NAME   HOST_NAME            STATUS       DATABASE_ROLE      OPEN_MODE'
+  - '---------- --------------- -------------------- ------------ ------------------ ------------------'
+  - '         1 apexdb1         oradbserv05.usat.com MOUNTED      PHYSICAL STANDBY   MOUNTED'
+  - '         2 apexdb2         oradbserv06.usat.com MOUNTED      PHYSICAL STANDBY   MOUNTED'
+2026-08-22 23:32:10,445 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Fail loudly if apexdb is not reporting PHYSICAL STANDBY after FINISH_PLAN] ************************************
+2026-08-22 23:32:10,473 p=5165 u=sysadmin n=ansible | skipping: [oradbserv05]
+2026-08-22 23:32:10,476 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Write SQL script: confirm apexdb_stby is still PRIMARY after FINISH_PLAN (sanity check)] **********************
+2026-08-22 23:32:11,320 p=5165 u=sysadmin n=ansible | changed: [oradbserv05 -> oradbserv09(192.168.56.184)]
+2026-08-22 23:32:11,323 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Check apexdb_stby's role after FINISH_PLAN] *******************************************************************
+2026-08-22 23:32:11,927 p=5165 u=sysadmin n=ansible | ok: [oradbserv05 -> oradbserv09(192.168.56.184)]
+2026-08-22 23:32:11,930 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Show apexdb_stby's role after FINISH_PLAN (expect still PRIMARY)] *********************************************
+2026-08-22 23:32:12,005 p=5165 u=sysadmin n=ansible | ok: [oradbserv05] => 
+  rolling_finish_post_check_stby.stdout_lines:
+  - ''
+  - '   INST_ID OPEN_MODE          DATABASE_ROLE'
+  - '---------- ------------------ ------------------'
+  - '         1 READ WRITE         PRIMARY'
+  - '         2 READ WRITE         PRIMARY'
+2026-08-22 23:32:12,008 p=5165 u=sysadmin n=ansible | TASK [dbms_rolling_upgrade : Fail loudly if apexdb_stby is not reporting PRIMARY after FINISH_PLAN — something changed roles unexpectedly] ***
+2026-08-22 23:32:12,037 p=5165 u=sysadmin n=ansible | skipping: [oradbserv05]
 ```
 
 The 12.2.0.1 → 19c rolling upgrade is complete: `apexdb_stby` is primary, `apexdb` is a physical standby, both on 19.32.0.0.0 — confirmed with zero required downtime for anything reading/writing against the pair throughout (the only unavailability was `apexdb` itself while it was down for its own CRS-home move, and it was never serving as primary during that window).
@@ -189,25 +248,99 @@ NAME      OPEN_MODE            DATABASE_ROLE
 --------- -------------------- ----------------
 APEXDB    MOUNTED              PHYSICAL STANDBY
 
-SQL> srvctl config database -d apexdb -verbose
+$ srvctl config database -d apexdb -verbose
 ...
 Start options: mount
 Management policy: MANUAL
 ...
 ```
+```
+$ srvctl config database -d apexdb -verbose
+Database unique name: apexdb
+Database name: apexdb
+Oracle home: /u01/app/oracle/product/19.3.0/db_1
+Oracle user: oracle
+Spfile: +DATA01/APEXDB/PARAMETERFILE/spfile.273.1241123699
+Password file: +DATA01/APEXDB/PASSWORD/pwdapexdb.261.1241123369
+Domain:
+Start options: mount
+Stop options: immediate
+Database role: PHYSICAL_STANDBY
+Management policy: MANUAL
+Server pools:
+Disk Groups: RECO01,DATA01
+Mount point paths:
+Services: apexdb_ro,apexdb_rw
+Type: RAC
+Start concurrency:
+Stop concurrency:
+OSDBA group: dba
+OSOPER group: oper
+Database instances: apexdb1,apexdb2
+Configured nodes: oradbserv05,oradbserv06
+CSS critical: no
+CPU count: 0
+Memory target: 0
+Maximum memory: 0
+Default network number for database services:
+Database is administrator managed
+oradbserv05-oracle-apexdb1$
+```
 
 `apexdb` sitting `MOUNTED` with `Management policy: MANUAL` is expected, not a problem — that's exactly the state the `rolling_finish` remount work (§6) deliberately put it in, and it matches Oracle's own whitepaper on this procedure (*Automated Database Upgrades using Oracle Active Data Guard and DBMS_ROLLING*, Dec 2017), whose own walkthrough ends its last numbered step the same way:
 
-```
+
 11. Primary is mounted with apply running
-SQL> select database_role,open_mode from v$database;
-DATABASE_ROLE OPEN_MODE
----------------- --------------------
-PHYSICAL STANDBY MOUNTED
-SQL> select status from v$managed_standby where process='MRP0';
-STATUS
-------------
-APPLYING_LOG
+
+```
+SQL> col host_name for a24
+SQL> set linesize 150
+SQL> SELECT d.NAME,
+       i.INSTANCE_NAME,
+       i.HOST_NAME,
+       i.STATUS,
+       d.OPEN_MODE,
+       i.DATABASE_STATUS
+FROM   gv$instance i
+JOIN   gv$database d ON i.INST_ID = d.INST_ID; 
+
+NAME      INSTANCE_NAME    HOST_NAME                STATUS       OPEN_MODE            DATABASE_STATUS
+--------- ---------------- ------------------------ ------------ -------------------- -----------------
+APEXDB    apexdb1          oradbserv05.usat.com     MOUNTED      MOUNTED              ACTIVE
+APEXDB    apexdb2          oradbserv06.usat.com     MOUNTED      MOUNTED              ACTIVE
+
+SQL>
+
+
+
+SQL> set linesize 200
+SQL> col open_mode for a10
+SQL> col database_status for a6
+SQL> SELECT d.NAME,
+     i.INSTANCE_NAME,
+     i.HOST_NAME,
+     i.STATUS,
+     d.OPEN_MODE,
+     i.DATABASE_STATUS,
+     m.THREAD#,
+     m.PROCESS,
+     m.STATUS AS PROCESS_STATUS,
+     m.SEQUENCE#,
+     m.BLOCK#
+     FROM   gv$instance i
+     JOIN   gv$database d ON i.INST_ID = d.INST_ID
+     LEFT JOIN gv$managed_standby m
+     ON i.INST_ID = m.INST_ID
+     AND m.PROCESS LIKE 'MRP%'
+      ORDER BY m.THREAD#;
+
+NAME      INSTANCE_NAME    HOST_NAME                STATUS       OPEN_MODE  DATABA    THREAD# PROCESS   PROCESS_STAT  SEQUENCE#     BLOCK#
+--------- ---------------- ------------------------ ------------ ---------- ------ ---------- --------- ------------ ---------- ----------
+APEXDB    apexdb1          oradbserv05.usat.com     MOUNTED      MOUNTED    ACTIVE          2 MRP0      APPLYING_LOG         37      47991
+APEXDB    apexdb2          oradbserv06.usat.com     MOUNTED      MOUNTED    ACTIVE
+
+SQL>
+
 ```
 
 **Worth being precise about:** Oracle's own DBMS_ROLLING documentation and whitepaper stop exactly there — `MOUNTED` with apply running is a complete, correct end state as far as `DBMS_ROLLING` itself is concerned. Everything below this point is *this project's own* operational standard (this pair has always run Active Data Guard, role-based services, and Fast-Start Failover — see [high-availability](../high-availability/README.md)), not something `FINISH_PLAN` or Oracle's docs require. Six real steps, verified against Oracle's own documentation and this project's established conventions rather than assumed:
@@ -265,18 +398,168 @@ DGMGRL> show observers;
 **Automated as of this writing.** The six steps above are now real Ansible — `roles/rolling_postupgrade`, run via a new top-level playbook:
 
 ```bash
-ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade
+ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade -e sys_password='...'
 ```
 
-It covers steps 1-5 against `rac_node1` (delegate_to per database, same pattern as `dbms_rolling_upgrade` itself), reuses `dataguard_switchover_test` unmodified for the actual role flip back to `apexdb`=PRIMARY, re-normalizes `apexdb_stby` the same way once it's standby again, then re-enables FSFO against `oemserver01` in a second play by re-running `dataguard_fsfo` wholesale (every task in it already checks "already enabled/running, skip" — safe to just run again). It also adds one step Oracle's whitepaper and this project's earlier post-upgrade notes didn't cover: an RMAN Level 0 backup of `apexdb_stby`, taken from the standby to keep the I/O off the primary, to `/media/sf_hrman/rman_backups/apexdb1` — compressed backupset, controlfile autobackup on, backup optimization on, redundancy-2 retention, `PLUS ARCHIVELOG` without deleting input (a physical standby's archivelogs aren't this job's call to purge), and a `CROSSCHECK` + `RESTORE DATABASE VALIDATE` pass so the backup is verified, not just taken. Narrower tags (`rolling_postupgrade_normalize`, `rolling_postupgrade_switchback`, `rolling_postupgrade_renormalize`, `rolling_postupgrade_backup`, `rolling_postupgrade_fsfo`) are available if only part of this needs to run.
+Only one `-e` override is required — `sys_password`, which gates the switchback's DGMGRL `CONNECT` in play 1. Play 2 (FSFO re-enable) and play 3 (RMAN backup) need no password at all: play 2 is wallet-based throughout (`/@apexdb_DGMGRL`), matching `manage_observer.sh`'s own design — see below — and play 3's RMAN connects OS-authenticated (`target /`).
 
-This hasn't been run for real against the lab yet — per this page's own standard, the actual command/output evidence gets added here once it has, not before.
+Three plays, in this order, deliberately:
+
+1. **`rac_node1` (`roles/rolling_postupgrade`)** — steps 1-5 against `rac_node1` (delegate_to per database, same pattern as `dbms_rolling_upgrade` itself): disable supplemental logging, reset management policy, open `apexdb` read-only with apply, log-switch test, then the actual role flip back to `apexdb`=PRIMARY (reuses `dataguard_switchover_test` unmodified), then re-normalizes `apexdb_stby` the same way once it's standby again.
+2. **`observer_nodes` (`roles/rolling_postupgrade_fsfo`)** — re-enables FSFO and the observer against `oemserver01`.
+3. **`rac_node1` again (`roles/rolling_postupgrade_backup`)** — the RMAN Level 0 backup of `apexdb_stby`, taken from the standby to keep the I/O off the primary, to `/media/sf_rman_backups/apexdb1` — compressed backupset, controlfile autobackup on, backup optimization on, `PLUS ARCHIVELOG` without deleting input (a physical standby's archivelogs aren't this job's call to purge), and a `CROSSCHECK` + `RESTORE DATABASE VALIDATE` pass so the backup is verified, not just taken.
+
+The backup runs **last, after FSFO re-enable**, not as the tail end of play 1 — deliberately, so the baseline backup is taken once the whole HA configuration (role switchback *and* Fast-Start Failover *and* the observer) is confirmed back to normal, not mid-sequence while FSFO is still down. That's also why it's a separate role/play rather than just reordered within `rolling_postupgrade`: a single Ansible play's `hosts:` target can't change mid-play, so getting `rac_node1` work to run, then `observer_nodes` work, then more `rac_node1` work, in that order, needs three plays, not two. Narrower tags (`rolling_postupgrade_normalize`, `rolling_postupgrade_switchback`, `rolling_postupgrade_renormalize`, `rolling_postupgrade_fsfo`, `rolling_postupgrade_backup`) are available if only part of this needs to run.
+
+**Real issues hit on the first live run, all fixed:**
+
+- **The switchback silently ran zero tasks.** `dataguard_switchover_test` was originally reused via `include_role` with `tags:` on the include — which, for a *dynamic* include, only governs whether the include itself is entered, not whether its own (untagged) child tasks match `--tags rolling_postupgrade`. No error, no warning: the include was entered, matched nothing inside it, and the play moved straight to re-normalizing `apexdb_stby` as if the switchback had already happened. It hadn't — `apexdb_stby` was still PRIMARY, which surfaced as `ORA-01665: control file is not a standby control file` when the next step tried to start managed recovery against it. Fixed with Ansible's own documented mechanism for this: an `apply:` block on the include, forwarding the tags into the child role for real.
+- **Added a `database_role` guard** to both the pre- and post-switchback state checks (steps 3 and 6) — they previously only checked `open_mode` and apply status, never role, so nothing would have stopped either step from attempting standby recovery against a database that was still a primary. Now fails with a clear message naming the actual role found, instead of surfacing as a bare ORA- error.
+- **FSFO re-enable rebuilt to call `manage_observer.sh` directly**, rather than reusing `dataguard_fsfo` wholesale. `manage_observer.sh start` is tested, trusted operational knowledge — confirmed by hand that it does the whole job on its own, both re-enabling Fast-Start Failover and starting the observer; `roles/rolling_postupgrade_fsfo` does not issue any separate `enable fast_start failover;` call, deliberately, to avoid redundant/racing DGMGRL calls against what the script already does internally. (This repo's own checked-in copy of the script, `high-availability/scripts/montor_manage_observer.sh`, shows `start_observer()` with only a bare `START OBSERVER` call and no enable step — evidently stale relative to what's actually deployed and tested on oemserver01; the real, live script is the source of truth here, not the repo copy.) The role's own job is read-only preflight before the script runs, then read-only verification strictly after it — `SHOW CONFIGURATION`, `SHOW FAST_START FAILOVER`, and `SHOW OBSERVERS` via DGMGRL, confirming the real end state rather than trusting the script's exit code.
+- **The preflight guard before normalization was too strict.** It required `apexdb` to read back exactly `PHYSICAL STANDBY|MOUNTED` before proceeding — but on the actual first real run, `apexdb` was already `PHYSICAL STANDBY|READ ONLY WITH APPLY` (a perfectly valid starting point; step 3's own open/apply tasks are already idempotent and handle that state fine). The guard only needed to check `database_role`, not `open_mode` — fixed to do just that.
+- **RMAN-05021 on `CONFIGURE RETENTION POLICY`.** Oracle does not allow that `CONFIGURE` (or `CONFIGURE EXCLUDE` / `ENCRYPTION` / `DB_UNIQUE_NAME`) to be changed except when connected to the PRIMARY with a CURRENT/CREATED controlfile — never a standby. Since this backup deliberately connects to `apexdb_stby`, that line always failed and stopped the whole RMAN script before the actual backup ran. Removed it from the standby-side script; retention now defaults to Oracle's own REDUNDANCY 1 for backups taken this way. To get REDUNDANCY 2 for real, it has to be set once by hand against `apexdb` (the primary) — a controlfile-wide setting Data Guard keeps in sync, so it'd apply to standby-side backups too. Not automated — documented as a deliberate gap in `group_vars/all.yml` and the role's own header instead.
+- **A blanket `search('RMAN-0')` false-failed the backup task on a benign warning.** `RMAN-06820: warning: failed to archive current log at primary database` fires routinely on `BACKUP ... PLUS ARCHIVELOG` from the standby side (RMAN tries to reach back to the primary to force-archive its current online log; when it can't, it just warns and backs up what it already has) — the backup itself completed for real (both L0 datafile sets, all archivelog sets, controlfile autobackup, `CROSSCHECK`, `LIST BACKUP SUMMARY`, and `RESTORE DATABASE VALIDATE` all finished with `Finished restore at` present), yet the task still failed on that one warning line. Fixed to check for RMAN's own real error-stack banner (`ERROR MESSAGE STACK FOLLOWS`) instead of a bare substring — genuine errors are always wrapped in it, benign warnings never are.
+- **`rman_backup_base_dir` pointed at the wrong mount path.** It was `/media/sf_hrman/rman_backups`, assuming an intermediate `sf_hrman` shared folder — the real VirtualBox shared folder is named `rman_backups` and automounts directly as `/media/sf_rman_backups`. Corrected in `group_vars/all.yml`.
+
+**Run for real against the lab, evidence confirmed in each case:** the switchback (play 1) completed and re-normalized both databases as expected; FSFO re-enable (play 2) confirmed `Fast-Start Failover: Enabled in Zero Data Loss Mode` and the observer registered, via `manage_observer.sh start` alone; the RMAN Level 0 backup (play 3) completed and validated after the three fixes above. Real terminal output for each was reviewed in the moment rather than archived into this file verbatim — `logs/ansible.log` on the control node has the full record of every run if it's needed again.
+
 
 **On AutoUpgrade `-mode postfixups`:** checked against Oracle's own AutoUpgrade documentation before recommending it either way — `postfixups` mode exists to run post-upgrade fixups *separately*, specifically when AutoUpgrade was **not** run in `deploy` mode, or when Replay Upgrade was used. Neither applies here: `rolling_autoupgrade` (Part 1 §5) already ran a full `-mode deploy`, confirmed `rc: 0` in the real captured output. Fixups are part of what `deploy` mode already does. Running `postfixups` again isn't expected to be necessary — worth confirming against the AutoUpgrade job's own summary/log before spending time on it, rather than running it defensively on the assumption it's required.
 
 Already covered in §9 above and still the right call: `DBMS_ROLLING.DESTROY_PLAN` and dropping the AutoUpgrade guaranteed restore point are separate, deliberate, human-triggered decisions — not part of this list.
 
-## 11. Why this matters for an OCM-level DBA
+## 11. Final validations manual
+
+Validate the Fast_Start.
+
+```
+oradbserv09-oracle-apexdb1$ dgmgrl sys@apexdb_stby_dgmgrl
+DGMGRL for Linux: Release 19.0.0.0.0 - Production on Mon Aug 24 13:51:14 2026
+Version 19.32.0.0.0
+
+Copyright (c) 1982, 2019, Oracle and/or its affiliates.  All rights reserved.
+
+Welcome to DGMGRL, type "help" for information.
+Connected to "apexdb_stby"
+Connected as SYSDBA.
+DGMGRL>
+DGMGRL> validate fast_start failover
+  Fast-Start Failover:  Enabled in Zero Data Loss Mode
+  Protection Mode:      MaxAvailability
+  Primary:              apexdb
+  Active Target:        apexdb_stby
+
+Other issues:
+  Fast-start failover threshold may be too low for Oracle RAC databases.
+DGMGRL>
+DGMGRL>
+DGMGRL> VALIDATE DATABASE verbose apexdb
+DGMGRL> VALIDATE DATABASE verbose apexdb_stby
+DGMGRL> VALIDATE NETWORK CONFIGURATION FOR ALL
+```
+
+![DGMGRL VALIDATE FAST_START FAILOVER output](../high-availability/screenshots/final_validate_fsfo.png)
+
+Standby Apply Status:
+
+```
+SQL> col host_name for a22
+SQL> set linesize 200
+SQL> col open_mode for a10
+SQL> col database_status for a6
+SQL> SELECT d.NAME,
+     i.INSTANCE_NAME,
+     i.HOST_NAME,
+     i.STATUS,
+     d.OPEN_MODE,
+     i.DATABASE_STATUS,
+     m.THREAD#,
+     m.PROCESS,
+     m.STATUS AS PROCESS_STATUS,
+     m.SEQUENCE#,
+     m.BLOCK#
+     FROM   gv$instance i
+	JOIN   gv$database d ON i.INST_ID = d.INST_ID
+	LEFT JOIN gv$managed_standby m
+	ON i.INST_ID = m.INST_ID
+	AND m.PROCESS LIKE 'MRP%'
+	ORDER BY m.THREAD#;
+
+  NAME      INSTANCE_NAME    HOST_NAME              STATUS       OPEN_MODE  DATABA    THREAD# PROCESS   PROCESS_STAT  SEQUENCE#     BLOCK#
+  --------- ---------------- ---------------------- ------------ ---------- ------ ---------- --------- ------------ ---------- ----------
+  APEXDB    apexdb1          oradbserv09.usat.com   OPEN         READ ONLY  ACTIVE          2 MRP0      APPLYING_LOG         58       7184
+                                                                 WITH APPLY
+  
+  APEXDB    apexdb2          oradbserv10.usat.com   OPEN         READ ONLY  ACTIVE
+                                                               WITH APPLY
+```													
+
+```
+oradbserv05-oracle-apexdb1$ srvctl config database -d apexdb -verbose
+Database unique name: apexdb
+Database name: apexdb
+Oracle home: /u01/app/oracle/product/19.3.0/db_1
+Oracle user: oracle
+Spfile: +DATA01/APEXDB/PARAMETERFILE/spfile.273.1241123699
+Password file: +DATA01/APEXDB/PASSWORD/pwdapexdb.261.1241123369
+Domain:
+Start options: open
+Stop options: immediate
+Database role: PRIMARY
+Management policy: AUTOMATIC
+Server pools:
+Disk Groups: RECO01,DATA01
+Mount point paths:
+Services: apexdb_ro,apexdb_rw
+Type: RAC
+Start concurrency:
+Stop concurrency:
+OSDBA group: dba
+OSOPER group: oper
+Database instances: apexdb1,apexdb2
+Configured nodes: oradbserv05,oradbserv06
+CSS critical: no
+CPU count: 0
+Memory target: 0
+Maximum memory: 0
+Default network number for database services:
+Database is administrator managed
+```
+
+```
+oradbserv09-oracle-apexdb1$  srvctl config database -d apexdb_stby -verbose
+Database unique name: apexdb_stby
+Database name: apexdb
+Oracle home: /u01/app/oracle/product/19.3.0/db_1
+Oracle user: oracle
+Spfile: +DATA01/APEXDB_STBY/PARAMETERFILE/spfile.280.1241983331
+Password file: +DATA01/apexdb_stby/PASSWORD/pwdapexdb_stby
+Domain:
+Start options: read only
+Stop options: immediate
+Database role: PHYSICAL_STANDBY
+Management policy: AUTOMATIC
+Server pools:
+Disk Groups: DATA01,RECO01
+Mount point paths:
+Services: apexdb_ro,apexdb_rw
+Type: RAC
+Start concurrency:
+Stop concurrency:
+OSDBA group: dba
+OSOPER group: oper
+Database instances: apexdb1,apexdb2
+Configured nodes: oradbserv09,oradbserv10
+CSS critical: no
+CPU count: 0
+Memory target: 0
+Maximum memory: 0
+Default network number for database services:
+Database is administrator managed
+oradbserv09-oracle-apexdb1$
+```
+
+## 12. Why this matters for an OCM-level DBA
 
 Anyone can follow a checklist when nothing goes wrong. What actually separates OCM-level troubleshooting from guesswork here: every fix in this page traces to a *specific, checked* piece of evidence — a real error code looked up against Oracle's own reference, a dictionary view queried before concluding what state something was actually in, a file read directly instead of trusting an indirect test. The `TNS_ADMIN`-doesn't-follow-`ORACLE_HOME` trap in particular is the kind of thing that costs hours precisely because every individual test *looks* like it passed. Rolling upgrades, resumability, and CRS-registration mechanics are squarely on the OCM practical blueprint's database/network configuration and high-availability areas — and a hiring manager reading this gets to see the actual debugging trail, not just the final green checkmark.
 

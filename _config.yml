@@ -10,14 +10,27 @@ baseurl: "/NestWise"
 # each file's first heading via jekyll-titles-from-headings even with no front
 # matter), which was dumping internal drafts and a literal post-template placeholder
 # into the public nav alongside real docs. Each entry below is a real, built entry
-# point; each one links out to its own sub-pages (HA parts 1-3, phase-01's docs/
-# subsection files) rather than flattening everything into the global bar.
+# point; each one links out to its own sub-pages (HA parts 1-3, maintenance parts 1-2,
+# tools/swingbench) rather than flattening everything into the global bar.
+#
+# phase-01-foundation-2node-rac-12cR2/README.md and its docs/known-risks.md were
+# both dropped from the top nav on purpose (they don't map to one of this bar's
+# section headers) — not orphaned, though: installation/README.md links to both
+# repeatedly (know-risks.md alone 25+ times), and the phase-01 README links back to
+# installation/README.md itself, so the content stays reachable, just not duplicated
+# in the top bar.
+#
+# tools/README.md (not tools/swingbench/README.md directly) is the header entry so
+# "Tools" has a real landing page — Swingbench is linked from there, plus any future
+# standing tools (AHF, SQL Developer) as their own pages get built.
 header_pages:
   - installation/README.md
   - high-availability/README.md
-  - phase-01-foundation-2node-rac-12cR2/README.md
-  - phase-01-foundation-2node-rac-12cR2/docs/known-risks.md
-  - tools/swingbench/README.md
+  - monitoring/README.md
+  - backup-recovery/README.md
+  - maintenance/README.md
+  - performance-tuning/README.md
+  - tools/README.md
 
 # Keep Jekyll from parsing/publishing the Ansible automation. These files
 # start with "---" (plain YAML document markers) and contain Jinja2 syntax

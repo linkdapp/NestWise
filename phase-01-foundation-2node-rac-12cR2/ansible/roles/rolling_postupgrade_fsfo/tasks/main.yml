@@ -1,0 +1,216 @@
+---
+# Phase 6 post-upgrade — re-enable Fast-Start Failover + restart the
+# Observer, against oemserver01 (observer_nodes). Runs after
+# roles/rolling_postupgrade has restored apexdb=PRIMARY / apexdb_stby=STANDBY.
+#
+# --- Why this role exists, not another reuse of dataguard_fsfo ------------
+# First version of this reused dataguard_fsfo wholesale. Corrected after
+# direct, tested operational knowledge of manage_observer.sh (the pre-
+# existing script on oemserver01, also used by rolling_upgrade_fsfo for the
+# disable side): confirmed by hand, repeatedly, that `manage_observer.sh
+# start` does the whole job on the start side too — both enabling
+# Fast-Start Failover AND starting the observer. This role does NOT issue
+# its own separate `enable fast_start failover;` — that would be redundant
+# with, and could race against, what the script already does internally.
+# (An earlier version of this role second-guessed that based on reading
+# start_observer() in this repo's own copy of the script,
+# high-availability/scripts/montor_manage_observer.sh, which only shows a
+# bare `START OBSERVER ... IN BACKGROUND` call with no enable step — that
+# copy is evidently stale relative to what's actually deployed and tested
+# on oemserver01. Trusting the tested, real behavior of the live script
+# over an inference from a possibly-out-of-date checked-in copy.)
+#
+# Shape of this role, deliberately in this order:
+#   1. Preflight — confirm the script is staged, confirm the wallet
+#      connects, log the BEFORE state (read-only, no action taken).
+#   2. The one and only action: `manage_observer.sh start`, run last, only
+#      after preflight above has already confirmed everything looks ready.
+#   3. Verification, strictly AFTER the script has run — `show
+#      configuration;` and `show observers;` via DGMGRL (plus `show
+#      fast_start failover;` alongside them for an unambiguous, single-line
+#      Enabled/Disabled string to check against), confirming both that FSFO
+#      is enabled and that the observer is actually up — real evidence, not
+#      an assumption that the script worked just because it exited 0.
+#
+# --- No password needed anywhere in this role ------------------------------
+# manage_observer.sh's own DGMGRL calls are wallet-based (/@apexdb_dgmgrl,
+# no embedded password) — every DGMGRL call in this role uses the same
+# wallet connect (/@apexdb_DGMGRL, matching this project's Ansible-side TNS
+# alias casing; SQL*Net alias resolution is case-insensitive either way).
+# Assumes the wallet already exists and works — it does, built by
+# dataguard_fsfo during the original Phase 9 FSFO setup and unchanged since.
+# A broken/missing wallet is confirmed explicitly below and fails with a
+# clear pointer back to dataguard_fsfo for a full rebuild, rather than
+# silently trying to recreate it here.
+
+- name: "Preflight: confirm manage_observer.sh is actually staged where expected"
+  stat:
+    path: "{{ manage_observer_script }}"
+  register: rpf_manage_observer_stat
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: "Fail with a clear message if manage_observer.sh isn't where group_vars/all.yml expects"
+  fail:
+    msg: >
+      Expected {{ manage_observer_script }} on {{ inventory_hostname }} — not
+      found. Confirm the real path before re-running.
+  when: not rpf_manage_observer_stat.stat.exists
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+# ============================================================================
+# Confirm the wallet still works before depending on it for everything below
+# ============================================================================
+- name: "Write DGMGRL script: test wallet connectivity + read current FastStartFailover status in one call"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ fsfo_dir }}/rpf_fsfo_check.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    content: |
+      connect /@apexdb_DGMGRL as sysdba
+      show fast_start failover;
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: "Run: wallet connectivity + FastStartFailover status check"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ observer_oracle_home }}
+    {{ observer_oracle_home }}/bin/dgmgrl < {{ fsfo_dir }}/rpf_fsfo_check.dgc
+  register: rpf_fsfo_status_check
+  changed_when: false
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: Show FastStartFailover status-check output
+  debug:
+    msg: "{{ rpf_fsfo_status_check.stdout_lines }}"
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: "Fail loudly if the wallet connect itself failed — do not proceed against a wallet that doesn't work (rebuild via dataguard_fsfo if this happens)"
+  fail:
+    msg: >-
+      Could not connect via /@apexdb_DGMGRL — the wallet may be missing,
+      expired, or the credential may have changed. Read the output above.
+      Rebuild it with dataguard_fsfo (its wallet/credential tasks are
+      idempotent — safe to re-run) before retrying this role.
+  when: rpf_fsfo_status_check.stdout is not search('Fast-Start Failover:')
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: "Note: BEFORE state shown above is informational only — nothing in this role acts on it; manage_observer.sh start handles both enabling FSFO and starting the observer on its own"
+  debug:
+    msg: "Proceeding to manage_observer.sh start — no separate enable step."
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: "Remove the check script (no password in it — wallet-based connect)"
+  file:
+    path: "{{ fsfo_dir }}/rpf_fsfo_check.dgc"
+    state: absent
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+# ============================================================================
+# Start the Observer — manage_observer.sh directly, tested and trusted to
+# handle BOTH re-enabling Fast-Start Failover and starting the observer.
+# The only action this role takes — everything above was read-only
+# preflight, everything below is read-only verification.
+# ============================================================================
+- name: "Run: manage_observer.sh start"
+  become: true
+  become_user: "{{ oracle_user }}"
+  command: "{{ manage_observer_script }} start"
+  register: rpf_observer_start_result
+  changed_when: "'already running' not in rpf_observer_start_result.stdout | lower"
+  failed_when: false
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: "Show manage_observer.sh start output"
+  debug:
+    msg: "{{ rpf_observer_start_result.stdout_lines }}"
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+# failed_when: false above (so the real output always gets shown first via
+# the debug task) — check it explicitly here instead. manage_observer.sh's
+# own start_observer() does exit 1 on a real failure (unlike stop_observer,
+# it checks the OS process + SHOW OBSERVER before declaring success) — but
+# checking rc alone still isn't this project's convention anywhere else, so
+# the script's own CRITICAL marker is checked too, not just rc.
+- name: "Fail loudly if manage_observer.sh start reported a real failure"
+  fail:
+    msg: >-
+      manage_observer.sh start failed — rc={{ rpf_observer_start_result.rc }}.
+      Read the output above. The script's own log is under
+      /u01/app/oracle/scripts/logs/observer/ on {{ inventory_hostname }}
+      (timestamped per invocation) if more detail is needed than what it
+      printed to stdout.
+  when: rpf_observer_start_result.rc != 0 or rpf_observer_start_result.stdout is search('CRITICAL')
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+# ============================================================================
+# Final verification — run strictly AFTER manage_observer.sh, real DGMGRL
+# queries independent of the script's own self-reported success. Exactly
+# the two commands asked for — SHOW CONFIGURATION (whole broker config,
+# including its own FSFO status line) and SHOW OBSERVERS (is one actually
+# registered) — plus SHOW FAST_START FAILOVER alongside them for one
+# unambiguous "Enabled"/"Disabled" line to check against programmatically,
+# same "verify, don't just trust" discipline as dataguard_switchover_test's
+# own post-switchover checks.
+# ============================================================================
+- name: "Write DGMGRL script: final verification (SHOW CONFIGURATION + SHOW OBSERVERS, run only after manage_observer.sh has already completed)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ fsfo_dir }}/rpf_fsfo_verify.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    content: |
+      connect /@apexdb_DGMGRL as sysdba
+      show configuration;
+      show fast_start failover;
+      show observers;
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: "Run: final verification"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ observer_oracle_home }}
+    {{ observer_oracle_home }}/bin/dgmgrl < {{ fsfo_dir }}/rpf_fsfo_verify.dgc
+  register: rpf_fsfo_final_verify
+  changed_when: false
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: Show final verification output
+  debug:
+    msg: "{{ rpf_fsfo_final_verify.stdout_lines }}"
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: "Fail loudly if FastStartFailover is not confirmed Enabled, or no observer is registered, at the end of this role"
+  fail:
+    msg: >-
+      Expected 'Fast-Start Failover:  Enabled' and a registered observer in
+      the final verification output above — one or both are missing. Do not
+      consider FSFO restored until this is confirmed by hand.
+  when: >-
+    rpf_fsfo_final_verify.stdout is not search('Fast-Start Failover:\s+Enabled')
+    or rpf_fsfo_final_verify.stdout is search('No observers')
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: "Remove the verification script (no password in it — wallet-based connect)"
+  file:
+    path: "{{ fsfo_dir }}/rpf_fsfo_verify.dgc"
+    state: absent
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+
+- name: "Phase 6 post-upgrade FSFO re-enable summary"
+  debug:
+    msg: >-
+      Fast-Start Failover confirmed Enabled and the Observer confirmed
+      registered on {{ inventory_hostname }}, via manage_observer.sh start
+      alone (it handles both) — confirmed by SHOW CONFIGURATION / SHOW
+      OBSERVERS run after the script, not assumed from it. Post-upgrade
+      sequence complete — apexdb=PRIMARY, apexdb_stby=STANDBY (open
+      read-only, apply running), FSFO armed, RMAN Level 0 baseline backup
+      taken from apexdb_stby.
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]

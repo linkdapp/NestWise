@@ -39,38 +39,7 @@ what Oracle HA is supposed to look like, it's a record of building it.
 
 ## For the technical reader
 
-<pre class="mermaid">
-flowchart TB
-    subgraph APP["Application Layer — NestWise"]
-        APEX["APEX + ORDS<br/>(Oracle-native app)"]
-        MONGO["MongoDB<br/>(NestWise v2 — later phase)"]
-    end
-
-    subgraph CORE["Oracle MAA Core"]
-        direction TB
-        RAC["2-Node RAC<br/>GI 19c + DB 12.2.0.1"]
-        DG["Data Guard + Fast-Start Failover"]
-        GG["GoldenGate Classic"]
-    end
-
-    subgraph MGMT["Management"]
-        OEM["Enterprise Manager 13.5<br/>(→ 24ai, later phase)"]
-    end
-
-    APEX --> RAC
-    RAC --> DG
-    RAC --> GG
-    MONGO -.-> APEX
-    OEM --> RAC
-    OEM --> DG
-
-    classDef built fill:#1b5e3a,stroke:#0d3d26,color:#ffffff
-    classDef next fill:#7a5c00,stroke:#4d3900,color:#ffffff
-    classDef planned fill:#4a4a4a,stroke:#888888,color:#dddddd,stroke-dasharray: 4 4
-    class RAC,OEM,DG built
-    class APEX next
-    class MONGO,GG planned
-</pre>
+![NestWise Architecture]({{ site.baseurl }}/assets/images/nestwise-architecture.svg)
 
 🟩 Built &nbsp;&nbsp; 🟨 In progress — up next &nbsp;&nbsp; ⬜ Planned
 

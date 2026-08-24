@@ -77,7 +77,7 @@ See `known-risks.md` #137 for the full debugging journey.
 	```
 	SQL> alter system set dg_broker_start=true scope=both sid='*';
 	```
-	📸 *Screenshot: Show_primary_broker_config_file.png
+	📸 *Screenshot: Show_primary_broker_config_file.png.*
 	
 3. PAUSE, then clears `log_archive_dest_2` on both databases
    (check-then-clear, idempotent) — Broker manages it from here.
@@ -184,7 +184,7 @@ See `known-risks.md` #137 for the full debugging journey.
    APEXDB    apexdb1          oradbserv09.usat.com OPEN    READ WRITE   TO STANDBY           ACTIVE
    
    ```
-📸 *Screenshot: Show_switchover_output.png
+📸 *Screenshot: Show_switchover_output.png.*
 
    ``` 
    # --- New Standby (Old Primary)
@@ -241,7 +241,7 @@ $ ansible-playbook -i inventory/hosts.ini site.yml --tags dataguard_fsfo -e sys_
    sudo chmod 0440 /etc/sudoers.d/ansible
    ```
    
-   📸 *Screenshot: creating_observer_directory.png
+   📸 *Screenshot: creating_observer_directory.png.*
    ```
    Then from WSL2 (control node — reuses the same ansible-control key you already generated for 
    the other 4 nodes, no need to regenerate):
@@ -295,7 +295,7 @@ $ ansible-playbook -i inventory/hosts.ini site.yml --tags dataguard_fsfo -e sys_
 5. Sets `FastStartFailoverThreshold` (30s, Oracle's own default) and
    `ENABLE FAST_START FAILOVER` from the primary:
 
-   📸 *Screenshot: Show_current_FSFO_status.png
+   📸 *Screenshot: Show_current_FSFO_status.png.*
    
       ```
    DGMGRL> edit configuration set property FastStartFailoverThreshold=30;
@@ -329,13 +329,13 @@ $ ansible-playbook -i inventory/hosts.ini site.yml --tags dataguard_fsfo -e sys_
      Last Ping to Primary:   3 seconds ago
      Last Ping to Target:    3 seconds ago
    ``` 
-   📸 *Screenshot: show_observer.png
+   📸 *Screenshot: show_observer.png.*
    
       ```
    DGMGRL> show fast_start failover;
    ```
 
-   📸 *Screenshot: show_fast_start_fail_over.png
+   📸 *Screenshot: show_fast_start_fail_over.png.*
 
 **Real induced-failover drill — confirmed manually, not yet Ansible-automated.**
 Everything above proves FSFO *armed*. This proves it *exercised*: a real primary

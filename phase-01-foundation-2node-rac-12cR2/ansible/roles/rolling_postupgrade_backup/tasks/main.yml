@@ -1,0 +1,243 @@
+---
+# Phase 6 post-upgrade — RMAN Level 0 backup, from apexdb_stby (the standby,
+# post-switchback), to /media/sf_rman_backups/<SID> (rman_backup_base_dir,
+# group_vars/all.yml). Runs LAST in the
+# post-upgrade sequence, deliberately: after roles/rolling_postupgrade has
+# restored apexdb=PRIMARY / apexdb_stby=STANDBY, AND after
+# roles/rolling_postupgrade_fsfo has confirmed Fast-Start Failover re-enabled
+# and the Observer running — see rolling-postupgrade.yml's own header comment
+# for why this is its own third play rather than folded into either of those.
+#
+# Extracted out of roles/rolling_postupgrade (where this used to be that
+# role's own "step 7") so it could be reordered to run after FSFO re-enable
+# instead of before it — a straightforward move, not a rewrite: every task
+# below already used delegate_to against standby_node1 throughout and never
+# depended on facts set earlier in rolling_postupgrade's own tasks, so
+# nothing here changed except which play it runs in.
+#
+# Why from the standby: offloads backup I/O from the production primary — a
+# standard, well-documented Data-Guard-aware backup pattern, and exactly
+# what I asked for.
+#
+# Practices applied, and why:
+#   - CONFIGURE CONTROLFILE AUTOBACKUP ON — without this, restoring this
+#     backup later requires separately locating a controlfile/spfile copy.
+#     With it, RMAN backs up the controlfile+spfile automatically after
+#     every backup/structural change.
+#   - CONFIGURE BACKUP OPTIMIZATION ON — skips re-backing-up datafiles RMAN
+#     already has an identical copy of; matters once this becomes a repeated
+#     job, harmless for this one-time run.
+#   - CONFIGURE RETENTION POLICY is deliberately NOT issued here, even though
+#     group_vars/all.yml still documents an intended rman_retention_redundancy
+#     value. Confirmed the hard way on the first real run:
+#     `CONFIGURE RETENTION POLICY TO REDUNDANCY n;` against apexdb_stby fails
+#     with RMAN-05021 ("this configuration cannot be changed for a BACKUP or
+#     STANDBY control file") — Oracle only allows CONFIGURE RETENTION POLICY
+#     (along with CONFIGURE EXCLUDE / ENCRYPTION / DB_UNIQUE_NAME) when
+#     connected to the PRIMARY with a CURRENT/CREATED controlfile, never a
+#     standby. It's a controlfile-wide persistent setting, so configuring it
+#     once by hand against apexdb (the primary) is sufficient — it applies to
+#     backups taken from either side afterward. See group_vars/all.yml's own
+#     comment on rman_retention_redundancy. Real retention for backups taken
+#     by this role therefore currently defaults to Oracle's own REDUNDANCY 1
+#     until that's done.
+#   - CONFIGURE DEVICE TYPE DISK PARALLELISM {{ rman_channels }} ... BACKUP
+#     TYPE TO COMPRESSED BACKUPSET — persistent, config-driven parallelism
+#     and compression rather than ad hoc ALLOCATE CHANNEL in a RUN block;
+#     {{ rman_channels }} is deliberately modest (this is a lab VM, not a
+#     production-sized box).
+#   - INCREMENTAL LEVEL 0 DATABASE ... PLUS ARCHIVELOG — a level 0 is a full
+#     backup that also serves as the baseline for a future incremental
+#     strategy (backup-recovery/ is scoped for exactly that as later work).
+#   - PLUS ARCHIVELOG uses NOT BACKED UP 1 TIMES, and this job does NOT
+#     delete input archivelogs. Deliberate: this is a physical standby, and
+#     its archivelogs may still be needed by Data Guard apply / by other
+#     retention policy elsewhere in the broker configuration. A one-time
+#     ad hoc backup job deleting archivelogs out from under Data Guard on
+#     the standby is a real, avoidable risk — not done here.
+#   - CROSSCHECK BACKUP + LIST BACKUP SUMMARY + RESTORE DATABASE VALIDATE —
+#     a backup that's never been checked isn't a verified backup. VALIDATE
+#     reads every block RMAN would need for a restore without actually
+#     restoring anything.
+#
+# Deliberately NOT done here (out of scope for this one-time job, called out
+# rather than silently skipped): CONFIGURE ARCHIVELOG DELETION POLICY TO
+# APPLIED ON ALL STANDBY — this is a broker-wide governance setting that
+# belongs on the PRIMARY and affects when Data Guard considers archivelogs
+# safe to purge everywhere, not something to set incidentally from a single
+# standby-side backup script. Worth doing as its own deliberate step when
+# backup-recovery/ gets built out properly.
+# ============================================================================
+- name: "PAUSE — about to take an RMAN Level 0 backup of apexdb_stby to {{ rman_backup_base_dir }}/{{ sid_prefix }}1"
+  pause:
+    prompt: >
+      Post-upgrade normalization/switchback and Fast-Start Failover
+      re-enable are both confirmed complete. About to run an RMAN Level 0
+      (full) backup of apexdb_stby to {{ rman_backup_base_dir }}/{{ sid_prefix }}1,
+      then CROSSCHECK + RESTORE DATABASE VALIDATE against it. This can take
+      a while depending on database size. Press ENTER to continue, Ctrl+C
+      then A to abort.
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+
+- name: "Preflight: confirm the backup mount point exists and is a directory (does NOT attempt to mount it — /media/sf_rman_backups is expected to be an already-mounted VirtualBox shared folder)"
+  become: true
+  stat:
+    path: "{{ rman_backup_base_dir }}"
+  delegate_to: "{{ groups['standby_node1'][0] }}"
+  register: rpu_backup_mount_stat
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+
+- name: "Fail loudly if the backup mount point is missing — likely means the VirtualBox shared folder isn't mounted on this node"
+  fail:
+    msg: >-
+      {{ rman_backup_base_dir }} does not exist on
+      {{ groups['standby_node1'][0] }}. This looks like a VirtualBox shared
+      folder path (sf_ prefix) — confirm it's actually mounted (VirtualBox
+      Devices menu -> Shared Folders, or `mount | grep vboxsf` on the guest)
+      before re-running. Not something this role can fix by creating a
+      plain directory in its place.
+  when: not rpu_backup_mount_stat.stat.exists or not rpu_backup_mount_stat.stat.isdir
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+
+- name: "Create the SID-specific backup subdirectory ({{ rman_backup_base_dir }}/{{ sid_prefix }}1)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_node1'][0] }}"
+  file:
+    path: "{{ rman_backup_base_dir }}/{{ sid_prefix }}1"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0750"
+  register: rpu_backup_dir_result
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+
+- name: "Fail loudly if the oracle user can't actually write to the backup directory — common vboxsf gotcha (host-side folder permissions / oracle not in the vboxsf group)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_node1'][0] }}"
+  shell: |
+    touch "{{ rman_backup_base_dir }}/{{ sid_prefix }}1/.rpu_write_test" && rm -f "{{ rman_backup_base_dir }}/{{ sid_prefix }}1/.rpu_write_test"
+  register: rpu_backup_write_test
+  changed_when: false
+  failed_when: rpu_backup_write_test.rc != 0
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+
+- name: "Write RMAN script: Level 0 backup of apexdb_stby"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/rpu_rman_l0_backup.rman"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    content: |
+      CONFIGURE CONTROLFILE AUTOBACKUP ON;
+      CONFIGURE CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE DISK TO '{{ rman_backup_base_dir }}/{{ sid_prefix }}1/%F';
+      CONFIGURE BACKUP OPTIMIZATION ON;
+      CONFIGURE DEVICE TYPE DISK PARALLELISM {{ rman_channels }} BACKUP TYPE TO COMPRESSED BACKUPSET;
+      CONFIGURE DEFAULT DEVICE TYPE TO DISK;
+
+      BACKUP AS COMPRESSED BACKUPSET INCREMENTAL LEVEL 0 DATABASE
+        TAG 'POST_ROLLING_UPGRADE_L0'
+        FORMAT '{{ rman_backup_base_dir }}/{{ sid_prefix }}1/%d_DB_%T_%U.bkp'
+        PLUS ARCHIVELOG
+        TAG 'POST_ROLLING_UPGRADE_ARCH'
+        FORMAT '{{ rman_backup_base_dir }}/{{ sid_prefix }}1/%d_ARCH_%T_%U.bkp'
+        NOT BACKED UP 1 TIMES;
+
+      CROSSCHECK BACKUP;
+      LIST BACKUP SUMMARY;
+      RESTORE DATABASE VALIDATE;
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+
+- name: "Run: RMAN Level 0 backup of apexdb_stby (this can take a while — no fixed timeout override here on purpose, let it run)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db19c_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db19c_home }}/bin/rman target / cmdfile={{ staging_dir }}/sql/rpu_rman_l0_backup.rman log={{ staging_dir }}/sql/rpu_rman_l0_backup.log
+  register: rpu_rman_backup_result
+  changed_when: true
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+
+- name: "Fetch the RMAN log for inspection (rman's own rc can be 0 even when an internal RMAN-0xxxx error occurred mid-script — same non-trusting-rc discipline as every DGMGRL task in this project)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_node1'][0] }}"
+  command: "cat {{ staging_dir }}/sql/rpu_rman_l0_backup.log"
+  register: rpu_rman_backup_log
+  changed_when: false
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+
+- name: Show RMAN backup log
+  debug:
+    msg: "{{ rpu_rman_backup_log.stdout_lines }}"
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+
+- name: "Fail loudly if the RMAN log shows a real error stack, or rc != 0, or the script never reached its final command"
+  # Caught on fresh-eyes review: this used to check for the literal string
+  # "finished successfully", which plain RMAN output never actually prints
+  # (that's not a real RMAN message) — it would have failed this task on
+  # every run regardless of whether the backup actually worked. Fixed to
+  # check for RMAN's own real, standard completion line for the LAST
+  # command in the script (RESTORE DATABASE VALIDATE) instead — "Finished
+  # restore at <date>" is what RMAN genuinely prints when that command
+  # completes, matching the same "check the real text, not an assumed
+  # phrase" discipline already applied to every DGMGRL task in this project.
+  #
+  # Second bug, hit on the first real run against a live standby: a blanket
+  # `search('RMAN-0')` is too broad — it also matches benign RMAN-0xxxx
+  # WARNING messages, not just real errors. Specifically,
+  # "RMAN-06820: warning: failed to archive current log at primary
+  # database / cannot connect to remote database" fires routinely on a
+  # `BACKUP ... PLUS ARCHIVELOG` run from the standby side (RMAN tries to
+  # force-archive the primary's current online log via the standby
+  # connection; when that reach-back isn't available it just warns and
+  # backs up the archivelogs it already has) — the run in question
+  # completed every step for real (both L0 datafile backup sets, all
+  # archivelog backup sets, controlfile autobackup, CROSSCHECK, LIST
+  # BACKUP SUMMARY, and RESTORE DATABASE VALIDATE all completed with
+  # "Finished restore at" present), yet this task still failed the whole
+  # role on that one benign warning line. Fixed to check for RMAN's own
+  # real error-stack banner instead of a bare substring: genuine errors
+  # (confirmed against the earlier real RMAN-05021 failure in this same
+  # role) are always wrapped in
+  # "RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============",
+  # which warnings like RMAN-06820 never are.
+  fail:
+    msg: >-
+      RMAN reported a problem — read the full log above
+      ({{ staging_dir }}/sql/rpu_rman_l0_backup.log on
+      {{ groups['standby_node1'][0] }}) before assuming this backup is
+      usable. rc={{ rpu_rman_backup_result.rc }}.
+  when: >-
+    rpu_rman_backup_result.rc != 0
+    or rpu_rman_backup_log.stdout is search('ERROR MESSAGE STACK FOLLOWS')
+    or rpu_rman_backup_log.stdout is not search('Finished restore at')
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+
+- name: "Remove the RMAN cmdfile (no password in it — OS-authenticated target /) but keep the log for reference"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['standby_node1'][0] }}"
+  file:
+    path: "{{ staging_dir }}/sql/rpu_rman_l0_backup.rman"
+    state: absent
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]
+
+- name: "RMAN Level 0 backup summary"
+  debug:
+    msg: >-
+      RMAN Level 0 backup of apexdb_stby completed and validated. Backup
+      pieces + controlfile autobackup are under
+      {{ rman_backup_base_dir }}/{{ sid_prefix }}1 on
+      {{ groups['standby_node1'][0] }}. Full RMAN log kept at
+      {{ staging_dir }}/sql/rpu_rman_l0_backup.log for reference.
+      Post-upgrade sequence complete: normalization + switchback done,
+      Fast-Start Failover re-enabled and Observer running, baseline RMAN
+      Level 0 backup taken and validated — in that order.
+  tags: [rolling_postupgrade, rolling_postupgrade_backup]

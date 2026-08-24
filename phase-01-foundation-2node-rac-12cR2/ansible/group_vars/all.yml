@@ -680,18 +680,36 @@ autoupgrade_jar: "{{ staging_dir }}/software/AutoUpgrade_25.6_build_version_25.6
 # live; confirm this path is correct on oemserver01 before the first real run.
 manage_observer_script: /u01/app/oracle/scripts/monitoring/manage_observer.sh
 
-# Phase 6 post-upgrade (roles/rolling_postupgrade) — RMAN Level 0 backup taken
-# from apexdb_stby (the standby, post-switchback) per James's own explicit
-# instruction. /media/sf_hrman is a VirtualBox shared-folder mount point
-# (sf_<foldername> is VBoxService's own naming convention for auto-mounted
-# shared folders) — assumed already mounted on oradbserv09/10; the role does
-# NOT attempt to mount it, only fails loudly with a clear message (pointing at
-# VirtualBox Shared Folders / vboxsf group membership) if it isn't there or
-# isn't writable. Backup pieces land under
-# rman_backup_base_dir/<the connecting instance's SID> (apexdb1 — sid_prefix
-# is "apexdb" on BOTH clusters by this project's own design, see
-# group_vars/standby_nodes.yml's own note on sid_prefix; db_unique_name is
-# what actually differs, apexdb vs apexdb_stby, not the SID).
-rman_backup_base_dir: /media/sf_hrman/rman_backups
+# Phase 6 post-upgrade (roles/rolling_postupgrade_backup) — RMAN Level 0
+# backup taken from apexdb_stby (the standby, post-switchback) per my own
+# explicit instruction. /media/sf_rman_backups is a VirtualBox shared-folder
+# mount point (sf_<foldername> is VBoxService's own naming convention for
+# auto-mounted shared folders — the real shared folder is named
+# "rman_backups", so it automounts directly as /media/sf_rman_backups, NOT
+# nested under an intermediate /media/sf_hrman path) — assumed already
+# mounted on oradbserv09/10; the role does NOT attempt to mount it, only
+# fails loudly with a clear message (pointing at VirtualBox Shared Folders /
+# vboxsf group membership) if it isn't there or isn't writable. Backup
+# pieces land under rman_backup_base_dir/<the connecting instance's SID>
+# (apexdb1 — sid_prefix is "apexdb" on BOTH clusters by this project's own
+# design, see group_vars/standby_nodes.yml's own note on sid_prefix;
+# db_unique_name is what actually differs, apexdb vs apexdb_stby, not the
+# SID).
+rman_backup_base_dir: /media/sf_rman_backups
 rman_channels: 2                # CONFIGURE DEVICE TYPE DISK PARALLELISM — modest on purpose, this is a lab VM
-rman_retention_redundancy: 2    # CONFIGURE RETENTION POLICY TO REDUNDANCY — Oracle's own default is 1; set explicitly rather than left implicit
+# rman_retention_redundancy is currently DOCUMENTATION ONLY, not applied by
+# roles/rolling_postupgrade_backup: that role's RMAN session connects to
+# apexdb_stby (the standby), and Oracle does not allow CONFIGURE RETENTION
+# POLICY (along with CONFIGURE EXCLUDE / ENCRYPTION / DB_UNIQUE_NAME) to be
+# changed except when connected to the PRIMARY with a CURRENT/CREATED
+# controlfile — confirmed the hard way (RMAN-05021 "this configuration
+# cannot be changed for a BACKUP or STANDBY control file") the first time
+# this role actually ran. Real retention therefore still defaults to
+# Oracle's own REDUNDANCY 1 for backups taken this way. To actually apply
+# REDUNDANCY {{ rman_retention_redundancy }}, run CONFIGURE RETENTION
+# POLICY once by hand against apexdb (the primary) — it's a controlfile-wide
+# persistent RMAN setting, so it applies regardless of which side (primary
+# or standby) later backups connect from. Not automated here — out of scope
+# for a standby-side backup job to reach across and change primary-side
+# persistent configuration incidentally.
+rman_retention_redundancy: 2

@@ -16,22 +16,25 @@
 # match, not just this comment.
 #
 # --- Real gap found on the first live run — owned, not glossed over --------
-# `manage_observer.sh stop` only stops the Observer background PROCESS. That
-# is a genuinely different thing from the Broker's own FastStartFailover
-# CONFIGURATION property, which stays ENABLED until something explicitly runs
-# `DGMGRL> disable fast_start failover;`. First real run of this role stopped
-# the observer (SHOW OBSERVER correctly went to "No observers.") but James's
-# own follow-up `show fast_start failover` from dgmgrl still reported
-# "Fast-Start Failover: Enabled in Zero Data Loss Mode" — the property itself
-# hadn't moved. He caught this and ran the DGMGRL disable by hand, confirmed
-# by a second `show fast_start failover` reporting "Disabled". That manual
-# step is now folded into this role below (9.x/6.x-style DGMGRL script,
-# same pattern as dataguard_fsfo) so a future run of this role actually
-# reaches the real DBMS_ROLLING prerequisite on its own, not just an
-# observer-stopped-but-FSFO-still-enabled state that LOOKS done from
-# `manage_observer.sh status` alone. Root cause: I conflated "stop the
-# observer" with "disable FSFO" when first writing this role — related but
-# not the same lever.
+# CORRECTED (see high-availability/scripts/montor_manage_observer.sh, read
+# directly rather than assumed): `manage_observer.sh stop` DOES disable FSFO
+# first — its stop_observer() function runs `DISABLE FAST-START FAILOVER;`
+# as step 1, then `STOP OBSERVER;` as step 2. The original note here claimed
+# the script only touches the observer process and never the FastStartFailover
+# CONFIGURATION property — that was wrong; the script clearly attempts both.
+# The REAL root cause of the first live run's symptom (observer stopped,
+# SHOW OBSERVER correctly "No observers.", but a follow-up `show fast_start
+# failover` from dgmgrl still reported "Fast-Start Failover: Enabled in Zero
+# Data Loss Mode"): the script fires the DISABLE command and moves straight
+# to STOP OBSERVER without ever checking whether the disable actually
+# succeeded — the same "DGMGRL returns rc 0 even on internal errors" gotcha
+# documented everywhere else in this project (known-risks.md #137), just
+# inside a shell script instead of an Ansible task. The script's own
+# unconditional `exit 0` at the end makes this easy to miss. The explicit
+# DGMGRL disable+verify step below is still the right fix — it just isn't
+# compensating for a missing capability, it's compensating for the script's
+# own unchecked DGMGRL call, by checking the real output text instead of
+# trusting either rc.
 #
 # --- Second gap, found immediately after fixing the first one --------------
 # The first attempt at the fix above matched on the literal string
