@@ -15,7 +15,7 @@ subsequent full re-run confirmed it reproduces cleanly.
 | # | Section | Status |
 |---|---|---|
 | 1 | Prerequisites and decisions | reference — n/a |
-| 2 | Host-side VM and storage | 🟩 Confirmed (built by hand, per James) |
+| 2 | Host-side VM and storage | 🟩 Confirmed (built by hand, by me) |
 | 3 | OS baseline on oradbserv09/10 | 🟩 Confirmed |
 | 4 | DNS for usatclust2 | 🟩 Confirmed |
 | 5 | Time sync (chrony) | 🟩 Confirmed |
@@ -50,7 +50,7 @@ correctly for the standby's Data Guard aliases (see step 8.3.5 below and
 live lab confirmed it reproduces cleanly — no longer just "done once, by hand."
 
 **Sections 11 and 12** (Phases 5 and 6 of the same SOP) are both now confirmed
-clean. Phase 5 (remove the multiplexed standby redo log member — James's own
+clean. Phase 5 (remove the multiplexed standby redo log member — my own
 request, run only after the standby is confirmed working, i.e. after Phase 4) is
 confirmed clean — all six SRL groups single-member after two real-run bug fixes
 (`known-risks.md` #121-#122). Phase 6 (convert the standby to RAC) is also confirmed
@@ -99,7 +99,7 @@ naming convention as `installation/`'s Section 15.
 ## Contents
 
 1. [Prerequisites and decisions](#1-prerequisites-and-decisions)
-2. [🟩 Confirmed — Host-side VM and storage (built by hand, per James)](#2-confirmed--host-side-vm-and-storage-built-by-hand-per-james)
+2. [🟩 Confirmed — Host-side VM and storage (built by hand, by me)](#2-confirmed--host-side-vm-and-storage-built-by-hand-by-me)
 3. [🟩 Confirmed — OS baseline on oradbserv09/10](#3-confirmed--os-baseline-on-oradbserv0910)
 4. [🟩 Confirmed — DNS for usatclust2](#4-confirmed--dns-for-usatclust2)
 5. [🟩 Confirmed — Time sync (chrony)](#5-confirmed--time-sync-chrony)
@@ -123,8 +123,8 @@ Continue to **[Part 2 — Broker, Fast-Start Failover, and Observer](part2-broke
 | Target | 2-node physical standby cluster `usatclust2` for `apexdb` (primary: `usatclust1`, [`installation/README.md`](../installation/README.md)) — Active Data Guard, MAA pattern |
 | Nodes | `oradbserv09.usat.com`, `oradbserv10.usat.com` — replace the old `07`/`08` inventory placeholders |
 | Build method | GI 19c + DB 12.2.0.1 Oracle Homes **cloned** from the already-patched `oradbserv05` (tar/deploy, not a fresh silent install + RU/OJVM cycle) — see [`known-risks.md`](../phase-01-foundation-2node-rac-12cR2/docs/known-risks.md) #46 |
-| Clone-time outage | **Clusterware is stopped on `oradbserv05` before cloning** (`crsctl stop crs`, manual — James's decision), accepting a brief `apexdb` outage rather than tarring a live GI home; brought back up (`crsctl start crs`) once the tarballs are captured — see Section 8 and `known-risks.md` #46 |
-| Storage | Standby's own separate `.vdi` ASM disks — already created by James, not shared with `usatclust1`'s |
+| Clone-time outage | **Clusterware is stopped on `oradbserv05` before cloning** (`crsctl stop crs`, manual — my decision), accepting a brief `apexdb` outage rather than tarring a live GI home; brought back up (`crsctl start crs`) once the tarballs are captured — see Section 8 and `known-risks.md` #46 |
+| Storage | Standby's own separate `.vdi` ASM disks — already created by me, not shared with `usatclust1`'s |
 | OCR/voting | Fully separate from `usatclust1`'s — `usatclust2` is a genuinely independent cluster, not an extension of the primary's |
 | Observer | `oemserver01` hosts the Data Guard Broker Observer initially; a second observer on `oradbserv04` (the future APEX/ORDS app server) is planned for later |
 | Standby DB creation | RMAN `DUPLICATE ... FOR STANDBY FROM ACTIVE DATABASE` — **not** DBCA (DBCA creates new databases, not standbys) |
@@ -139,7 +139,7 @@ your real addressing (already pre-populated in this repo).
 
 ---
 
-## 2. 🟩 Confirmed — Host-side VM and storage (built by hand, per James)
+## 2. 🟩 Confirmed — Host-side VM and storage (built by hand, by me)
 
 VMs `oradbserv09`/`oradbserv10` and their own shared ASM `.vdi` disks already exist —
 built directly, not through this repo's `vm-tuning-vboxmanage.ps1` script (that script
@@ -310,7 +310,7 @@ Role: [`gi_db_home_clone`](../phase-01-foundation-2node-rac-12cR2/ansible/roles/
 Full reasoning in the role's header comment and [`known-risks.md`](../phase-01-foundation-2node-rac-12cR2/docs/known-risks.md) #46/#66.
 
 **Manual step required first — `crsctl stop crs` stop Clusterware on BOTH nodes, with the right
-command:** James's decision, overriding this role's earlier "leave it live" approach —
+command:** My decision, overriding this role's earlier "leave it live" approach —
 accepts a brief `apexdb` outage in exchange for tarring a fully quiesced GI home
 rather than arguing the risk away.
 
@@ -552,7 +552,7 @@ oradbserv09-grid-+ASM1$
 
 ## 10. 🟩 Confirmed — Create the standby database (RMAN duplicate)
 
-Built from a real, MAA-grounded SOP James provided
+Built from a real, MAA-grounded SOP I provided
 (`standby_dataguard_creation.txt`): `RMAN DUPLICATE ... FOR STANDBY FROM ACTIVE
 DATABASE`, run from an `oradbserv09` instance against `apexdb` on `oradbserv05`
 over `Net*`— see `known-risks.md` #76.
@@ -655,7 +655,7 @@ exit;
 Same result: already `YES`, so `alter system set db_flashback_retention_target=1440 scope=both sid='*'; alter database flashback on;` was skipped
 — which turned out to hide a real gap (`known-risks.md` #115): because
 flashback was already on, retention was never re-checked either, so when
-James later raised the target to 3 days (4320 minutes) by hand, a re-run of
+I later raised the target to 3 days (4320 minutes) by hand, a re-run of
 this role wouldn't have picked that change up — the enable-flashback and
 set-retention logic were both gated on the same "is flashback off" check.
 Split into its own independent check-then-act pair now, and
@@ -768,7 +768,7 @@ All 11 statements succeeded once the file-location-before-broker-start
 reorder was in place — confirms the #81 fix.
 
 **Updated since this capture.** `log_archive_dest_2` above uses
-`service=apexdb_stby_dg` — James later changed this to the plain
+`service=apexdb_stby_dg` — I later changed this to the plain
 `service=apexdb_stby` (`known-risks.md` #115, tested working), once
 `apexdb_stby` itself started carrying `(UR=A)` too and the `_dg`-suffixed
 alias stopped being the only one that could connect pre-open. The role now
@@ -1127,7 +1127,7 @@ run {
 
 **Two review pauses**, not one: before `DUPLICATE` itself runs (shown with
 the real `run{}` block above, password redacted), and before managed
-recovery starts (James's direct call, matching Phase 3's precedent). The SOP's
+recovery starts (my direct call, matching Phase 3's precedent). The SOP's
 own closing note — only proceed to Phase 5 once transport/apply lag are
 healthy — is left as a manual gate; the role prints the real numbers, not
 an automated pass/fail.
@@ -1267,7 +1267,7 @@ connection routed through SCAN for `apexdb_stby` was never going to
 succeed regardless of timing. The original write-up here correctly
 declined to guess at a root cause without evidence and flagged it as
 "likely a registration delay, not confirmed" — the real cause turned out to
-be more specific and more structural than that. James diagnosed and fixed
+be more specific and more structural than that. I diagnosed and fixed
 it directly: `apexdb_stby`/`apexdb_stby_dg` now connect via the standby's
 own node hostname instead of SCAN, and `log_archive_dest_2` on both sides
 now points at the plain `apexdb`/`apexdb_stby` aliases rather than the

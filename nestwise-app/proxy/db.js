@@ -16,7 +16,10 @@ async function connect() {
     client = new MongoClient(MONGO_URL);
     await client.connect();
     db = client.db(DB_NAME);
-    console.log(`[nestwise-proxy] connected to MongoDB at ${MONGO_URL}, db "${DB_NAME}"`);
+    // Never log MONGO_URL directly — it carries the credential inline
+    // (mongodb://user:pass@host/...). Redact the password before printing.
+    const redactedUrl = MONGO_URL.replace(/\/\/([^:]+):([^@]+)@/, '//$1:***@');
+    console.log(`[nestwise-proxy] connected to MongoDB at ${redactedUrl}, db "${DB_NAME}"`);
     return db;
 }
 

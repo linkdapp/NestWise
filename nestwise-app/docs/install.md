@@ -92,6 +92,12 @@ Each should return JSON, not a 404.
 
 ## 4. Set up MongoDB
 
+Assumes the Mongo host is already installed and configured — see
+[`mongodb-server-install.md`](mongodb-server-install.md) for the real, from-scratch server build
+(package install, storage layout, service-account/sudo access model, auth bootstrap) done for
+this project on `oradbserv04`. The commands below are just the schema/seed-data step that runs
+against an already-running server.
+
 On the Mongo host (or from any machine with `mongosh` pointed at it):
 
 ```bash

@@ -124,6 +124,11 @@ project's own first attempt — see Section 16's write-up for what that looked l
 
 ![SwingBench main GUI — Configuration tab, ready to set connection and load](screenshoots/Swingbench_setup9a.png)
 
+For example: 
+
+```
+(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=scan-usatclust1.usat.com)(PORT=1521))(ADDRESS=(PROTOCOL=TCP)(HOST=scan-usatclust2.usat.com)(PORT=1521))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=apexdb_rw)))
+```
 
 **Configuration tab, User Details:**
 - **Username/Password:** the schema account from step 2 (`soe`/`soe` if left

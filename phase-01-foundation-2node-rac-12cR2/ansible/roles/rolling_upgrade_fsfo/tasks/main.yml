@@ -14,6 +14,35 @@
 # is correct before a real run — if the script actually lives somewhere else
 # (e.g. one of the RAC nodes), this role's target group needs to change to
 # match, not just this comment.
+#
+# --- Real gap found on the first live run — owned, not glossed over --------
+# `manage_observer.sh stop` only stops the Observer background PROCESS. That
+# is a genuinely different thing from the Broker's own FastStartFailover
+# CONFIGURATION property, which stays ENABLED until something explicitly runs
+# `DGMGRL> disable fast_start failover;`. First real run of this role stopped
+# the observer (SHOW OBSERVER correctly went to "No observers.") but James's
+# own follow-up `show fast_start failover` from dgmgrl still reported
+# "Fast-Start Failover: Enabled in Zero Data Loss Mode" — the property itself
+# hadn't moved. He caught this and ran the DGMGRL disable by hand, confirmed
+# by a second `show fast_start failover` reporting "Disabled". That manual
+# step is now folded into this role below (9.x/6.x-style DGMGRL script,
+# same pattern as dataguard_fsfo) so a future run of this role actually
+# reaches the real DBMS_ROLLING prerequisite on its own, not just an
+# observer-stopped-but-FSFO-still-enabled state that LOOKS done from
+# `manage_observer.sh status` alone. Root cause: I conflated "stop the
+# observer" with "disable FSFO" when first writing this role — related but
+# not the same lever.
+#
+# --- Second gap, found immediately after fixing the first one --------------
+# The first attempt at the fix above matched on the literal string
+# 'Fast-Start Failover: Disabled' (one space). Real DGMGRL output right-pads
+# the label column so the summary line reads 'Fast-Start Failover:  Disabled'
+# (TWO spaces) when the value is short, vs 'Fast-Start Failover: Enabled in
+# Zero Data Loss Mode' (one space) when it's long — confirmed directly from
+# this role's own first real run output. A plain substring match on fixed
+# spacing is fragile against DGMGRL's column alignment; every check below now
+# uses a whitespace-tolerant regex (`is search('Fast-Start Failover:\s+...')`)
+# instead of a literal substring, so it can't be tripped up by padding again.
 
 - name: "Confirm manage_observer.sh is actually staged where expected"
   stat:
@@ -62,7 +91,7 @@
   changed_when: "'stopped' in fsfo_stop_result.stdout | lower or fsfo_stop_result.rc == 0"
   tags: [rolling_fsfo_disable]
 
-- name: "Confirm FSFO/observer status after stop"
+- name: "Confirm FSFO/observer PROCESS status after stop (this is the observer daemon only, NOT the Broker's FastStartFailover property — see next tasks)"
   become: true
   become_user: "{{ oracle_user }}"
   command: "{{ manage_observer_script }} status"
@@ -70,7 +99,148 @@
   changed_when: false
   tags: [rolling_fsfo_disable]
 
-- name: "Show FSFO/observer status after stop"
+- name: "Show FSFO/observer process status after stop"
   debug:
     var: fsfo_status_after.stdout_lines
+  tags: [rolling_fsfo_disable]
+
+# ============================================================================
+# The actual Broker-level action DBMS_ROLLING.BUILD_PLAN cares about: the
+# FastStartFailover CONFIGURATION property, not just whether an observer
+# process happens to be running. Uses the same wallet-based, no-embedded-
+# password /@apexdb_DGMGRL CONNECT that dataguard_fsfo already set up and
+# tested on oemserver01 — no new plaintext-secret script needed for this.
+# ============================================================================
+- name: "Write DGMGRL script: check current FastStartFailover property state"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ fsfo_dir }}/rolling_fsfo_check.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    content: |
+      connect /@apexdb_DGMGRL as sysdba
+      show fast_start failover;
+  tags: [rolling_fsfo_disable]
+
+- name: "Run: check current FastStartFailover property state"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ observer_oracle_home }}
+    {{ observer_oracle_home }}/bin/dgmgrl < {{ fsfo_dir }}/rolling_fsfo_check.dgc
+  register: rolling_fsfo_property_check
+  changed_when: false
+  tags: [rolling_fsfo_disable]
+
+- name: "Show FastStartFailover property state"
+  debug:
+    msg:
+      - "Command (on {{ inventory_hostname }}): {{ observer_oracle_home }}/bin/dgmgrl < {{ fsfo_dir }}/rolling_fsfo_check.dgc"
+      - "Output: {{ rolling_fsfo_property_check.stdout_lines }}"
+  tags: [rolling_fsfo_disable]
+
+- name: "Write DGMGRL script: disable Fast-Start Failover (the real DBMS_ROLLING prerequisite — stopping the observer process alone does not do this)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ fsfo_dir }}/rolling_fsfo_disable.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    content: |
+      connect /@apexdb_DGMGRL as sysdba
+      disable fast_start failover;
+      show fast_start failover;
+  when: "rolling_fsfo_property_check.stdout is search('Fast-Start Failover:\\s+Enabled')"
+  tags: [rolling_fsfo_disable]
+
+- name: "Run: disable Fast-Start Failover"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ observer_oracle_home }}
+    {{ observer_oracle_home }}/bin/dgmgrl < {{ fsfo_dir }}/rolling_fsfo_disable.dgc
+  register: rolling_fsfo_disable_result
+  when: "rolling_fsfo_property_check.stdout is search('Fast-Start Failover:\\s+Enabled')"
+  tags: [rolling_fsfo_disable]
+
+- name: Show FastStartFailover disable command and output
+  debug:
+    msg:
+      - "Command (on {{ inventory_hostname }}): {{ observer_oracle_home }}/bin/dgmgrl < {{ fsfo_dir }}/rolling_fsfo_disable.dgc"
+      - "Output: {{ rolling_fsfo_disable_result.stdout_lines }}"
+  when: "rolling_fsfo_property_check.stdout is search('Fast-Start Failover:\\s+Enabled')"
+  tags: [rolling_fsfo_disable]
+
+# DGMGRL returns rc 0 even on its own internal errors (no whenever-sqlerror
+# equivalent — the same gap already documented in dataguard_broker's and
+# dataguard_fsfo's headers). Check the real text, not rc, same discipline as
+# every other DGMGRL task in this project.
+- name: "Fail loudly if the disable didn't actually report success"
+  fail:
+    msg: >-
+      DGMGRL did not report 'Disabled' after `disable fast_start failover;`
+      — read the raw output above. rc 0 does not mean it worked
+      (known-risks.md #137 — DGMGRL has no whenever-sqlerror equivalent).
+  when:
+    - "rolling_fsfo_property_check.stdout is search('Fast-Start Failover:\\s+Enabled')"
+    - "rolling_fsfo_disable_result.stdout is not search('Disabled')"
+  tags: [rolling_fsfo_disable]
+
+- name: "Report: FastStartFailover already disabled, nothing to do"
+  debug:
+    msg: "FastStartFailover property was already Disabled — skipped the DGMGRL disable step."
+  when: "rolling_fsfo_property_check.stdout is not search('Fast-Start Failover:\\s+Enabled')"
+  tags: [rolling_fsfo_disable]
+
+- name: "Write DGMGRL script: final verification of FastStartFailover property"
+  become: true
+  become_user: "{{ oracle_user }}"
+  copy:
+    dest: "{{ fsfo_dir }}/rolling_fsfo_verify.dgc"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    content: |
+      connect /@apexdb_DGMGRL as sysdba
+      show fast_start failover;
+      show observers;
+  tags: [rolling_fsfo_disable]
+
+- name: "Run: final verification of FastStartFailover property"
+  become: true
+  become_user: "{{ oracle_user }}"
+  shell: |
+    export ORACLE_HOME={{ observer_oracle_home }}
+    {{ observer_oracle_home }}/bin/dgmgrl < {{ fsfo_dir }}/rolling_fsfo_verify.dgc
+  register: rolling_fsfo_final_verify
+  changed_when: false
+  tags: [rolling_fsfo_disable]
+
+- name: "Fail loudly if FastStartFailover is not confirmed Disabled at the end of this role — DBMS_ROLLING.BUILD_PLAN will reject otherwise"
+  fail:
+    msg: >-
+      Expected 'Fast-Start Failover:  Disabled' in the final verification
+      output but did not find it — read the raw output above. Do not proceed
+      to DBMS_ROLLING.BUILD_PLAN until this is confirmed.
+  when: "rolling_fsfo_final_verify.stdout is not search('Fast-Start Failover:\\s+Disabled')"
+  tags: [rolling_fsfo_disable]
+
+- name: "Show final FastStartFailover verification (confirmed Disabled)"
+  debug:
+    msg:
+      - "Command (on {{ inventory_hostname }}): {{ observer_oracle_home }}/bin/dgmgrl < {{ fsfo_dir }}/rolling_fsfo_verify.dgc"
+      - "Output: {{ rolling_fsfo_final_verify.stdout_lines }}"
+  tags: [rolling_fsfo_disable]
+
+- name: "Reminder — re-enabling FSFO is a separate, later step"
+  debug:
+    msg: >-
+      FastStartFailover is now confirmed Disabled and the Observer process is
+      stopped. Both need to be re-enabled after DBMS_ROLLING.FINISH_PLAN
+      completes (dataguard_fsfo's own enable/start-observer tasks cover that
+      — not yet wired into this role's post-upgrade path, since FINISH_PLAN
+      itself hasn't been written yet).
   tags: [rolling_fsfo_disable]

@@ -15,7 +15,35 @@
 # this fully; fall back to the software-only + opatchauto pattern from
 # db_silent_install if it isn't (same as GI's own patch_before_config role
 # already does for its OPatch-update-before-applyRU sequencing).
-
+#
+# --- Cross-cluster auto-copy, added after James noticed usatclust2
+# (oradbserv09) didn't have everything usatclust1 (oradbserv05) already had
+# staged (grid_home.zip was there already, from the earlier GI phase — the
+# 19c DB-home software/RU/OPatch zips weren't). Each cluster's node1 needs
+# its OWN local copy of these files (no shared storage assumed between the
+# two independent clusters), so below, any file missing on the target
+# cluster's staging host gets copied there automatically from usatclust1
+# (groups['rac_nodes'][0] — where James stages originals by hand), with an
+# explicit debug announcement before each copy so it's obvious what's
+# happening rather than a long silent pause.
+#
+# Two-tier: tries a direct host-to-host `rsync` push first (oracle@usatclust1
+# node1 -> oracle@usatclust2 node1, over the passwordless SSH trust the
+# cross_cluster_ssh_trust role sets up — confirmed working on the real hosts
+# 2026-08-21), and only falls back to routing through the Ansible controller
+# (fetch from source -> local temp -> copy to target) if that direct push
+# fails for any reason (trust not set up yet, rsync missing, etc.). The
+# fallback path has zero new prerequisites — Ansible already has working SSH
+# to both clusters, a precondition of this playbook running at all — so this
+# role works whether or not cross_cluster_ssh_trust has been run, just faster
+# if it has. These are multi-GB files (LINUX.X64_193000_grid_home.zip alone
+# is ~2.9GB, per James's own `ls -l` — the DB-home zip and RU combo are
+# comparable), so the fallback path especially can take a while and needs
+# that much free space, twice over, on both the controller and the target
+# host. The rsync path uses ansible-core's `command` module against the real
+# `rsync` binary, not the ansible.posix `synchronize` module — this project
+# deliberately avoids adding ansible.posix as a dependency (see
+# ssh_equivalence's own header comment).
 - name: "Stage 19c DB software: extract, update OPatch, confirm RU staged"
   tags: [db19c_stage]
   block:
@@ -39,43 +67,592 @@
       run_once: true
       delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
 
+    - name: "Determine this cluster's staging host and the canonical source host (usatclust1 node1 — where files are staged by hand)"
+      set_fact:
+        db19c_stage_target_host: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+        db19c_stage_source_host: "{{ groups['rac_nodes'][0] }}"
+      run_once: true
+
+    # ---- 1. 19c DB software zip -------------------------------------------
     - name: Confirm the 19c DB software zip is staged
       stat:
         path: "{{ db19c_software_zip }}"
       register: db19c_software_zip_stat
       run_once: true
-      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+      delegate_to: "{{ db19c_stage_target_host }}"
 
-    - name: Fail with a clear message if the 19c DB software zip isn't staged
+    - name: "Check the 19c DB software zip on the source host (only relevant if missing on the target)"
+      stat:
+        path: "{{ db19c_software_zip }}"
+      register: db19c_software_zip_src_stat
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_software_zip_stat.stat.exists
+
+    - name: "Announce cross-cluster copy: 19c DB software zip"
+      debug:
+        msg: >-
+          {{ db19c_software_zip }} is missing on {{ db19c_stage_target_host }}
+          ({{ db19c_stage_target_host }}'s cluster) — copying it now from
+          {{ db19c_stage_source_host }}
+          ({{ (db19c_software_zip_src_stat.stat.size | default(0) / 1024 / 1024 / 1024) | round(2) }} GB).
+          Trying a direct rsync push first (requires the oracle@{{ db19c_stage_source_host }}
+          -> oracle@{{ db19c_stage_target_host }} SSH trust from cross_cluster_ssh_trust);
+          falling back to routing through the Ansible controller if that isn't set up.
+      run_once: true
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_software_zip_stat.stat.exists
+        - db19c_software_zip_src_stat.stat.exists
+
+    # Fast path: direct host-to-host rsync over the oracle SSH trust
+    # (cross_cluster_ssh_trust role). Uses ansible-core's `command` module
+    # invoking the real `rsync` binary directly, NOT the ansible.posix
+    # collection's `synchronize` module — this project deliberately avoids
+    # adding ansible.posix as a dependency (see ssh_equivalence's own header
+    # comment). failed_when: false — a failure here (trust not set up, rsync
+    # missing, etc.) is expected to be possible and just triggers the slow
+    # fallback path below, not a hard stop.
+    - name: "Attempt direct rsync push: 19c DB software zip (fast path)"
+      become: true
+      become_user: "{{ oracle_user }}"
+      command: >
+        rsync -avh --progress -e 'ssh -o BatchMode=yes -o ConnectTimeout=5'
+        {{ db19c_software_zip }} {{ db19c_stage_target_host }}:{{ db19c_software_zip }}
+      register: db19c_software_zip_rsync_result
+      failed_when: false
+      changed_when: db19c_software_zip_rsync_result.rc == 0
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_software_zip_stat.stat.exists
+        - db19c_software_zip_src_stat.stat.exists
+
+    - name: "Report rsync fast-path result: 19c DB software zip"
+      debug:
+        msg:
+          - "Command (on {{ db19c_stage_source_host }}): rsync -avh --progress ... {{ db19c_software_zip }} {{ db19c_stage_target_host }}:{{ db19c_software_zip }}"
+          - "rc: {{ db19c_software_zip_rsync_result.rc }}"
+          - "{{ 'rsync push succeeded.' if db19c_software_zip_rsync_result.rc == 0 else 'rsync push FAILED — falling back to the Ansible-controller path.' }}"
+          - "stdout: {{ db19c_software_zip_rsync_result.stdout_lines }}"
+          - "stderr: {{ db19c_software_zip_rsync_result.stderr_lines }}"
+      run_once: true
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_software_zip_stat.stat.exists
+        - db19c_software_zip_src_stat.stat.exists
+
+    # Slow fallback path: only runs if the rsync fast path above didn't
+    # succeed. Routes through the Ansible controller (fetch from source ->
+    # local temp -> copy to target) — guaranteed to work with no SSH trust
+    # needed between the two clusters, just slower for multi-GB files.
+    - name: "Fetch the 19c DB software zip from the source host to the Ansible controller (fallback)"
+      fetch:
+        src: "{{ db19c_software_zip }}"
+        dest: "{{ playbook_dir }}/.transfer_cache/{{ db19c_software_zip | basename }}"
+        flat: true
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_software_zip_stat.stat.exists
+        - db19c_software_zip_src_stat.stat.exists
+        - db19c_software_zip_rsync_result.rc != 0
+
+    - name: "Push the 19c DB software zip from the Ansible controller to {{ db19c_stage_target_host }} (fallback)"
+      copy:
+        src: "{{ playbook_dir }}/.transfer_cache/{{ db19c_software_zip | basename }}"
+        dest: "{{ db19c_software_zip }}"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: "0664"
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_software_zip_stat.stat.exists
+        - db19c_software_zip_src_stat.stat.exists
+        - db19c_software_zip_rsync_result.rc != 0
+
+    - name: "Clean up controller-local transfer cache: 19c DB software zip (fallback)"
+      file:
+        path: "{{ playbook_dir }}/.transfer_cache/{{ db19c_software_zip | basename }}"
+        state: absent
+      run_once: true
+      delegate_to: localhost
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_software_zip_stat.stat.exists
+        - db19c_software_zip_src_stat.stat.exists
+        - db19c_software_zip_rsync_result.rc != 0
+
+    - name: "Re-check the 19c DB software zip on the target host after any copy attempt"
+      stat:
+        path: "{{ db19c_software_zip }}"
+      register: db19c_software_zip_stat_final
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+
+    - name: Fail with a clear message if the 19c DB software zip still isn't staged (and couldn't be auto-copied)
       fail:
-        msg: "Expected {{ db19c_software_zip }} — not found on {{ inventory_hostname }}."
-      when: not db19c_software_zip_stat.stat.exists
+        msg: >-
+          Expected {{ db19c_software_zip }} — not found on
+          {{ db19c_stage_target_host }}, and not found on the source host
+          {{ db19c_stage_source_host }} either, so it couldn't be auto-copied.
+          Stage it manually on one of the two before re-running.
+      when: not db19c_software_zip_stat_final.stat.exists
       run_once: true
 
+    # ---- 2. 19c RU combo patch zip -----------------------------------------
     - name: Confirm the 19c RU combo zip is staged (patch 39467003)
       stat:
         path: "{{ db19c_ru_zip }}"
       register: db19c_ru_zip_stat
       run_once: true
-      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+      delegate_to: "{{ db19c_stage_target_host }}"
 
-    - name: Fail with a clear message if the 19c RU zip isn't staged
+    - name: "Check the 19c RU combo zip on the source host (only relevant if missing on the target)"
+      stat:
+        path: "{{ db19c_ru_zip }}"
+      register: db19c_ru_zip_src_stat
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_ru_zip_stat.stat.exists
+
+    - name: "Announce cross-cluster copy: 19c RU combo zip"
+      debug:
+        msg: >-
+          {{ db19c_ru_zip }} is missing on {{ db19c_stage_target_host }} —
+          copying it now from {{ db19c_stage_source_host }}
+          ({{ (db19c_ru_zip_src_stat.stat.size | default(0) / 1024 / 1024 / 1024) | round(2) }} GB).
+          Trying a direct rsync push first; falling back to the Ansible
+          controller if the SSH trust isn't set up.
+      run_once: true
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_ru_zip_stat.stat.exists
+        - db19c_ru_zip_src_stat.stat.exists
+
+    - name: "Attempt direct rsync push: 19c RU combo zip (fast path)"
+      become: true
+      become_user: "{{ oracle_user }}"
+      command: >
+        rsync -avh --progress -e 'ssh -o BatchMode=yes -o ConnectTimeout=5'
+        {{ db19c_ru_zip }} {{ db19c_stage_target_host }}:{{ db19c_ru_zip }}
+      register: db19c_ru_zip_rsync_result
+      failed_when: false
+      changed_when: db19c_ru_zip_rsync_result.rc == 0
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_ru_zip_stat.stat.exists
+        - db19c_ru_zip_src_stat.stat.exists
+
+    - name: "Report rsync fast-path result: 19c RU combo zip"
+      debug:
+        msg:
+          - "Command (on {{ db19c_stage_source_host }}): rsync -avh --progress ... {{ db19c_ru_zip }} {{ db19c_stage_target_host }}:{{ db19c_ru_zip }}"
+          - "rc: {{ db19c_ru_zip_rsync_result.rc }}"
+          - "{{ 'rsync push succeeded.' if db19c_ru_zip_rsync_result.rc == 0 else 'rsync push FAILED — falling back to the Ansible-controller path.' }}"
+          - "stdout: {{ db19c_ru_zip_rsync_result.stdout_lines }}"
+          - "stderr: {{ db19c_ru_zip_rsync_result.stderr_lines }}"
+      run_once: true
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_ru_zip_stat.stat.exists
+        - db19c_ru_zip_src_stat.stat.exists
+
+    - name: "Fetch the 19c RU combo zip from the source host to the Ansible controller (fallback)"
+      fetch:
+        src: "{{ db19c_ru_zip }}"
+        dest: "{{ playbook_dir }}/.transfer_cache/{{ db19c_ru_zip | basename }}"
+        flat: true
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_ru_zip_stat.stat.exists
+        - db19c_ru_zip_src_stat.stat.exists
+        - db19c_ru_zip_rsync_result.rc != 0
+
+    - name: "Push the 19c RU combo zip from the Ansible controller to {{ db19c_stage_target_host }} (fallback)"
+      copy:
+        src: "{{ playbook_dir }}/.transfer_cache/{{ db19c_ru_zip | basename }}"
+        dest: "{{ db19c_ru_zip }}"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: "0664"
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_ru_zip_stat.stat.exists
+        - db19c_ru_zip_src_stat.stat.exists
+        - db19c_ru_zip_rsync_result.rc != 0
+
+    - name: "Clean up controller-local transfer cache: 19c RU combo zip (fallback)"
+      file:
+        path: "{{ playbook_dir }}/.transfer_cache/{{ db19c_ru_zip | basename }}"
+        state: absent
+      run_once: true
+      delegate_to: localhost
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_ru_zip_stat.stat.exists
+        - db19c_ru_zip_src_stat.stat.exists
+        - db19c_ru_zip_rsync_result.rc != 0
+
+    - name: "Re-check the 19c RU combo zip on the target host after any copy attempt"
+      stat:
+        path: "{{ db19c_ru_zip }}"
+      register: db19c_ru_zip_stat_final
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+
+    - name: Fail with a clear message if the 19c RU zip still isn't staged (and couldn't be auto-copied)
       fail:
-        msg: "Expected {{ db19c_ru_zip }} — not found on {{ inventory_hostname }}."
-      when: not db19c_ru_zip_stat.stat.exists
+        msg: >-
+          Expected {{ db19c_ru_zip }} — not found on {{ db19c_stage_target_host }},
+          and not found on the source host {{ db19c_stage_source_host }}
+          either, so it couldn't be auto-copied. Stage it manually on one of
+          the two before re-running.
+      when: not db19c_ru_zip_stat_final.stat.exists
       run_once: true
 
-    - name: Extract 19c DB software to a staging location (NOT db19c_home — same reasoning as db_silent_install)
+    # ---- 3. 19c DB OPatch zip -----------------------------------------------
+    # James's own call, and the right one: get ALL THREE zips fully staged
+    # (copied) on the target cluster BEFORE extracting anything. Originally
+    # this OPatch-zip check/copy sat AFTER the two extract tasks below, which
+    # meant a fresh oradbserv09 run could spend time extracting the software
+    # and RU zips before ever confirming/copying the OPatch zip — if that
+    # copy then failed, you'd be left with a half-extracted staging area and
+    # a still-missing file. Copying while everything is still a small,
+    # compressed .zip is also just faster and easier to reason about than
+    # copying in between extraction steps.
+    - name: Confirm the 19c DB OPatch zip is staged
+      stat:
+        path: "{{ db19c_opatch_zip }}"
+      register: db19c_opatch_zip_stat
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+
+    - name: "Check the 19c DB OPatch zip on the source host (only relevant if missing on the target)"
+      stat:
+        path: "{{ db19c_opatch_zip }}"
+      register: db19c_opatch_zip_src_stat
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_opatch_zip_stat.stat.exists
+
+    - name: "Announce cross-cluster copy: 19c DB OPatch zip"
+      debug:
+        msg: >-
+          {{ db19c_opatch_zip }} is missing on {{ db19c_stage_target_host }} —
+          copying it now from {{ db19c_stage_source_host }}
+          ({{ (db19c_opatch_zip_src_stat.stat.size | default(0) / 1024 / 1024 / 1024) | round(2) }} GB).
+          Trying a direct rsync push first; falling back to the Ansible
+          controller if the SSH trust isn't set up.
+      run_once: true
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_opatch_zip_stat.stat.exists
+        - db19c_opatch_zip_src_stat.stat.exists
+
+    - name: "Attempt direct rsync push: 19c DB OPatch zip (fast path)"
+      become: true
+      become_user: "{{ oracle_user }}"
+      command: >
+        rsync -avh --progress -e 'ssh -o BatchMode=yes -o ConnectTimeout=5'
+        {{ db19c_opatch_zip }} {{ db19c_stage_target_host }}:{{ db19c_opatch_zip }}
+      register: db19c_opatch_zip_rsync_result
+      failed_when: false
+      changed_when: db19c_opatch_zip_rsync_result.rc == 0
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_opatch_zip_stat.stat.exists
+        - db19c_opatch_zip_src_stat.stat.exists
+
+    - name: "Report rsync fast-path result: 19c DB OPatch zip"
+      debug:
+        msg:
+          - "Command (on {{ db19c_stage_source_host }}): rsync -avh --progress ... {{ db19c_opatch_zip }} {{ db19c_stage_target_host }}:{{ db19c_opatch_zip }}"
+          - "rc: {{ db19c_opatch_zip_rsync_result.rc }}"
+          - "{{ 'rsync push succeeded.' if db19c_opatch_zip_rsync_result.rc == 0 else 'rsync push FAILED — falling back to the Ansible-controller path.' }}"
+          - "stdout: {{ db19c_opatch_zip_rsync_result.stdout_lines }}"
+          - "stderr: {{ db19c_opatch_zip_rsync_result.stderr_lines }}"
+      run_once: true
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_opatch_zip_stat.stat.exists
+        - db19c_opatch_zip_src_stat.stat.exists
+
+    - name: "Fetch the 19c DB OPatch zip from the source host to the Ansible controller (fallback)"
+      fetch:
+        src: "{{ db19c_opatch_zip }}"
+        dest: "{{ playbook_dir }}/.transfer_cache/{{ db19c_opatch_zip | basename }}"
+        flat: true
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_opatch_zip_stat.stat.exists
+        - db19c_opatch_zip_src_stat.stat.exists
+        - db19c_opatch_zip_rsync_result.rc != 0
+
+    - name: "Push the 19c DB OPatch zip from the Ansible controller to {{ db19c_stage_target_host }} (fallback)"
+      copy:
+        src: "{{ playbook_dir }}/.transfer_cache/{{ db19c_opatch_zip | basename }}"
+        dest: "{{ db19c_opatch_zip }}"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: "0664"
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_opatch_zip_stat.stat.exists
+        - db19c_opatch_zip_src_stat.stat.exists
+        - db19c_opatch_zip_rsync_result.rc != 0
+
+    - name: "Clean up controller-local transfer cache: 19c DB OPatch zip (fallback)"
+      file:
+        path: "{{ playbook_dir }}/.transfer_cache/{{ db19c_opatch_zip | basename }}"
+        state: absent
+      run_once: true
+      delegate_to: localhost
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not db19c_opatch_zip_stat.stat.exists
+        - db19c_opatch_zip_src_stat.stat.exists
+        - db19c_opatch_zip_rsync_result.rc != 0
+
+    - name: "Re-check the 19c DB OPatch zip on the target host after any copy attempt"
+      stat:
+        path: "{{ db19c_opatch_zip }}"
+      register: db19c_opatch_zip_stat_final
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+
+    - name: Fail with a clear message if the 19c DB OPatch zip still isn't staged (and couldn't be auto-copied)
+      fail:
+        msg: >-
+          Expected {{ db19c_opatch_zip }} — not found on
+          {{ db19c_stage_target_host }}, and not found on the source host
+          {{ db19c_stage_source_host }} either, so it couldn't be auto-copied.
+          Stage it manually on one of the two before re-running.
+      when: not db19c_opatch_zip_stat_final.stat.exists
+      run_once: true
+
+    # ---- 4. AutoUpgrade jar --------------------------------------------------
+    # Real gap James caught live: dbms_rolling_upgrade's rolling_autoupgrade
+    # tag failed outright with "Unable to access jarfile" because
+    # AutoUpgrade_25.6_....jar was never wired into this role's staging at
+    # all — it only ever existed wherever it had been placed by hand, and was
+    # never copied to the standby cluster (where it actually needs to run,
+    # against apexdb_stby). James's own standing rule, stated explicitly:
+    # every file this upgrade needs — other than the Oracle install media
+    # itself, which the installer/OPatch process lays down on its own — must
+    # be copied to each server as part of THIS first preparation step, not
+    # left to manual copying mid-run. Same rsync-then-controller-fallback
+    # pattern as the three zips above; the jar itself is only a few MB (not
+    # multi-GB), so this step is fast either way. No extraction needed —
+    # AutoUpgrade runs the jar in place from staging_dir/software.
+    - name: Confirm the AutoUpgrade jar is staged
+      stat:
+        path: "{{ autoupgrade_jar }}"
+      register: autoupgrade_jar_stat
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+
+    - name: "Check the AutoUpgrade jar on the source host (only relevant if missing on the target)"
+      stat:
+        path: "{{ autoupgrade_jar }}"
+      register: autoupgrade_jar_src_stat
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not autoupgrade_jar_stat.stat.exists
+
+    - name: "Announce cross-cluster copy: AutoUpgrade jar"
+      debug:
+        msg: >-
+          {{ autoupgrade_jar }} is missing on {{ db19c_stage_target_host }} —
+          copying it now from {{ db19c_stage_source_host }}
+          ({{ (autoupgrade_jar_src_stat.stat.size | default(0) / 1024 / 1024) | round(2) }} MB).
+          Trying a direct rsync push first; falling back to the Ansible
+          controller if the SSH trust isn't set up.
+      run_once: true
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not autoupgrade_jar_stat.stat.exists
+        - autoupgrade_jar_src_stat.stat.exists
+
+    - name: "Attempt direct rsync push: AutoUpgrade jar (fast path)"
+      become: true
+      become_user: "{{ oracle_user }}"
+      command: >
+        rsync -avh --progress -e 'ssh -o BatchMode=yes -o ConnectTimeout=5'
+        {{ autoupgrade_jar }} {{ db19c_stage_target_host }}:{{ autoupgrade_jar }}
+      register: autoupgrade_jar_rsync_result
+      failed_when: false
+      changed_when: autoupgrade_jar_rsync_result.rc == 0
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not autoupgrade_jar_stat.stat.exists
+        - autoupgrade_jar_src_stat.stat.exists
+
+    - name: "Report rsync fast-path result: AutoUpgrade jar"
+      debug:
+        msg:
+          - "Command (on {{ db19c_stage_source_host }}): rsync -avh --progress ... {{ autoupgrade_jar }} {{ db19c_stage_target_host }}:{{ autoupgrade_jar }}"
+          - "rc: {{ autoupgrade_jar_rsync_result.rc }}"
+          - "{{ 'rsync push succeeded.' if autoupgrade_jar_rsync_result.rc == 0 else 'rsync push FAILED — falling back to the Ansible-controller path.' }}"
+          - "stdout: {{ autoupgrade_jar_rsync_result.stdout_lines }}"
+          - "stderr: {{ autoupgrade_jar_rsync_result.stderr_lines }}"
+      run_once: true
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not autoupgrade_jar_stat.stat.exists
+        - autoupgrade_jar_src_stat.stat.exists
+
+    - name: "Ensure {{ autoupgrade_jar | dirname }} exists on the target host before the controller-fallback copy"
+      file:
+        path: "{{ autoupgrade_jar | dirname }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: "0775"
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not autoupgrade_jar_stat.stat.exists
+        - autoupgrade_jar_src_stat.stat.exists
+        - autoupgrade_jar_rsync_result.rc != 0
+
+    - name: "Fetch the AutoUpgrade jar from the source host to the Ansible controller (fallback)"
+      fetch:
+        src: "{{ autoupgrade_jar }}"
+        dest: "{{ playbook_dir }}/.transfer_cache/{{ autoupgrade_jar | basename }}"
+        flat: true
+      run_once: true
+      delegate_to: "{{ db19c_stage_source_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not autoupgrade_jar_stat.stat.exists
+        - autoupgrade_jar_src_stat.stat.exists
+        - autoupgrade_jar_rsync_result.rc != 0
+
+    - name: "Push the AutoUpgrade jar from the Ansible controller to {{ db19c_stage_target_host }} (fallback)"
+      copy:
+        src: "{{ playbook_dir }}/.transfer_cache/{{ autoupgrade_jar | basename }}"
+        dest: "{{ autoupgrade_jar }}"
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: "0664"
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not autoupgrade_jar_stat.stat.exists
+        - autoupgrade_jar_src_stat.stat.exists
+        - autoupgrade_jar_rsync_result.rc != 0
+
+    - name: "Clean up controller-local transfer cache: AutoUpgrade jar (fallback)"
+      file:
+        path: "{{ playbook_dir }}/.transfer_cache/{{ autoupgrade_jar | basename }}"
+        state: absent
+      run_once: true
+      delegate_to: localhost
+      when:
+        - db19c_stage_target_host != db19c_stage_source_host
+        - not autoupgrade_jar_stat.stat.exists
+        - autoupgrade_jar_src_stat.stat.exists
+        - autoupgrade_jar_rsync_result.rc != 0
+
+    - name: "Re-check the AutoUpgrade jar on the target host after any copy attempt"
+      stat:
+        path: "{{ autoupgrade_jar }}"
+      register: autoupgrade_jar_stat_final
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+
+    - name: Fail with a clear message if the AutoUpgrade jar still isn't staged (and couldn't be auto-copied)
+      fail:
+        msg: >-
+          Expected {{ autoupgrade_jar }} — not found on
+          {{ db19c_stage_target_host }}, and not found on the source host
+          {{ db19c_stage_source_host }} either, so it couldn't be
+          auto-copied. Stage it manually on one of the two (e.g. download it
+          fresh to {{ db19c_stage_source_host }}:{{ autoupgrade_jar }})
+          before re-running `--tags db19c_stage`.
+      when: not autoupgrade_jar_stat_final.stat.exists
+      run_once: true
+
+    # ---- All four files are now confirmed staged locally — extract -------
+    # James's own catch: 19c's DB software media is packaged differently from
+    # 12.2.0.1's. db_silent_install (12.2.0.1) extracts to a STAGING location
+    # and runs staging/database/runInstaller with a response file that points
+    # -at- db_home as the INSTALL target — that's the OLD model, and the zip
+    # contains a top-level database/ folder. Starting at 18c, Oracle changed
+    # the packaging: the zip's contents ARE the Oracle Home itself (no
+    # database/ subfolder), so the correct procedure is: create an EMPTY
+    # db19c_home first (already done above), unzip DIRECTLY into it, then run
+    # {{ db19c_home }}/runInstaller from inside that home — not a staging
+    # copy. This matches what grid_silent_install already does for GI (also
+    # 19.3.0, same packaging model): "Extract Grid Infrastructure software
+    # into grid_home" (dest: grid_home), then "{{ grid_home }}/gridSetup.sh".
+    # This role originally extracted to a staging location instead (copied
+    # from the OLD 12.2.0.1 pattern without checking whether it still
+    # applied) — fixed below to match GI's own, correct, already-proven 19c
+    # pattern. staging_dir/patches (used just below, for the RU combo only)
+    # is unaffected — Release Update patches stay staged separately and get
+    # applied via -applyRU pointing at their own path, in both the 12c and
+    # 19c models; only the BASE software (and OPatch, see the Install block
+    # above) unzips directly into the home.
+    - name: "Ensure {{ staging_dir }}/patches exists before extracting into it"
+      file:
+        path: "{{ staging_dir }}/patches"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: "0775"
+      run_once: true
+      delegate_to: "{{ db19c_stage_target_host }}"
+
+    - name: "Extract 19c DB software DIRECTLY into db19c_home (18c+ packaging — NOT a staging location, unlike 12.2.0.1's db_silent_install)"
       unarchive:
         src: "{{ db19c_software_zip }}"
-        dest: "{{ staging_dir }}/software/db19c"
+        dest: "{{ db19c_home }}"
         remote_src: true
         owner: "{{ oracle_user }}"
         group: oinstall
       args:
-        creates: "{{ staging_dir }}/software/db19c/runInstaller"
+        creates: "{{ db19c_home }}/runInstaller"
+      register: db19c_software_extract_result
       run_once: true
-      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+      delegate_to: "{{ db19c_stage_target_host }}"
+
+    - name: "Show 19c DB software extraction result"
+      debug:
+        msg: >-
+          Extracted {{ db19c_software_zip }} into {{ db19c_home }} on
+          {{ db19c_stage_target_host }} — changed: {{ db19c_software_extract_result.changed }}
+          ({{ 'fresh extraction' if db19c_software_extract_result.changed else 'runInstaller already present, skipped (creates: guard)' }}).
+      run_once: true
 
     - name: Extract the 19c RU combo patch to the staging patches directory
       unarchive:
@@ -86,43 +663,170 @@
         group: oinstall
       args:
         creates: "{{ db19c_ru_patch_path }}"
+      register: db19c_ru_extract_result
       run_once: true
-      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+      delegate_to: "{{ db19c_stage_target_host }}"
 
-    - name: Confirm the 19c DB OPatch zip is staged
-      stat:
-        path: "{{ db19c_opatch_zip }}"
-      register: db19c_opatch_zip_stat
-      run_once: true
-      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
-
-    - name: Fail with a clear message if the 19c DB OPatch zip isn't staged
-      fail:
-        msg: "Expected {{ db19c_opatch_zip }} — not found on {{ inventory_hostname }}."
-      when: not db19c_opatch_zip_stat.stat.exists
+    - name: "Show 19c RU combo patch extraction result"
+      debug:
+        msg: >-
+          Extracted {{ db19c_ru_zip }} into {{ staging_dir }}/patches on
+          {{ db19c_stage_target_host }} — changed: {{ db19c_ru_extract_result.changed }}
+          ({{ 'fresh extraction' if db19c_ru_extract_result.changed else db19c_ru_patch_path + ' already present, skipped (creates: guard)' }}).
       run_once: true
 
 - name: "Install 19c DB software with -applyRU + root.sh"
   tags: [db19c_install_software]
   block:
-    - name: "Check whether the 19c DB software install has already completed"
-      stat:
-        path: "{{ db19c_home }}/root.sh"
-      register: db19c_root_sh_stat
+    # Real bug found on the first run against this new (18c+ direct-into-home)
+    # model: checking for db19c_home/root.sh's mere EXISTENCE is NOT a valid
+    # completion signal here, even though it was fine for the old 12.2.0.1
+    # staging model. Since 19c's zip is unzipped directly into db19c_home
+    # (see the extraction task's comment above), root.sh is already SITTING
+    # THERE, unmodified, straight from the raw zip contents, the instant
+    # extraction finishes — long before runInstaller ever runs. Confirmed the
+    # hard way: this check said "already completed" right after a fresh
+    # extraction, so runInstaller/OPatch-update were skipped entirely, and
+    # the raw, un-customized root.sh (which still had a hardcoded generic
+    # build-time path baked in, not this install's real path) failed when
+    # run directly: ".../install/utl/rootmacro.sh: No such file or
+    # directory" — root.sh only becomes a genuinely runnable, customized
+    # script AFTER runInstaller has processed the home.
+    #
+    # Fixed to match grid_silent_install's own, already-correct idempotency
+    # check for the exact same packaging model: grep the CENTRAL INVENTORY
+    # (inventory.xml) for a HOME entry at this path. That's a real Oracle
+    # record that only exists once OUI has actually registered the home —
+    # not a marker file invented for this project, and not vulnerable to the
+    # raw-zip-contents false positive above.
+    - name: "Check whether the 19c DB software install has already completed (central inventory, not a marker file — see comment above)"
+      command: >
+        grep -q 'LOC="{{ db19c_home }}"' {{ inventory_loc }}/ContentsXML/inventory.xml
+      register: db19c_inventory_check
+      changed_when: false
+      failed_when: false
       run_once: true
       delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
 
     - name: "Set install-check result"
       set_fact:
-        db19c_install_check_rc: "{{ 0 if db19c_root_sh_stat.stat.exists else 1 }}"
+        db19c_install_check_rc: "{{ 0 if db19c_inventory_check.rc == 0 else 1 }}"
       run_once: true
 
     - name: Report 19c DB software install status
       debug:
         msg: >
-          19c DB software install {{ 'already completed — ' + db19c_home + '/root.sh exists.
-          Skipping runInstaller re-invocation.' if db19c_install_check_rc == '0' else
+          19c DB software install {{ 'already completed — ' + db19c_home + ' is
+          registered in the central inventory. Skipping runInstaller
+          re-invocation.' if db19c_install_check_rc == '0' else
           'not yet done — running runInstaller now, with -applyRU (' + db19c_ru_patch_path + ').' }}
+      run_once: true
+
+    # James's own catch, after a real -applyRU failure: this role staged
+    # db19c_opatch_zip during db19c_stage but never actually USED it —
+    # skipped the exact "update OPatch before -applyRU" step
+    # grid_silent_install already does for GI (see that role's own header
+    # comment on gi_opatch_zip, which db19c_opatch_zip in group_vars/all.yml
+    # deliberately reuses/points at). Real failure this caused: the base
+    # 19.3.0 media ships OPatch 12.2.0.1.17, but the 19.32 RU's own
+    # sub-patches need up to 12.2.0.1.52 — opatchauto's own error said so
+    # explicitly ("CheckMinimumOPatchVersion :- FAILED ... Patch 39526364
+    # requires OPatch version 12.2.0.1.52"). Same fix, same pattern as
+    # grid_silent_install: unzip the OPatch zip straight into db19c_home,
+    # overwriting the bundled OPatch/, before runInstaller's -applyRU runs.
+    - name: "Confirm the 19c DB OPatch zip is present on this cluster's staging host (should already be there from db19c_stage — re-checked here so --tags db19c_install_software alone still fails clearly instead of guessing)"
+      stat:
+        path: "{{ db19c_opatch_zip }}"
+      register: db19c_install_opatch_zip_stat
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+      when: db19c_install_check_rc == '1'
+
+    - name: "Fail with a clear message if the 19c DB OPatch zip isn't staged (run db19c_stage first)"
+      fail:
+        msg: >-
+          Expected {{ db19c_opatch_zip }} on {{ inventory_hostname }} — not
+          found. Run `--tags db19c_stage` first (it copies/stages this file),
+          then re-run `--tags db19c_install_software`.
+      when:
+        - db19c_install_check_rc == '1'
+        - not db19c_install_opatch_zip_stat.stat.exists
+      run_once: true
+
+    - name: "Update OPatch in db19c_home from the staged OPatch zip (required before -applyRU, not part of the RU itself — same reasoning as grid_silent_install's equivalent step)"
+      unarchive:
+        src: "{{ db19c_opatch_zip }}"
+        dest: "{{ db19c_home }}"
+        remote_src: true
+        owner: "{{ oracle_user }}"
+        group: oinstall
+      # No `creates:` guard, same reasoning as grid_silent_install: this should
+      # overwrite OPatch/ every time in case db19c_opatch_zip is ever updated to
+      # a newer OPatch later — unarchive's own checksum-diff behavior keeps a
+      # no-op re-run cheap.
+      register: db19c_opatch_extract_result
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+      when: db19c_install_check_rc == '1'
+
+    - name: "Show OPatch update result"
+      debug:
+        msg: >-
+          Unzipped {{ db19c_opatch_zip }} over {{ db19c_home }}/OPatch —
+          changed: {{ db19c_opatch_extract_result.changed }}.
+      run_once: true
+      when: db19c_install_check_rc == '1'
+
+    - name: "Report updated OPatch version in db19c_home (should now be well above the 12.2.0.1.17 the base 19.3.0 media ships with)"
+      command: "{{ db19c_home }}/OPatch/opatch version"
+      register: db19c_preinstall_opatch_version
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}"
+      when: db19c_install_check_rc == '1'
+
+    - name: Show updated OPatch version
+      debug:
+        msg:
+          - "Command (on {{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}): {{ db19c_home }}/OPatch/opatch version"
+          - "rc: {{ db19c_preinstall_opatch_version.rc }}"
+          - "Output: {{ db19c_preinstall_opatch_version.stdout_lines }}"
+      run_once: true
+      when: db19c_install_check_rc == '1'
+
+    # Defensive, same reasoning as grid_silent_install's own equivalent step:
+    # runInstaller, like gridSetup.sh, propagates the Oracle Home to every
+    # OTHER node in the response file's CLUSTER_NODES list over SSH
+    # equivalence — and refuses (INS-44002) if it finds ANYTHING already at
+    # that path on the target node, including hidden dotfiles a plain
+    # `rm -rf path/*` won't clear. Not the direct cause of the failure just
+    # fixed above (node2 never had db19c_home populated at all yet — that's
+    # WHY its root.sh call errored with "No such file or directory"), but
+    # left unguarded this is exactly the kind of thing that silently breaks
+    # a LATER partial-failure retry. Only runs on nodes other than the one
+    # runInstaller launches from; never touches that node's own extracted
+    # software.
+    - name: "Remove {{ db19c_home }} entirely on every node OTHER than the install-launch node (clears hidden dotfiles too — a plain rm -rf path/* would not)"
+      become: true
+      delegate_to: "{{ item }}"
+      loop: "{{ (nodes | map(attribute='name') | list) | reject('equalto', (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0]) | list }}"
+      when: db19c_install_check_rc == '1'
+      file:
+        path: "{{ db19c_home }}"
+        state: absent
+      run_once: true
+
+    - name: "Recreate {{ db19c_home }} empty on every node OTHER than the install-launch node, owned oracle:oinstall"
+      become: true
+      delegate_to: "{{ item }}"
+      loop: "{{ (nodes | map(attribute='name') | list) | reject('equalto', (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0]) | list }}"
+      when: db19c_install_check_rc == '1'
+      file:
+        path: "{{ db19c_home }}"
+        state: directory
+        owner: "{{ oracle_user }}"
+        group: oinstall
+        mode: "0775"
       run_once: true
 
     # Same -waitforcompletion requirement as db_silent_install's 12.2.0.1 install —
@@ -130,14 +834,44 @@
     # specific to either version. -applyRU here is the actual difference from
     # db_install.rsp's install: confirmed acceptable by 18c+ installers per
     # db_silent_install's own header comment.
+    #
+    # Invoked as {{ db19c_home }}/runInstaller, NOT
+    # {{ staging_dir }}/software/db19c/runInstaller — James's own catch (see
+    # the extraction task's comment above): 19c's media unzips directly into
+    # the target Oracle Home, so that's also where runInstaller itself lives
+    # and must be run from, matching grid_silent_install's
+    # {{ grid_home }}/gridSetup.sh precedent.
+    #
+    # --- Real gap, found on a real run: -ignoreSysPrereqs rejected outright --
+    # -ignorePrereq -ignoreSysPrereqs (grid_silent_install's own flags for
+    # gridSetup.sh, also 19.3.0) got THROUGH the -applyRU patch-apply phase
+    # of this same command fine ("Successfully applied the patch") — the
+    # failure only hit on the very next internal phase, which runInstaller's
+    # own error labeled "DBSetup": "[INS-04009] The argument
+    # [-ignoreSysPrereqs] passed is not supported for the current context
+    # DBSetup". gridSetup.sh (GI) and runInstaller (DB) are different OUI
+    # front-ends that ship in the same 19.3.0 release wave but parse their
+    # own argument lists independently — one accepting a flag doesn't mean
+    # the other does, and in this case the very same 19.3.0 wave's DB
+    # installer doesn't recognize -ignorePrereq/-ignoreSysPrereqs at all in
+    # this context. The command's own -silent usage text, printed in the
+    # error output, confirms the actual supported flag: -ignorePrereqFailure
+    # (singular, no "Sys") — not listed anywhere in
+    # db_silent_install/grid_silent_install's own flag choice, so this is a
+    # genuinely different flag name for this specific installer/context, not
+    # a typo. Scoped to this role only — db_silent_install (12.2.0.1) and
+    # grid_silent_install (GI) both keep their own -ignorePrereq
+    # -ignoreSysPrereqs unchanged, since neither has shown this failure.
     - name: Run runInstaller silently, with -applyRU
       become: true
       become_user: "{{ oracle_user }}"
+      environment:
+        ORACLE_HOME: "{{ db19c_home }}"
       command: >
-        {{ staging_dir }}/software/db19c/runInstaller -silent -waitforcompletion
+        {{ db19c_home }}/runInstaller -silent -waitforcompletion
         -responseFile {{ staging_dir }}/response-files/db19c_install.rsp
         -applyRU {{ db19c_ru_patch_path }}
-        {{ '-ignorePrereq -ignoreSysPrereqs' if (use_ignore_prereq or db_ignore_prereq) else '' }}
+        {{ '-ignorePrereqFailure' if (use_ignore_prereq or db_ignore_prereq) else '' }}
       register: db19c_install_result
       failed_when: db19c_install_result.rc not in [0, 6]
       changed_when: db19c_install_result.rc == 0
@@ -147,7 +881,11 @@
 
     - name: Show runInstaller output
       debug:
-        var: db19c_install_result.stdout_lines
+        msg:
+          - "Command (on {{ (groups['rac_nodes'] if inventory_hostname in groups['rac_nodes'] else groups['standby_nodes'])[0] }}): {{ db19c_home }}/runInstaller -silent -waitforcompletion -responseFile {{ staging_dir }}/response-files/db19c_install.rsp -applyRU {{ db19c_ru_patch_path }} {{ '-ignorePrereqFailure' if (use_ignore_prereq or db_ignore_prereq) else '' }}"
+          - "rc: {{ db19c_install_result.rc }}"
+          - "stdout: {{ db19c_install_result.stdout_lines }}"
+          - "stderr: {{ db19c_install_result.stderr_lines }}"
       when: db19c_install_check_rc == '1'
       run_once: true
 
@@ -156,6 +894,20 @@
       command: "{{ db19c_home }}/root.sh"
       register: db19c_root_sh
       changed_when: "'has already been run' not in db19c_root_sh.stdout"
+      failed_when: false
+
+    - name: Show root.sh output (this node)
+      debug:
+        msg:
+          - "Command (on {{ inventory_hostname }}): {{ db19c_home }}/root.sh"
+          - "rc: {{ db19c_root_sh.rc }}"
+          - "stdout: {{ db19c_root_sh.stdout_lines }}"
+          - "stderr: {{ db19c_root_sh.stderr_lines }}"
+
+    - name: "Fail loudly if root.sh actually failed (failed_when: false above is only so this node's output prints before a multi-node play aborts, not a silent swallow)"
+      fail:
+        msg: "root.sh failed on {{ inventory_hostname }} (rc={{ db19c_root_sh.rc }}) — see output above."
+      when: db19c_root_sh.rc != 0
 
     - name: "Check 19c DB OPatch version, update if needed (defensive — should already be current from -applyRU)"
       command: "{{ db19c_home }}/OPatch/opatch version"
@@ -164,7 +916,10 @@
 
     - name: Report 19c OPatch version
       debug:
-        msg: "OPatch in {{ db19c_home }} on {{ inventory_hostname }}: {{ db19c_opatch_version.stdout_lines[0] }}"
+        msg:
+          - "Command (on {{ inventory_hostname }}): {{ db19c_home }}/OPatch/opatch version"
+          - "rc: {{ db19c_opatch_version.rc }}"
+          - "Output: {{ db19c_opatch_version.stdout_lines }}"
 
     - name: "PAUSE — 19c DB software installed and patched. Confirm before continuing to the next node/cluster."
       pause:

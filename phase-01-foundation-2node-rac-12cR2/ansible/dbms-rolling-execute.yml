@@ -1,0 +1,50 @@
+---
+# Phase 6: the actual DBMS_ROLLING (12.2.0.1 -> 19c) execution — separate
+# top-level playbook from upgrade-19c-rolling.yml (which only covered the
+# safe groundwork: FSFO disable + 19c software install on both clusters) and
+# from site.yml, same precedent as clone-node.yml: a distinct, one-time
+# operational event against an already-live, production-representative
+# database, not part of the normal build sequence.
+#
+# Runs against rac_node1 (oradbserv05) only — even for rolling_finish, whose
+# own DBMS_ROLLING.FINISH_PLAN call has to execute against apexdb_stby (the
+# primary since rolling_switchover), not apexdb. Turned out NOT to need "a
+# genuinely different play" as an earlier version of this comment predicted:
+# delegate_to works against any inventory host regardless of this play's own
+# hosts: line — every task that needs to reach apexdb_stby (or, in
+# rolling_finish's case, apexdb itself once it's a standby) does so via
+# delegate_to a host discovered through srvctl, exactly like
+# rolling_autoupgrade and rolling_switchover already proved out in real runs.
+# One play, one hosts: line, for the whole chain.
+#
+# Covers so far (updated 2026-08-22 — the whole DBMS_ROLLING chain, INIT_PLAN
+# through FINISH_PLAN, has now been built and run for real against this
+# lab's actual apexdb/apexdb_stby pair):
+#   1. DBMS_ROLLING.INIT_PLAN (designates apexdb_stby as future_primary)
+#   2. DBMS_ROLLING.BUILD_PLAN (compiles + validates the plan)
+#   3. DBMS_ROLLING.START_PLAN (converts apexdb_stby into a transient
+#      logical standby, reduced to a single RAC instance)
+#   4. rolling_autoupgrade — AutoUpgrade against apexdb_stby
+#   5. rolling_switchover — DBMS_ROLLING.SWITCHOVER (apexdb_stby becomes the
+#      new primary; the actual point of no return — ROLLBACK_PLAN stops
+#      working once this succeeds)
+#   6. rolling_finish — remounts apexdb on the 19c home and calls
+#      DBMS_ROLLING.FINISH_PLAN (apexdb becomes a physical standby of
+#      apexdb_stby) — the last step in the chain. Also updates oracle's
+#      .bash_profile on all 4 nodes to the 19c ORACLE_HOME.
+#   7. A read-only status check (safe to run any time)
+#
+# Run with --tags, same convention as every other playbook in this project:
+#   ansible-playbook dbms-rolling-execute.yml --tags rolling_init
+#   ansible-playbook dbms-rolling-execute.yml --tags rolling_build
+#   ansible-playbook dbms-rolling-execute.yml --tags rolling_start
+#   ansible-playbook dbms-rolling-execute.yml --tags rolling_autoupgrade
+#   ansible-playbook dbms-rolling-execute.yml --tags rolling_switchover
+#   ansible-playbook dbms-rolling-execute.yml --tags rolling_finish
+#   ansible-playbook dbms-rolling-execute.yml --tags rolling_status
+
+- name: "DBMS_ROLLING orchestration — INIT_PLAN / BUILD_PLAN / status (against apexdb, current primary)"
+  hosts: rac_node1
+  gather_facts: no
+  roles:
+    - dbms_rolling_upgrade

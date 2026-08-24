@@ -13,17 +13,34 @@
 # via group_vars/standby_nodes.yml's redirection, same mechanism every other
 # per-cluster template in this project relies on.
 #
-# CAVEAT, same as db_install.rsp.j2: diff against the real db_install.rsp shipped
-# inside LINUX.X64_193000_db_home.zip before trusting the exact schema version
-# string below on a real run — not yet confirmed against this project's actual
-# staged media.
+# CONFIRMED against the real db_install.rsp shipped inside
+# LINUX.X64_193000_db_home.zip — James pulled it directly from the
+# db19c_home/install/response/db_install.rsp path on oradbserv05 (saved as
+# 19c_db_install_softwareONLY.rsp) and pasted it back 2026-08-21. Real
+# corrections came out of that diff, fixed below:
+#   1. responseFileVersion — the schema string I'd guessed
+#      (rspfmt_dbinstall_response_schema_v19.0.0) was actually correct.
+#   2. OSBACKUPDBA_GROUP/OSDGDBA_GROUP/OSKMDBA_GROUP/OSRACDBA_GROUP — I had
+#      defaulted ALL FOUR to "dba", which was wrong. The real file (and this
+#      project's own os_prep role, independently) uses the distinct
+#      backupdba/dgdba/kmdba/racdba groups — os_prep's own comment confirms
+#      these are real, already-populated groups (created by the
+#      oracle-database-preinstall-19c RPM itself), not placeholders.
+#   3. ORACLE_HOSTNAME is NOT a real key in Oracle's own DB response file
+#      template (it's a GI/SCAN-related parameter, not a DB-software one) —
+#      removed; it was never a documented risk, just dead weight that could
+#      have been silently ignored or, worse, rejected outright.
+# Kept minimal, matching this project's existing db_install.rsp.j2 style:
+# only the keys that matter for INSTALL_DB_SWONLY are included below, not
+# every starterdb.*/ASM.* key from the full stock template (those are for
+# INSTALL_DB_AND_CONFIG, not used here — DBCA/database creation happens
+# later in this phase, not as part of this software-only install).
 ################################################################################
 
 oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v19.0.0
 
 oracle.install.option=INSTALL_DB_SWONLY
 
-ORACLE_HOSTNAME={{ inventory_hostname }}.{{ domain }}
 UNIX_GROUP_NAME=oinstall
 INVENTORY_LOCATION={{ inventory_loc }}
 ORACLE_BASE={{ oracle_base }}
@@ -32,10 +49,15 @@ ORACLE_HOME={{ db19c_home }}
 oracle.install.db.InstallEdition=EE
 oracle.install.db.OSDBA_GROUP=dba
 oracle.install.db.OSOPER_GROUP=oper
-oracle.install.db.OSBACKUPDBA_GROUP=dba
-oracle.install.db.OSDGDBA_GROUP=dba
-oracle.install.db.OSKMDBA_GROUP=dba
-oracle.install.db.OSRACDBA_GROUP=dba
+oracle.install.db.OSBACKUPDBA_GROUP=backupdba
+oracle.install.db.OSDGDBA_GROUP=dgdba
+oracle.install.db.OSKMDBA_GROUP=kmdba
+oracle.install.db.OSRACDBA_GROUP=racdba
+
+oracle.install.db.rootconfig.executeRootScript=false
+oracle.install.db.rootconfig.configMethod=
+oracle.install.db.rootconfig.sudoPath=
+oracle.install.db.rootconfig.sudoUserName=
 
 oracle.install.db.CLUSTER_NODES={{ nodes | map(attribute='name') | join(',') }}
 oracle.install.db.isRACOneInstall=false

@@ -1,6 +1,6 @@
 # Application-facing TNS entries for apexdb_rw / apexdb_ro
 #
-# Written by James while debugging Section 16 (Swingbench-driven switchover
+# Written by me while debugging Section 16 (Swingbench-driven switchover
 # validation) — see part3-post-checks.md.
 #
 # Why this looks different from the DBA-facing aliases in Part 1/Part 2

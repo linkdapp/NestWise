@@ -1,0 +1,48 @@
+---
+# Phase 6 continued: post-upgrade normalization + role switchback + RMAN
+# Level 0 backup. Run this AFTER dbms-rolling-execute.yml --tags
+# rolling_finish has completed successfully and
+# maintenance/part2-finish-plan-and-troubleshooting.md §9's confirmation
+# (apexdb_stby PRIMARY/OPEN, apexdb PHYSICAL STANDBY/MOUNTED) matches reality.
+#
+# Two plays, two host groups — same shape as upgrade-19c-rolling.yml, because
+# the work genuinely spans two different targets:
+#   1. rac_node1 — supplemental logging, management policy, opening the
+#      current standby read-only+apply, log-switch test, the switchback
+#      itself (reuses dataguard_switchover_test unmodified via include_role),
+#      re-normalizing the new standby, and the RMAN Level 0 backup. All via
+#      delegate_to, same pattern as dbms-rolling-execute.yml and
+#      dataguard_switchover_test itself.
+#   2. observer_nodes (oemserver01) — re-enabling Fast-Start Failover and
+#      restarting the Observer, by reusing dataguard_fsfo's own role
+#      wholesale. Has to be its own play: dataguard_fsfo's tasks rely on the
+#      PLAY's hosts: being observer_nodes directly (no internal delegate_to,
+#      unlike dataguard_switchover_test) — same reasoning
+#      upgrade-19c-rolling.yml already applied when it added a separate
+#      observer_nodes play for rolling_upgrade_fsfo. Every task in
+#      dataguard_fsfo already checks "already enabled/running, skip" — safe
+#      to just run the whole role again as the re-enable path.
+#
+# Run with --tags, same convention as every other playbook in this project:
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade
+# (runs both plays, in order — every task in both carries this tag)
+#
+# Or narrower, if only part of this is needed:
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_normalize    (play 1: steps 1-4, pre-switchback)
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_switchback   (play 1: step 5, the actual role flip)
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_renormalize  (play 1: step 6, post-switchback)
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_backup       (play 1: step 7, RMAN Level 0)
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_fsfo         (play 2: FSFO/observer re-enable)
+
+- name: "Post-upgrade normalization + switchback + RMAN Level 0 backup (against rac_node1, delegate_to per database throughout)"
+  hosts: rac_node1
+  gather_facts: no
+  roles:
+    - rolling_postupgrade
+
+- name: "Re-enable Fast-Start Failover + restart Observer (oemserver01) — whole dataguard_fsfo role reused, fully idempotent"
+  hosts: observer_nodes
+  gather_facts: no
+  tags: [rolling_postupgrade, rolling_postupgrade_fsfo]
+  roles:
+    - dataguard_fsfo

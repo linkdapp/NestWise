@@ -117,7 +117,7 @@ for.
 | 3 | **[NestWise](nestwise-app/docs/architecture.md)** — APEX + ORDS + MongoDB hybrid application | 🟨 In progress — scaffold built, not yet deployed/run | The application itself |
 | 4 | GoldenGate Classic replication | ⬜ Planned | — |
 | 5 | Security + performance baseline (TDE, Unified Audit, AWR/ADDM) | ⬜ Planned | Hardens and tunes NestWise's backend |
-| 6 | Upgrade 12c → 19c (AutoUpgrade) | ⬜ Planned | Live upgrade with NestWise running on it |
+| 6 | [Upgrade 12c → 19c](maintenance/README.md) (DBMS_ROLLING + AutoUpgrade) | 🟩 Built | Live upgrade, near-zero downtime |
 | 7 | OEM 13.5 → 24ai + Fleet Maintenance | ⬜ Planned | Full observability of NestWise |
 | 8 | GoldenGate Classic → Microservices | ⬜ Planned | — |
 | 9 | Upgrade 19c → 26ai | ⬜ Planned | AI-native features (Vector Search, Select AI) |
@@ -142,7 +142,9 @@ Full phase detail: [`02-roadmap-skeleton.md`](02-roadmap-skeleton.md).
   - [`backup-recovery/`](backup-recovery/README.md) — ⬜ planned
   - [`performance-tuning/`](performance-tuning/README.md) — ⬜ planned
   - [`monitoring/`](monitoring/README.md) — ⬜ planned
-  - [`maintenance/`](maintenance/README.md) — ⬜ planned
+  - [`maintenance/`](maintenance/README.md) — 🟩 built:
+    [Part 1: INIT_PLAN → SWITCHOVER](maintenance/part1-dbms-rolling-plan-to-switchover.md) 🟩,
+    [Part 2: FINISH_PLAN, troubleshooting, pre-flight checklist](maintenance/part2-finish-plan-and-troubleshooting.md) 🟩
 - **`phase-NN-*/` folders** (e.g. `phase-01-foundation-2node-rac-12cR2/`) — the actual
   infrastructure-as-code (Ansible roles, silent-install response files, patch
   scripts) that builds the lab, one per roadmap phase.
@@ -163,7 +165,7 @@ Oracle-DBA-POC/
 ├── backup-recovery/                            ⬜ planned — RMAN, Data Pump
 ├── performance-tuning/                         ⬜ planned — AWR/ADDM/SQL Tuning Advisor
 ├── monitoring/                                 ⬜ planned — OEM 13.5→24ai, AHF/orachk
-├── maintenance/                                ⬜ planned — patching, AutoUpgrade, Fleet Maintenance
+├── maintenance/                                🟩 built — DBMS_ROLLING 12c→19c upgrade, 2 parts
 └── phase-01-foundation-2node-rac-12cR2/        the actual Ansible/scripts for Phase 1
     ├── README.md
     ├── docs/
@@ -192,7 +194,7 @@ Phase 0 onward.
 
 ## About
 
-Built and documented in public by James as a hands-on demonstration of Oracle DBA
+Built and documented in public by me as a hands-on demonstration of Oracle DBA
 skills at OCM depth — installation, high availability, backup/recovery, performance,
 monitoring, maintenance, and (starting Phase 3) a real application running on top of
 all of it. Not a collection of isolated demos: a living platform that gets an actual

@@ -5,8 +5,8 @@
 # production-representative database, not part of the normal build sequence.
 #
 # THIS FIRST PASS covers only the safe, fully reversible groundwork:
-#   1. Disable FSFO (required before DBMS_ROLLING.BUILD_PLAN will even succeed)
-#   2. Install the new, patched 19c DB software on BOTH clusters
+#   1. Install the new, patched 19c DB software on BOTH clusters
+#   2. Disable FSFO (required before DBMS_ROLLING.BUILD_PLAN will even succeed)
 # Nothing here touches the running 12.2.0.1 database, its dictionary, or the
 # Data Guard configuration's actual role/state. DBMS_ROLLING's own phases
 # (BUILD_PLAN / START_PLAN / the AutoUpgrade run against the transient logical
@@ -14,16 +14,33 @@
 # deliberately separate, not-yet-written playbook — built and verified only
 # after this groundwork is confirmed clean against the real environment.
 #
+# Deliberately ordered software-install-before-FSFO-disable, not the reverse:
+# disabling FSFO removes automatic failover protection for the whole window
+# it's off, and the software install/stage steps below don't touch the Data
+# Guard broker or the running database at all (different host group entirely
+# — observer_nodes vs rac_nodes/standby_nodes — no dependency either
+# direction). There's no technical reason to shrink HA coverage before it's
+# actually needed, so FSFO disable is pushed to right before the step that
+# requires it, minimizing the exposed window. James's call, and the right
+# one for a production-representative environment.
+#
 # Run with --tags to control scope, same convention as site.yml, e.g.:
-#   ansible-playbook upgrade-19c-rolling.yml --tags rolling_fsfo_disable
+#   ansible-playbook upgrade-19c-rolling.yml --tags cross_cluster_ssh_trust
 #   ansible-playbook upgrade-19c-rolling.yml --tags db19c_stage,db19c_install_software
+#   ansible-playbook upgrade-19c-rolling.yml --tags rolling_fsfo_disable
 
-- name: "Disable FSFO — required before DBMS_ROLLING.BUILD_PLAN"
-  hosts: observer_nodes
+# Optional, but recommended before db19c_stage: sets up passwordless SSH
+# (oracle@oradbserv05 -> oracle@oradbserv09 only) so the cross-cluster file
+# copy below CAN use a direct rsync push instead of routing through the
+# Ansible controller. Not yet wired into db19c_stage's own copy tasks — those
+# still use fetch+copy via the controller until this is confirmed working
+# against the real hosts. Safe to skip entirely; db19c_stage works either way.
+- name: "Set up passwordless SSH, oracle@oradbserv05 -> oracle@oradbserv09 (optional — speeds up db19c_stage's cross-cluster copy)"
+  hosts: localhost
   gather_facts: no
-  tags: [rolling_fsfo_disable]
+  tags: [cross_cluster_ssh_trust]
   roles:
-    - rolling_upgrade_fsfo
+    - cross_cluster_ssh_trust
 
 - name: "Install patched 19c DB software — primary cluster (usatclust1)"
   hosts: rac_nodes
@@ -36,3 +53,14 @@
   tags: [db19c_stage, db19c_install_software]
   roles:
     - db19c_software_install
+
+# Run this LAST, only once the software is staged on both clusters and you're
+# ready to move straight into dbms-rolling-execute.yml — this is the step
+# that actually removes automatic-failover protection until FINISH_PLAN
+# completes and FSFO is re-enabled (a later, not-yet-built step).
+- name: "Disable FSFO — required before DBMS_ROLLING.BUILD_PLAN"
+  hosts: observer_nodes
+  gather_facts: no
+  tags: [rolling_fsfo_disable]
+  roles:
+    - rolling_upgrade_fsfo

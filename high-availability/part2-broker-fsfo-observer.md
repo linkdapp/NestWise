@@ -344,7 +344,7 @@ the standby with no human triggering the failover itself. Run by hand, following
 the same separation-of-concerns reasoning as `dataguard_switchover_test`. A
 dedicated `roles/dataguard_fsfo_test` role that automates this drill the way
 `dataguard_switchover_test` automates a planned switchover **is explicitly on
-hold — James's call**, not an oversight: the mechanism itself is now proven
+hold — my call**, not an oversight: the mechanism itself is now proven
 end to end by hand, and automating the drill is deliberately deferred rather
 than treated as an immediate next step.
 
