@@ -1,3 +1,7 @@
+---
+title: "Backup & Recovery"
+---
+
 # Backup & Recovery
 
 **Status: ⬜ Planned — not built yet.** This page will hold the SOP once this phase is
