@@ -78,7 +78,7 @@
 # (runs all three plays, in order — every task in all three carries this tag)
 #
 # Or narrower, if only part of this is needed:
-#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_normalize    -e sys_password='...'   (play 1: steps 1-4, pre-switchback)
+#   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_normalize    -e sys_password='...'   (play 1: steps 0-4, pre-switchback — step 0 destroys any still-registered DBMS_ROLLING plan; --tags rolling_postupgrade_destroy_plan runs step 0 alone)
 #   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_switchback   -e sys_password='...'   (play 1: step 5, the actual role flip)
 #   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_renormalize  -e sys_password='...'   (play 1: step 6, post-switchback)
 #   ansible-playbook rolling-postupgrade.yml --tags rolling_postupgrade_fsfo                                 (play 2: FSFO/observer re-enable — no password needed, wallet-based)

@@ -17,6 +17,8 @@
 #   apexdb      — PHYSICAL STANDBY, MOUNTED (remounted by rolling_finish)
 #
 # What this role does, in order:
+#   0. Destroy the completed DBMS_ROLLING plan (DBMS_ROLLING.DESTROY_PLAN),
+#      if one is still registered. Added retroactively — see the note below.
 #   1. Disable supplemental logging on apexdb_stby (current primary) —
 #      DBMS_ROLLING turns this on for the transient-logical-standby phase
 #      and never turns it back off (Oracle's own whitepaper names this step).
@@ -32,6 +34,24 @@
 #      SQL/srvctl, not just DGMGRL's own report). This also satisfies §10
 #      step 5 ("check role-based services") — no separate task needed here.
 #   6. Re-open apexdb_stby (now standby again) read-only with apply.
+#
+# Step 0 — why it's here, added after the fact: part2-finish-plan-and-
+# troubleshooting.md §9 originally left DBMS_ROLLING.DESTROY_PLAN as a
+# deliberate, manual, human-triggered cleanup step — reasonable at the time,
+# since FINISH_PLAN completing doesn't require it. What that assessment
+# missed: Oracle's own docs are explicit that plan state "is persisted in
+# the database until you call the DESTROY_PLAN procedure" — and other
+# PL/SQL that has nothing to do with Data Guard can and does check for that
+# persisted state. Real, live evidence: standing up the NestWise app schema
+# on this same database, days after FINISH_PLAN had already completed,
+# ORDS.ENABLE_SCHEMA failed outright with ORA-20011 ("Data Guard rolling
+# upgrade is currently running") — a stale-but-still-present plan record
+# was enough to trip it, despite the upgrade being long since done. See
+# nestwise-app/docs/install.md's step 1 troubleshooting note and
+# maintenance/part2 §9/§13 for the full evidence trail. Runs first, before
+# supplemental-logging/switchback normalization, specifically so it's out
+# of the way before anything else in this role — including the switchover
+# back to the original configuration — touches these databases again.
 #
 # Fast-Start Failover re-enable (roles/rolling_postupgrade_fsfo) is NOT in
 # this role — it has to run against oemserver01 (observer_nodes), a
@@ -143,20 +163,125 @@
     or (rpu_preflight_role.results | selectattr('item.db','equalto','apexdb') | first).stdout is not search('PHYSICAL STANDBY\|')
   tags: [rolling_postupgrade]
 
-- name: "PAUSE — about to run post-upgrade normalization (supplemental logging, management policy, open apexdb read-only) then switch back to apexdb=PRIMARY / apexdb_stby=STANDBY"
+- name: "PAUSE — about to destroy the completed DBMS_ROLLING plan, then run post-upgrade normalization (supplemental logging, management policy, open apexdb read-only) then switch back to apexdb=PRIMARY / apexdb_stby=STANDBY"
   pause:
     prompt: >
       Preflight confirmed apexdb_stby database_role=PRIMARY, apexdb
       database_role=PHYSICAL STANDBY (open_mode not checked here — the next
       steps handle apexdb already being MOUNTED, READ ONLY, or READ ONLY
-      WITH APPLY idempotently). About to: disable supplemental logging on
-      apexdb_stby, reset management policy to AUTOMATIC on both, open
-      apexdb read-only with apply (if not already), log-switch test,
+      WITH APPLY idempotently). About to: destroy the completed DBMS_ROLLING
+      plan if one is still registered (DESTROY_PLAN), disable supplemental
+      logging on apexdb_stby, reset management policy to AUTOMATIC on both,
+      open apexdb read-only with apply (if not already), log-switch test,
       SWITCHOVER BACK to apexdb=PRIMARY, re-open apexdb_stby read-only with
       apply. Fast-Start Failover re-enable and the RMAN Level 0 backup run
       afterward, as separate plays. Press ENTER to continue, Ctrl+C
       then A to abort.
   tags: [rolling_postupgrade]
+
+# ============================================================================
+# Step 0 — destroy the completed DBMS_ROLLING plan, if one is still
+# registered. Check-then-act, same idiom as steps 3/6 below: query
+# dba_rolling_status for a row count first, only call DESTROY_PLAN if one is
+# actually there, so a resumed/re-run of this role against a database that's
+# already been cleaned up doesn't hit an avoidable error calling DESTROY_PLAN
+# with nothing to destroy.
+# ============================================================================
+- name: "Write SQL: count any still-registered DBMS_ROLLING plan"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/rpu_rolling_plan_check.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    content: |
+      set echo off heading off feedback off pagesize 0 linesize 200 tab off
+      select count(*) from dba_rolling_status;
+      exit;
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize, rolling_postupgrade_destroy_plan]
+
+- name: "Run: count any still-registered DBMS_ROLLING plan"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db19c_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db19c_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/rpu_rolling_plan_check.sql
+  register: rpu_rolling_plan_count
+  changed_when: false
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize, rolling_postupgrade_destroy_plan]
+
+- name: "Set fact: whether a DBMS_ROLLING plan is still registered"
+  set_fact:
+    rpu_rolling_plan_present: "{{ (rpu_rolling_plan_count.stdout | trim | int) > 0 }}"
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize, rolling_postupgrade_destroy_plan]
+
+- name: "Write SQL: DBMS_ROLLING.DESTROY_PLAN (only runs if a plan is present)"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  copy:
+    dest: "{{ staging_dir }}/sql/rpu_rolling_destroy_plan.sql"
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0644"
+    content: |
+      set echo off feedback on pagesize 100 linesize 200
+      EXEC DBMS_ROLLING.DESTROY_PLAN;
+      select count(*) as rows_remaining from dba_rolling_status;
+      exit;
+  when: rpu_rolling_plan_present
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize, rolling_postupgrade_destroy_plan]
+
+- name: "Run: DBMS_ROLLING.DESTROY_PLAN"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  shell: |
+    export ORACLE_HOME={{ db19c_home }}
+    export ORACLE_SID={{ sid_prefix }}1
+    {{ db19c_home }}/bin/sqlplus -s / as sysdba @{{ staging_dir }}/sql/rpu_rolling_destroy_plan.sql
+  register: rpu_rolling_destroy_result
+  when: rpu_rolling_plan_present
+  changed_when: rpu_rolling_plan_present
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize, rolling_postupgrade_destroy_plan]
+
+- name: "Show DBMS_ROLLING.DESTROY_PLAN output"
+  debug:
+    msg: "{{ rpu_rolling_destroy_result.stdout_lines }}"
+  when: rpu_rolling_plan_present
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize, rolling_postupgrade_destroy_plan]
+
+- name: "Fail loudly if DBMS_ROLLING.DESTROY_PLAN reported an ORA- error"
+  fail:
+    msg: >-
+      DBMS_ROLLING.DESTROY_PLAN reported an ORA- error — read the output
+      above before proceeding. Do not continue into supplemental-logging
+      normalization or the switchback with a rolling-upgrade plan still in
+      an unknown state.
+  when: rpu_rolling_plan_present and rpu_rolling_destroy_result.stdout is search('ORA-')
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize, rolling_postupgrade_destroy_plan]
+
+- name: "Report: no DBMS_ROLLING plan was registered, skipped DESTROY_PLAN"
+  debug:
+    msg: "dba_rolling_status returned 0 rows — nothing to destroy, skipped."
+  when: not rpu_rolling_plan_present
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize, rolling_postupgrade_destroy_plan]
+
+- name: "Remove DBMS_ROLLING plan-check/destroy SQL"
+  become: true
+  become_user: "{{ oracle_user }}"
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ staging_dir }}/sql/rpu_rolling_plan_check.sql"
+    - "{{ staging_dir }}/sql/rpu_rolling_destroy_plan.sql"
+  tags: [rolling_postupgrade, rolling_postupgrade_normalize, rolling_postupgrade_destroy_plan]
 
 # ============================================================================
 # Step 1 — disable supplemental logging on apexdb_stby (current primary)

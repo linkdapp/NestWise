@@ -83,7 +83,7 @@ for.
 |---|---|---|---|
 | 0/1 | [Foundation + 2-node RAC](installation/README.md) (GI 19c, DB 12.2.0.1, ASM) | 🟩 Built | The platform NestWise runs on |
 | 2 | [Data Guard](high-availability/README.md) (Active DG, Broker, Fast-Start Failover, post-checks) | 🟩 Built | HA for NestWise before it goes live |
-| 3 | **[NestWise](nestwise-app/docs/architecture.md)** — APEX + ORDS + MongoDB hybrid application | 🟨 In progress — scaffold built, not yet deployed/run | The application itself |
+| 3 | **[NestWise](nestwise-app/docs/architecture.md)** — APEX + ORDS + MongoDB hybrid application | 🟨 In progress — Oracle schema/DDL/seed data, MongoDB seed data, Node proxy, and ORDS REST modules all deployed and verified against live data; Oracle APEX 26.1 itself now installed and reachable ([`apex-server-install.md`](nestwise-app/docs/apex-server-install.md)); building the 12 application pages next | The application itself |
 | 4 | GoldenGate Classic replication | ⬜ Planned | — |
 | 5 | Security + performance baseline (TDE, Unified Audit, AWR/ADDM) | ⬜ Planned | Hardens and tunes NestWise's backend |
 | 6 | [Upgrade 12c → 19c](maintenance/README.md) (DBMS_ROLLING + AutoUpgrade) | 🟩 Built | Live upgrade, near-zero downtime |

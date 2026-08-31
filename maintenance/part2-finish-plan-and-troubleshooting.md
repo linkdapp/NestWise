@@ -12,7 +12,7 @@ tags: [dbms_rolling, dataguard, rac, upgrade, troubleshooting, srvctl, oracle-li
 
 Part 2 of 2. [Part 1](part1-dbms-rolling-plan-to-switchover.md) covers `INIT_PLAN` through `SWITCHOVER` — read that first if you're starting fresh; this page assumes `apexdb_stby` is already confirmed primary and `apexdb` is a logical standby, still on 12.2.0.1. This page covers the last step, `FINISH_PLAN`, and the real troubleshooting behind getting there — most of which a 60-second pre-flight check (§7 below) would have avoided.
 
-Status: 🟩 Confirmed — `FINISH_PLAN` completed successfully; `apexdb` is now a physical standby of `apexdb_stby`, both on 19c.
+Status: 🟩 Confirmed — `FINISH_PLAN` completed successfully; `apexdb` is now a physical standby of `apexdb_stby`, both on 19c. See §13 for a real gap found afterward: the plan's own tracked state outlived `FINISH_PLAN` and blocked unrelated work days later.
 
 | # | Section | Status |
 |---|---|---|
@@ -21,7 +21,9 @@ Status: 🟩 Confirmed — `FINISH_PLAN` completed successfully; `apexdb` is now
 | 8 | FINISH_PLAN itself, and the ORA-45414 root cause | 🟩 Confirmed (2-part root cause) |
 | 9 | Final confirmation and cleanup | 🟩 Confirmed |
 | 10 | **Post-upgrade procedure — restoring normal operations** | 🟩 Confirmed (researched, real state shown) |
-| 11 | Why this matters for an OCM-level DBA | reference |
+| 11 | Final validations manual | 🟩 Confirmed |
+| 12 | Why this matters for an OCM-level DBA | reference |
+| 13 | **Addendum — `DESTROY_PLAN` wasn't actually optional** | 🟩 Confirmed (manual fix verified live; Ansible step 0 not yet re-run end-to-end) |
 
 ---
 
@@ -236,7 +238,7 @@ The 12.2.0.1 → 19c rolling upgrade is complete: `apexdb_stby` is primary, `ape
 
 `oracle`'s `.bash_profile` `DB_HOME` was then updated to the 19c home on all four nodes (`oradbserv05/06/09/10`), with a backup of each original file kept alongside it. Already-open shells need `. ~/.bash_profile` or a fresh login to pick it up.
 
-**Deliberately left undone, not forgotten:** `DBMS_ROLLING.DESTROY_PLAN` (purges this plan's tracked state, run manually once nothing further needs it — same treatment as `ROLLBACK_PLAN` throughout this project, a human decision, not something automated blindly) and the AutoUpgrade-created guaranteed restore point on `apexdb_stby` (`DROP RESTORE POINT ...`, once confident that standalone upgrade step will never need to be flashed back).
+**Originally left undone on purpose, revised in §13:** `DBMS_ROLLING.DESTROY_PLAN` (purges this plan's tracked state) was treated here as a manual, human-triggered cleanup step with no real deadline — reasonable-sounding at the time, since `FINISH_PLAN` completing doesn't itself require it. That assessment turned out to be wrong: see §13 for the real evidence that something else genuinely needed it, and why it's now step 0 of `roles/rolling_postupgrade`, run automatically before the switchback rather than left to a human's discretion. The AutoUpgrade-created guaranteed restore point on `apexdb_stby` (`DROP RESTORE POINT ...`) remains a deliberate manual decision — nothing has surfaced a similar forcing function for it.
 
 ## 10. Post-upgrade procedure — restoring normal operations
 
@@ -343,7 +345,13 @@ SQL>
 
 ```
 
-**Worth being precise about:** Oracle's own DBMS_ROLLING documentation and whitepaper stop exactly there — `MOUNTED` with apply running is a complete, correct end state as far as `DBMS_ROLLING` itself is concerned. Everything below this point is *this project's own* operational standard (this pair has always run Active Data Guard, role-based services, and Fast-Start Failover — see [high-availability](../high-availability/README.md)), not something `FINISH_PLAN` or Oracle's docs require. Six real steps, verified against Oracle's own documentation and this project's established conventions rather than assumed:
+**Worth being precise about:** Oracle's own DBMS_ROLLING documentation and whitepaper stop exactly there — `MOUNTED` with apply running is a complete, correct end state as far as `DBMS_ROLLING` itself is concerned. Everything below this point is *this project's own* operational standard (this pair has always run Active Data Guard, role-based services, and Fast-Start Failover — see [high-availability](../high-availability/README.md)), not something `FINISH_PLAN` or Oracle's docs require. Seven real steps (an eventual step 0 included — see §13), verified against Oracle's own documentation and this project's established conventions rather than assumed:
+
+**0. Destroy the completed `DBMS_ROLLING` plan, if one is still registered.** Added after the fact — this wasn't part of the original post-upgrade procedure; §13 explains why it had to become one:
+
+```sql
+EXEC DBMS_ROLLING.DESTROY_PLAN;
+```
 
 **1. Disable supplemental logging.** The one genuinely required cleanup step Oracle's own whitepaper documents by name — `DBMS_ROLLING` enables supplemental logging for the logical-standby phase and leaves it on; it doesn't turn itself off:
 
@@ -405,7 +413,7 @@ Only one `-e` override is required — `sys_password`, which gates the switchbac
 
 Three plays, in this order, deliberately:
 
-1. **`rac_node1` (`roles/rolling_postupgrade`)** — steps 1-5 against `rac_node1` (delegate_to per database, same pattern as `dbms_rolling_upgrade` itself): disable supplemental logging, reset management policy, open `apexdb` read-only with apply, log-switch test, then the actual role flip back to `apexdb`=PRIMARY (reuses `dataguard_switchover_test` unmodified), then re-normalizes `apexdb_stby` the same way once it's standby again.
+1. **`rac_node1` (`roles/rolling_postupgrade`)** — steps 0-5 against `rac_node1` (delegate_to per database, same pattern as `dbms_rolling_upgrade` itself): destroy any still-registered `DBMS_ROLLING` plan (§13), disable supplemental logging, reset management policy, open `apexdb` read-only with apply, log-switch test, then the actual role flip back to `apexdb`=PRIMARY (reuses `dataguard_switchover_test` unmodified), then re-normalizes `apexdb_stby` the same way once it's standby again.
 2. **`observer_nodes` (`roles/rolling_postupgrade_fsfo`)** — re-enables FSFO and the observer against `oemserver01`.
 3. **`rac_node1` again (`roles/rolling_postupgrade_backup`)** — the RMAN Level 0 backup of `apexdb_stby`, taken from the standby to keep the I/O off the primary, to `/media/sf_rman_backups/apexdb1` — compressed backupset, controlfile autobackup on, backup optimization on, `PLUS ARCHIVELOG` without deleting input (a physical standby's archivelogs aren't this job's call to purge), and a `CROSSCHECK` + `RESTORE DATABASE VALIDATE` pass so the backup is verified, not just taken.
 
@@ -426,7 +434,7 @@ The backup runs **last, after FSFO re-enable**, not as the tail end of play 1 �
 
 **On AutoUpgrade `-mode postfixups`:** checked against Oracle's own AutoUpgrade documentation before recommending it either way — `postfixups` mode exists to run post-upgrade fixups *separately*, specifically when AutoUpgrade was **not** run in `deploy` mode, or when Replay Upgrade was used. Neither applies here: `rolling_autoupgrade` (Part 1 §5) already ran a full `-mode deploy`, confirmed `rc: 0` in the real captured output. Fixups are part of what `deploy` mode already does. Running `postfixups` again isn't expected to be necessary — worth confirming against the AutoUpgrade job's own summary/log before spending time on it, rather than running it defensively on the assumption it's required.
 
-Already covered in §9 above and still the right call: `DBMS_ROLLING.DESTROY_PLAN` and dropping the AutoUpgrade guaranteed restore point are separate, deliberate, human-triggered decisions — not part of this list.
+`DBMS_ROLLING.DESTROY_PLAN` is no longer in that "separate, deliberate, human-triggered" category — see §9's revision and §13 below for why. Dropping the AutoUpgrade guaranteed restore point remains one.
 
 ## 11. Final validations manual
 
@@ -562,6 +570,54 @@ oradbserv09-oracle-apexdb1$
 ## 12. Why this matters for an OCM-level DBA
 
 Anyone can follow a checklist when nothing goes wrong. What actually separates OCM-level troubleshooting from guesswork here: every fix in this page traces to a *specific, checked* piece of evidence — a real error code looked up against Oracle's own reference, a dictionary view queried before concluding what state something was actually in, a file read directly instead of trusting an indirect test. The `TNS_ADMIN`-doesn't-follow-`ORACLE_HOME` trap in particular is the kind of thing that costs hours precisely because every individual test *looks* like it passed. Rolling upgrades, resumability, and CRS-registration mechanics are squarely on the OCM practical blueprint's database/network configuration and high-availability areas — and a hiring manager reading this gets to see the actual debugging trail, not just the final green checkmark.
+
+## 13. 🟩 Addendum — `DESTROY_PLAN` wasn't actually optional
+
+Written up days after §9/§10 above, once real evidence forced a revision of a call made in good faith at the time.
+
+**What happened.** Standing up the NestWise application schema against this same database — completely unrelated to Data Guard or rolling upgrades on the surface — `ORDS.ENABLE_SCHEMA` failed:
+
+```sql
+BEGIN
+    ORDS.ENABLE_SCHEMA(...);
+END;
+/
+-- ERROR at line 1:
+-- ORA-20011: Data Guard rolling upgrade is currently running. Please try again later.
+-- ORA-06512: at "ORDS_METADATA.ORDS", line 183
+-- ORA-06512: at "ORDS_METADATA.ORDS_SECURITY_INTERNAL", line 206
+```
+
+The upgrade had genuinely finished two days earlier — `dba_rolling_status` showed `STATUS=READY`, `PHASE=DONE`, and `dba_rolling_events` recorded `DBMS_ROLLING.FINISH_PLAN completed` as its last real event. Nothing was mid-switchover. The error message is misleading taken at face value.
+
+**Root cause, confirmed against Oracle's own docs, not guessed:** *Using DBMS_ROLLING to Perform a Rolling Upgrade* states plainly that "plan parameters are persisted in the database until you call the `DESTROY_PLAN` procedure to remove all states related to the rolling upgrade." `FINISH_PLAN` finishing the upgrade and `DESTROY_PLAN` purging its bookkeeping are two separate, sequential steps — §9 originally deferred the second one indefinitely on the theory that nothing depended on it. Something did: `ORDS_METADATA.ORDS_SECURITY_INTERNAL` checks for *any* persisted rolling-upgrade plan record before letting schema-metadata operations proceed, regardless of that plan's actual `STATUS`/`PHASE`.
+
+**The fix — confirmed working:**
+
+```sql
+EXEC DBMS_ROLLING.DESTROY_PLAN;
+```
+
+`DESTROY_PLAN` takes no parameters and is the documented cleanup call for a plan that's already finished — safe to run any time after `FINISH_PLAN` has completed, which is exactly the state this pair has been in since §9. Confirmed, real output:
+
+```sql
+SQL> EXEC DBMS_ROLLING.DESTROY_PLAN;
+PL/SQL procedure successfully completed.
+SQL> SELECT * FROM dba_rolling_status;
+no rows selected
+```
+
+Empty `dba_rolling_status` is the actual proof this worked — not the "successfully completed" message alone, same non-trusting-the-happy-message discipline as §9's own role/state checks.
+
+**What changed as a result:**
+
+- `roles/rolling_postupgrade/tasks/main.yml` gained a new step 0 (tag `rolling_postupgrade_destroy_plan`): check `dba_rolling_status` for a still-registered plan, and if one's there, destroy it — before supplemental-logging normalization, before the switchback, before anything else in that role touches these databases again. Check-then-act, same idiom as the role's other idempotent steps, so re-running it against an already-cleaned-up database is a no-op, not an error.
+- §9 above no longer describes `DESTROY_PLAN` as an indefinitely-deferred manual decision.
+- `nestwise-app/docs/install.md` step 1 carries a matching troubleshooting note (this exact `ORA-20011`, plus the related `ORA-06598` INHERIT PRIVILEGES issue hit in the same session) for anyone hitting this from the NestWise side rather than the maintenance side.
+
+**Not yet re-verified end-to-end:** the fix above was applied manually, once, directly against the live database (this upgrade cycle's `rolling_postupgrade` Ansible run had already completed before this was discovered, so the new step 0 didn't get to run for it). The role change itself hasn't been exercised by an actual Ansible run yet — worth doing on the next rolling upgrade this project performs, rather than assumed correct off the code alone.
+
+**Why this matters for an OCM-level DBA:** a "finished" Data Guard operation and a "fully cleaned up" one are not the same state, and Oracle's own object model treats that distinction as meaningful — enough that unrelated PL/SQL, written by an entirely different team (ORDS), checks for it. Deferring a documented cleanup step because "nothing needs it yet" is a reasonable call under uncertainty, but it's a call that has to be revisited the moment new evidence shows up, not defended after the fact. That's the difference between a checklist followed once and an operational standard that actually holds up.
 
 ---
 
