@@ -169,7 +169,7 @@ Budget real time for this — it's a Java project, not a config change.
 
 ## What to do with the numbers
 
-Record results in `loadtest/swingbench/results.md` per `workload_notes.md`'s
+Record results in [`../results.md`](../results.md) per `workload_notes.md`'s
 format (transaction × avg × p95 × throughput, at each concurrency step), plus
 the `gv$session` distribution at each step. One sentence on where the knee
 appeared matters more than the absolute numbers — a 28-neighborhood demo schema

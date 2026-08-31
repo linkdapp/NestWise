@@ -69,7 +69,7 @@ sleep 300
 kill $(jobs -p)
 ```
 
-Measure the same shape of numbers (response time avg/p95, error rate) so the write-up is one combined table, not two disconnected reports — see `results.md` (create alongside this file after a real run) for the format.
+Measure the same shape of numbers (response time avg/p95, error rate) so the write-up is one combined table, not two disconnected reports. Real results live in [`../results.md`](../results.md), one directory up, because both load generators write to it.
 
 ## Index recommendations (specific to NestWise's actual query patterns)
 
@@ -88,4 +88,4 @@ Measure the same shape of numbers (response time avg/p95, error rate) so the wri
 
 ## Write-up
 
-After a real run, record results as a table (transaction/endpoint × avg response time × p95 × throughput) at 10/50/100 concurrent users in a `loadtest/swingbench/results.md`, with one sentence on where the knee appeared and which index change (if any) moved it. This belongs with the technical deliverables, not the demo script — load-test numbers are a detail for the Oracle-developer audience reading the docs, not part of the live click-through (see `docs/demo-script.md`).
+After a real run, record results as a table (transaction/endpoint × avg response time × p95 × throughput) at each concurrency step in [`../results.md`](../results.md), with one sentence on where the knee appeared and which index change (if any) moved it. This belongs with the technical deliverables, not the demo script: load-test numbers are a detail for the Oracle-developer audience reading the docs, not part of the live click-through (see `docs/demo-script.md`).

@@ -44,7 +44,7 @@
           DECLARE
             v_cursor SYS_REFCURSOR;
           BEGIN
-            v_cursor := nbhd_pkg.list_neighborhoods(p_city => 'San Francisco', p_search => NULL);
+            v_cursor := nbhd_pkg.list_neighborhoods(p_city => 'Washington', p_search => NULL);
             CLOSE v_cursor;
           END;
         ]]>
@@ -58,12 +58,12 @@
           DECLARE
             v_cursor SYS_REFCURSOR;
           BEGIN
-            v_cursor := nbhd_pkg.list_neighborhoods(p_city => 'San Francisco', p_search => :search_term);
+            v_cursor := nbhd_pkg.list_neighborhoods(p_city => 'Washington', p_search => :search_term);
             CLOSE v_cursor;
           END;
         ]]>
-        <!-- :search_term drawn at runtime from a small pool: 'Mission','Hayes',
-             'North','SoMa','Castro','Noe','Richmond','Marina' -->
+        <!-- :search_term drawn at runtime from a small pool: 'Georgetown','Dupont',
+             'Capitol','Adams','Logan','Navy','Penn','Mount' -->
       </SQLStatement>
     </Transaction>
 

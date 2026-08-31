@@ -250,5 +250,5 @@ per second, p95 and p99 latency per transaction group, error rate, and the
 `gv$session` distribution across both RAC instances.
 
 The k6 summary gives you the first three directly; `--summary-export` writes them
-as JSON so you can paste real numbers into `loadtest/swingbench/results.md`
+as JSON so you can paste real numbers into [`../results.md`](../results.md)
 rather than transcribing from a terminal.
