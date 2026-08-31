@@ -194,6 +194,8 @@ action attributable to a real person in `/var/log/secure`.
 ```bash
 useradd -m -c "mongodba - DBA" mongodba
 passwd mongodba
+usermod -aG mongodba,mongod,vboxsf mongodba
+
 ```
 
 **Give `mongod` a real shell.** The package default (`/bin/false`) actively blocks the exact

@@ -1,8 +1,19 @@
 # NestWise — Load testing (Swingbench + hybrid)
 
+> **See also: `loadtest/k6/` — the path actually taken.** Swingbench cannot drive
+> NestWise's own SQL without Java or PL/SQL transaction classes (see the
+> correction below). k6 driving the **ORDS REST layer** produces the same
+> database workload with no custom code, because those handlers call the same
+> PL/SQL packages the APEX pages call. `loadtest/k6/nestwise_ords.js` implements
+> the exact transaction mix specified in this file. Swingbench's bundled SOE
+> benchmark remains useful as a cluster-ceiling reference, and this file's
+> "what to measure" and index sections apply to either generator.
+
 ## Which of the three realistic paths, and why
 
-Swingbench ships **prebuilt benchmarks with matching data generators** (SOE, SH, Calling Circle) — it is not a wizard that inspects an arbitrary schema like NestWise's and auto-generates matching transactions. Hand-authoring a custom Swingbench benchmark XML against `db/oracle/` is the only path that produces load numbers tied to NestWise's actual hot paths, and since the entire point of this app is to validate the RAC cluster with a real, app-specific workload (not a generic one), **that is the path this deliverable takes**: a custom Swingbench XML (`sample_config.xml`) with `Transaction` elements wrapping NestWise's actual queries. This is more setup than running SOE as-is, but a generic OLTP number ("SOE does N tps") wouldn't say anything about whether *NestWise's* filter queries or the recommendation heuristic are the RAC-load bottleneck — and that's the number worth having.
+Swingbench ships **prebuilt benchmarks with matching data generators** (SOE, SH, Calling Circle) — it is not a wizard that inspects an arbitrary schema like NestWise's and auto-generates matching transactions. Producing load numbers tied to NestWise's actual hot paths therefore means authoring a custom benchmark, and since the entire point of this app is to validate the RAC cluster with a real, app-specific workload (not a generic one), that's the direction this deliverable points. A generic OLTP number ("SOE does N tps") wouldn't say anything about whether *NestWise's* filter queries or the recommendation heuristic are the RAC-load bottleneck — and that's the number worth having.
+
+> **Correction (added after actually reading Swingbench's docs and distribution):** an earlier version of this section said the custom path was "a custom Swingbench XML (`sample_config.xml`) with `Transaction` elements wrapping NestWise's actual queries." **That is wrong and would not run.** Swingbench's XML configures connections, user counts, think time, and *which transaction classes to run* — it cannot contain SQL. Custom transactions are either **Java classes** extending `JdbcTaskImpl` (source and an `ant` build script ship in `$SWINGHOME/source`) or a rewrite of the **PL/SQL stored procedure** behind Swingbench's shipped "blank" benchmark. The transaction table below is still the right specification of *what* to implement — it just describes Java/PL/SQL to be written, not XML. Concrete, verified setup and run instructions for all three paths (quick RAC check, bundled SOE, custom benchmark) are in [`README-swingbench.md`](README-swingbench.md).
 
 As a fast sanity check *before* investing time in the custom XML, it is still worth running the bundled **SOE** benchmark once against a separate schema on the same RAC service, purely to characterize the cluster's general OLTP ceiling (baseline tps, interconnect behavior) independent of NestWise's schema. Treat that number as a ceiling reference, not a NestWise result — it's noted here so nobody mistakes it for one.
 
