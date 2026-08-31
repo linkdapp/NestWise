@@ -11,7 +11,7 @@ const { connect } = require('../db');
 // into one summary the tile can show at a glance.
 router.get('/current', async (req, res) => {
     const db = await connect();
-    const city = req.query.city || 'San Francisco';
+    const city = req.query.city || 'Washington';
 
     const latestPerNeighborhood = await db.collection('weather_snapshots')
         .aggregate([

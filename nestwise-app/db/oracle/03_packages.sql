@@ -4,6 +4,9 @@
 -- scattered across APEX page processes, so it's testable and reusable from
 -- ORDS. Deliberately not a generic data-access layer — only the operations
 -- the pages actually call.
+--
+-- Seed data targets Washington, D.C. (28 neighborhoods, 87 restaurants,
+-- 14 theaters). See admin_pkg.reload_oracle_seed_data.
 -- =============================================================================
 
 -- =============================================================================
@@ -96,14 +99,27 @@ CREATE OR REPLACE PACKAGE BODY nbhd_pkg AS
         p_app_user          IN VARCHAR2,
         p_neighborhood_id   IN NUMBER
     ) IS
+        v_count NUMBER;
     BEGIN
-        MERGE INTO user_favorites uf
-        USING (SELECT p_app_user AS app_user, p_neighborhood_id AS neighborhood_id FROM dual) src
-        ON (uf.app_user = src.app_user AND uf.neighborhood_id = src.neighborhood_id)
-        WHEN NOT MATCHED THEN
-            INSERT (app_user, neighborhood_id) VALUES (src.app_user, src.neighborhood_id)
-        WHEN MATCHED THEN
-            DELETE; -- toggling: second click un-favorites
+        -- Not a MERGE: MERGE's DELETE clause is only valid as a sub-clause of
+        -- WHEN MATCHED THEN UPDATE (it deletes the row the UPDATE just
+        -- touched, with its own WHERE) — a bare `WHEN MATCHED THEN DELETE;`
+        -- is not valid MERGE syntax (confirmed against a real compile:
+        -- ORA-00905, "missing keyword"). A plain existence check + branch is
+        -- the correct way to express toggle semantics.
+        SELECT COUNT(*) INTO v_count
+        FROM user_favorites
+        WHERE app_user = p_app_user
+          AND neighborhood_id = p_neighborhood_id;
+
+        IF v_count > 0 THEN
+            DELETE FROM user_favorites
+            WHERE app_user = p_app_user
+              AND neighborhood_id = p_neighborhood_id;
+        ELSE
+            INSERT INTO user_favorites (app_user, neighborhood_id)
+            VALUES (p_app_user, p_neighborhood_id);
+        END IF;
         COMMIT;
     END toggle_favorite;
 
@@ -145,10 +161,38 @@ CREATE OR REPLACE PACKAGE restaurant_pkg AS
     -- select list without hardcoding values in APEX.
     FUNCTION list_cuisines RETURN SYS_REFCURSOR;
 
+    -- Maps '$'.. '$$$$' to 1..4 so budget comparisons are numeric. Declared
+    -- here (not just in the body) for a real, confirmed reason, not style:
+    -- recommend_for_user calls it from inside a SQL SELECT, and Oracle does
+    -- not allow a SQL statement — even one embedded in the same package's
+    -- own body — to call a function that's private (body-only). Confirmed
+    -- against a real compile: PLS-00231, unaffected by reordering the body,
+    -- resolved only once this was added to the spec. Same reasoning this
+    -- project already applied to nbhd_pkg.is_favorited.
+    FUNCTION price_rank(p_price_range IN VARCHAR2) RETURN NUMBER;
+
 END restaurant_pkg;
 /
 
 CREATE OR REPLACE PACKAGE BODY restaurant_pkg AS
+
+    -- Helper: maps '$'.. '$$$$' to 1..4 so budget comparisons are numeric.
+    -- Defined first, ahead of any subprogram that calls it from inside a SQL
+    -- statement — a package body compiles top-down, and a private function
+    -- called from SQL by an earlier subprogram must already be defined by
+    -- that point, or the compile fails with PLS-00231 ("function ... may not
+    -- be used in SQL"), confirmed against a real compile of an earlier
+    -- version of this file that defined price_rank last.
+    FUNCTION price_rank(p_price_range IN VARCHAR2) RETURN NUMBER IS
+    BEGIN
+        RETURN CASE p_price_range
+                   WHEN '$'    THEN 1
+                   WHEN '$$'   THEN 2
+                   WHEN '$$$'  THEN 3
+                   WHEN '$$$$' THEN 4
+                   ELSE 2
+               END;
+    END price_rank;
 
     FUNCTION search(
         p_neighborhood_id  IN NUMBER   DEFAULT NULL,
@@ -215,18 +259,6 @@ CREATE OR REPLACE PACKAGE BODY restaurant_pkg AS
         RETURN v_cursor;
     END recommend_for_user;
 
-    -- Helper: maps '$'.. '$$$$' to 1..4 so budget comparisons are numeric.
-    FUNCTION price_rank(p_price_range IN VARCHAR2) RETURN NUMBER IS
-    BEGIN
-        RETURN CASE p_price_range
-                   WHEN '$'    THEN 1
-                   WHEN '$$'   THEN 2
-                   WHEN '$$$'  THEN 3
-                   WHEN '$$$$' THEN 4
-                   ELSE 2
-               END;
-    END price_rank;
-
     FUNCTION list_cuisines RETURN SYS_REFCURSOR IS
         v_cursor SYS_REFCURSOR;
     BEGIN
@@ -277,7 +309,8 @@ CREATE OR REPLACE PACKAGE prefs_pkg AS
         p_app_user           IN VARCHAR2,
         p_preferred_cuisine  IN VARCHAR2,
         p_budget_price_range IN VARCHAR2,
-        p_weather_preference IN VARCHAR2
+        p_weather_preference IN VARCHAR2,
+        p_min_rating         IN NUMBER DEFAULT 0
     );
 
 END prefs_pkg;
@@ -289,7 +322,7 @@ CREATE OR REPLACE PACKAGE BODY prefs_pkg AS
         v_cursor SYS_REFCURSOR;
     BEGIN
         OPEN v_cursor FOR
-            SELECT preferred_cuisine, budget_price_range, weather_preference
+            SELECT preferred_cuisine, budget_price_range, weather_preference, min_rating
             FROM user_preferences
             WHERE app_user = p_app_user;
         RETURN v_cursor;
@@ -299,7 +332,8 @@ CREATE OR REPLACE PACKAGE BODY prefs_pkg AS
         p_app_user           IN VARCHAR2,
         p_preferred_cuisine  IN VARCHAR2,
         p_budget_price_range IN VARCHAR2,
-        p_weather_preference IN VARCHAR2
+        p_weather_preference IN VARCHAR2,
+        p_min_rating         IN NUMBER DEFAULT 0
     ) IS
     BEGIN
         MERGE INTO user_preferences up
@@ -309,10 +343,11 @@ CREATE OR REPLACE PACKAGE BODY prefs_pkg AS
             UPDATE SET preferred_cuisine  = p_preferred_cuisine,
                        budget_price_range = p_budget_price_range,
                        weather_preference = p_weather_preference,
+                       min_rating         = NVL(p_min_rating, 0),
                        updated_at         = SYSTIMESTAMP
         WHEN NOT MATCHED THEN
-            INSERT (app_user, preferred_cuisine, budget_price_range, weather_preference)
-            VALUES (p_app_user, p_preferred_cuisine, p_budget_price_range, p_weather_preference);
+            INSERT (app_user, preferred_cuisine, budget_price_range, weather_preference, min_rating)
+            VALUES (p_app_user, p_preferred_cuisine, p_budget_price_range, p_weather_preference, NVL(p_min_rating, 0));
         COMMIT;
     END save_preferences;
 
@@ -321,8 +356,9 @@ END prefs_pkg;
 
 -- =============================================================================
 -- ADMIN_PKG — Admin / Seed Data page
--- Reload procedure mirrors db/oracle/99_seed_data.sql exactly so the "Reload
--- Seed Data" button in APEX and a fresh install produce the same dataset.
+-- Reload procedure is the single source of truth for Oracle seed rows so the
+-- "Reload Seed Data" button in APEX and a fresh install produce the same
+-- dataset. Targets Washington, D.C.
 -- =============================================================================
 CREATE OR REPLACE PACKAGE admin_pkg AS
 
@@ -332,7 +368,14 @@ CREATE OR REPLACE PACKAGE admin_pkg AS
     FUNCTION get_dashboard_counts RETURN SYS_REFCURSOR;
 
     -- Deletes and re-inserts all Oracle seed rows. Idempotent — safe to run
-    -- repeatedly from the Admin page between demo runs.
+    -- repeatedly from the Admin page between demo runs. NOTE: because
+    -- neighborhood_id/restaurant_id/theater_id are IDENTITY columns and this
+    -- procedure DELETEs rather than drops/recreates the tables, re-running
+    -- it against a non-empty schema does NOT reproduce the same IDs (the
+    -- sequence keeps counting up) — the MongoDB seed data's neighborhood_id
+    -- join values only match a genuinely fresh install. Same documented
+    -- caveat as before, now against 28 IDs instead of 8 — see
+    -- db/mongodb/schema_notes.md.
     PROCEDURE reload_oracle_seed_data;
 
     -- Returns the current city setting used to filter every page.
@@ -365,7 +408,7 @@ CREATE OR REPLACE PACKAGE BODY admin_pkg AS
         RETURN v_city;
     EXCEPTION
         WHEN NO_DATA_FOUND THEN
-            RETURN 'San Francisco';
+            RETURN 'Washington';
     END get_current_city;
 
     PROCEDURE reload_oracle_seed_data IS
@@ -377,95 +420,388 @@ CREATE OR REPLACE PACKAGE BODY admin_pkg AS
         DELETE FROM neighborhoods;
         COMMIT;
 
-        -- Delegate to the same statements as 99_seed_data.sql. Kept inline
-        -- (not dynamic SQL against the .sql file) so this package has no
-        -- filesystem dependency and can run identically from an APEX button.
-        INSERT INTO neighborhoods (name, city, description, latitude, longitude) VALUES
-            ('Mission District', 'San Francisco', 'Murals, taquerias, and Dolores Park.', 37.7599, -122.4148);
-        INSERT INTO neighborhoods (name, city, description, latitude, longitude) VALUES
-            ('Hayes Valley', 'San Francisco', 'Boutique shops and a walkable, leafy core.', 37.7759, -122.4245);
-        INSERT INTO neighborhoods (name, city, description, latitude, longitude) VALUES
-            ('North Beach', 'San Francisco', 'Italian cafes, City Lights Books, and jazz clubs.', 37.8060, -122.4103);
-        INSERT INTO neighborhoods (name, city, description, latitude, longitude) VALUES
-            ('SoMa', 'San Francisco', 'Museums, tech offices, and Oracle Park nearby.', 37.7785, -122.4056);
-        INSERT INTO neighborhoods (name, city, description, latitude, longitude) VALUES
-            ('Castro', 'San Francisco', 'Historic LGBTQ+ neighborhood with classic theaters.', 37.7609, -122.4350);
-        INSERT INTO neighborhoods (name, city, description, latitude, longitude) VALUES
-            ('Noe Valley', 'San Francisco', 'Sunny, family-friendly, and quiet compared to downtown.', 37.7502, -122.4337);
-        INSERT INTO neighborhoods (name, city, description, latitude, longitude) VALUES
-            ('Richmond District', 'San Francisco', 'Foggy, dense with Asian eateries, near Golden Gate Park.', 37.7806, -122.4644);
-        INSERT INTO neighborhoods (name, city, description, latitude, longitude) VALUES
-            ('Marina District', 'San Francisco', 'Waterfront views and upscale brunch spots.', 37.8030, -122.4377);
+        -- -------------------------------------------------------------------
+        -- Neighborhoods (28) — Washington, D.C.
+        --
+        -- neighborhood_id is inserted EXPLICITLY, not generated. This is the
+        -- fix for the cross-database ID drift documented in
+        -- db/mongodb/schema_notes.md: MongoDB's listings/weather_snapshots/
+        -- mflix_movies all reference these integers as their join key, so they
+        -- must be stable across reloads. When this column was
+        -- GENERATED ALWAYS AS IDENTITY, every DELETE+INSERT cycle here left the
+        -- sequence untouched and produced a fresh, higher range (1-28 -> 9-36 ->
+        -- ...), silently breaking every Mongo-backed region. IDs below match
+        -- schema_notes.md's table exactly and must stay in sync with it.
+        --
+        -- restaurants/theaters below resolve neighborhood_id by name lookup, so
+        -- they need no changes and stay correct regardless.
+        -- -------------------------------------------------------------------
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (1, 'Georgetown', 'Washington', 'Historic waterfront neighborhood with cobblestone streets, high-end shopping, and the C&O Canal.', 38.9094, -77.0650);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (2, 'Capitol Hill', 'Washington', 'Home of the U.S. Capitol, Supreme Court, and Eastern Market; dense with 19th-century rowhouses.', 38.8860, -76.9995);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (3, 'Dupont Circle', 'Washington', 'Walkable hub of embassies, bookstores, and nightlife around the famous traffic circle.', 38.9096, -77.0434);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (4, 'Adams Morgan', 'Washington', 'Eclectic, international nightlife and dining corridor along 18th Street NW.', 38.9226, -77.0427);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (5, 'Columbia Heights', 'Washington', 'Diverse, rapidly evolving neighborhood centered on 14th Street and the DC USA complex.', 38.9257, -77.0294);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (6, 'U Street / Shaw', 'Washington', 'Historic African American cultural corridor with jazz history, murals, and a booming restaurant scene.', 38.9170, -77.0270);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (7, 'Logan Circle', 'Washington', 'Victorian architecture, 14th Street dining, and a lively LGBTQ+ community.', 38.9096, -77.0296);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (8, 'Navy Yard / Capitol Riverfront', 'Washington', 'Waterfront redevelopment around Nationals Park with new restaurants, parks, and views of the Anacostia.', 38.8765, -77.0075);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (9, 'Foggy Bottom', 'Washington', 'Home to George Washington University, the State Department, and the Kennedy Center.', 38.9000, -77.0500);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (10, 'Penn Quarter / Chinatown', 'Washington', 'Downtown entertainment district with Capital One Arena, museums, and a classic Chinatown arch.', 38.8990, -77.0210);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (11, 'Mount Pleasant', 'Washington', 'Leafy, international enclave known for its Latin American community and Mount Pleasant Street.', 38.9312, -77.0406);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (12, 'Cleveland Park', 'Washington', 'Quiet, residential neighborhood near the National Zoo and Washington National Cathedral.', 38.9360, -77.0580);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (13, 'Woodley Park', 'Washington', 'Elegant residential area adjacent to the National Zoo and Rock Creek Park.', 38.9280, -77.0520);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (14, 'Petworth', 'Washington', 'Emerging residential neighborhood with a growing restaurant row along Georgia Avenue.', 38.9500, -77.0250);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (15, 'Brookland', 'Washington', 'Tree-lined streets, the Basilica of the National Shrine, and a quiet residential feel.', 38.9300, -76.9900);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (16, 'H Street NE / Atlas District', 'Washington', 'Vibrant nightlife and dining corridor east of Union Station.', 38.9000, -76.9900);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (17, 'Anacostia', 'Washington', 'Historic neighborhood east of the Anacostia River with strong community roots and waterfront parks.', 38.8630, -76.9830);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (18, 'Southwest Waterfront / The Wharf', 'Washington', 'Modern waterfront destination with concert venues, piers, and a dense restaurant scene.', 38.8800, -77.0250);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (19, 'NoMa', 'Washington', 'Rapidly developing area north of Union Station with new apartments, parks, and food halls.', 38.9070, -77.0050);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (20, 'Bloomingdale', 'Washington', 'Quiet residential neighborhood known for its Victorian homes and community gardens.', 38.9150, -77.0120);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (21, 'LeDroit Park', 'Washington', 'Historic African American neighborhood adjacent to Howard University.', 38.9200, -77.0150);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (22, 'Glover Park', 'Washington', 'Residential neighborhood west of Georgetown near Glover-Archbold Park.', 38.9220, -77.0800);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (23, 'Tenleytown', 'Washington', 'Northwest neighborhood with American University nearby and a mix of residential and commercial streets.', 38.9480, -77.0800);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (24, 'Friendship Heights', 'Washington', 'Upscale shopping and residential area on the Maryland border.', 38.9600, -77.0850);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (25, 'Congress Heights', 'Washington', 'Southeast neighborhood with community institutions and proximity to St. Elizabeths.', 38.8400, -76.9900);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (26, 'Deanwood', 'Washington', 'Quiet residential neighborhood in far Northeast D.C.', 38.9100, -76.9300);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (27, 'Barracks Row', 'Washington', 'Historic commercial corridor on 8th Street SE near the Marine Barracks and Eastern Market.', 38.8800, -76.9950);
+        INSERT INTO neighborhoods (neighborhood_id, name, city, description, latitude, longitude) VALUES
+            (28, 'West End', 'Washington', 'Upscale residential and hotel district between Foggy Bottom and Georgetown.', 38.9050, -77.0500);
         COMMIT;
 
-        -- restaurants: 3-4 per neighborhood, varied cuisine/price/rating
+        -- -------------------------------------------------------------------
+        -- Restaurants (87)
+        -- -------------------------------------------------------------------
+        -- Georgetown
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'La Taqueria Real', 'Mexican', '$', 4.6, 37.7595, -122.4149 FROM neighborhoods WHERE name = 'Mission District';
+            SELECT neighborhood_id, 'Filomena Ristorante', 'Italian', '$$$', 4.4, 38.9045, -77.0620 FROM neighborhoods WHERE name = 'Georgetown';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Foreign Cinema', 'American', '$$$', 4.4, 37.7562, -122.4198 FROM neighborhoods WHERE name = 'Mission District';
+            SELECT neighborhood_id, 'Farmers Fishers Bakers', 'American', '$$', 4.2, 38.9010, -77.0600 FROM neighborhoods WHERE name = 'Georgetown';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Bi-Rite Creamery', 'Dessert', '$', 4.7, 37.7614, -122.4256 FROM neighborhoods WHERE name = 'Mission District';
+            SELECT neighborhood_id, 'Cafe Milano', 'Italian', '$$$$', 4.5, 38.9055, -77.0635 FROM neighborhoods WHERE name = 'Georgetown';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Rintaro', 'Japanese', '$$$', 4.5, 37.7656, -122.4211 FROM neighborhoods WHERE name = 'Mission District';
+            SELECT neighborhood_id, 'Martin''s Tavern', 'American', '$$', 4.3, 38.9060, -77.0655 FROM neighborhoods WHERE name = 'Georgetown';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'La Chaumiere', 'French', '$$$', 4.4, 38.9050, -77.0610 FROM neighborhoods WHERE name = 'Georgetown';
 
+        -- Capitol Hill
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Rich Table', 'American', '$$$$', 4.6, 37.7726, -122.4230 FROM neighborhoods WHERE name = 'Hayes Valley';
+            SELECT neighborhood_id, 'Tunnicliff''s Tavern', 'American', '$$', 4.1, 38.8865, -76.9950 FROM neighborhoods WHERE name = 'Capitol Hill';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Souvla', 'Greek', '$$', 4.5, 37.7764, -122.4243 FROM neighborhoods WHERE name = 'Hayes Valley';
+            SELECT neighborhood_id, 'Rose''s Luxury', 'American', '$$$$', 4.7, 38.8800, -76.9955 FROM neighborhoods WHERE name = 'Capitol Hill';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Absinthe Brasserie', 'French', '$$$', 4.2, 37.7770, -122.4238 FROM neighborhoods WHERE name = 'Hayes Valley';
+            SELECT neighborhood_id, 'Pascual', 'Mexican', '$$$', 4.6, 38.8850, -76.9980 FROM neighborhoods WHERE name = 'Capitol Hill';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Good Stuff Eatery', 'American', '$', 4.3, 38.8870, -76.9960 FROM neighborhoods WHERE name = 'Capitol Hill';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Ted''s Bulletin', 'American', '$$', 4.2, 38.8840, -76.9940 FROM neighborhoods WHERE name = 'Capitol Hill';
 
+        -- Dupont Circle
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Tony''s Pizza Napoletana', 'Italian', '$$', 4.5, 37.8064, -122.4098 FROM neighborhoods WHERE name = 'North Beach';
+            SELECT neighborhood_id, 'Tabard Inn Restaurant', 'American', '$$$', 4.5, 38.9090, -77.0400 FROM neighborhoods WHERE name = 'Dupont Circle';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Molinari Delicatessen', 'Italian', '$', 4.6, 37.7986, -122.4079 FROM neighborhoods WHERE name = 'North Beach';
+            SELECT neighborhood_id, 'Kramerbooks & Afterwords Cafe', 'Cafe', '$$', 4.3, 38.9100, -77.0430 FROM neighborhoods WHERE name = 'Dupont Circle';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Caffe Trieste', 'Cafe', '$', 4.3, 37.8010, -122.4110 FROM neighborhoods WHERE name = 'North Beach';
+            SELECT neighborhood_id, 'Duke''s Grocery', 'British', '$$', 4.4, 38.9110, -77.0420 FROM neighborhoods WHERE name = 'Dupont Circle';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Boogy & Peel', 'Pizza', '$', 4.2, 38.9085, -77.0415 FROM neighborhoods WHERE name = 'Dupont Circle';
 
+        -- Adams Morgan
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'The Cheese School', 'American', '$$', 4.1, 37.7724, -122.4028 FROM neighborhoods WHERE name = 'SoMa';
+            SELECT neighborhood_id, 'Tail Up Goat', 'Mediterranean', '$$$', 4.6, 38.9210, -77.0420 FROM neighborhoods WHERE name = 'Adams Morgan';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Bar Agricole', 'American', '$$$', 4.4, 37.7719, -122.4092 FROM neighborhoods WHERE name = 'SoMa';
+            SELECT neighborhood_id, 'Lucky Buns', 'American', '$$', 4.4, 38.9220, -77.0430 FROM neighborhoods WHERE name = 'Adams Morgan';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Sushi Zone', 'Japanese', '$$', 4.3, 37.7790, -122.4030 FROM neighborhoods WHERE name = 'SoMa';
+            SELECT neighborhood_id, 'Lapis', 'Afghan', '$$', 4.5, 38.9230, -77.0410 FROM neighborhoods WHERE name = 'Adams Morgan';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Perry''s', 'Japanese', '$$', 4.3, 38.9215, -77.0440 FROM neighborhoods WHERE name = 'Adams Morgan';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Tsehay Ethiopian', 'Ethiopian', '$', 4.4, 38.9225, -77.0405 FROM neighborhoods WHERE name = 'Adams Morgan';
 
+        -- Columbia Heights
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Frances', 'French', '$$$$', 4.8, 37.7611, -122.4348 FROM neighborhoods WHERE name = 'Castro';
+            SELECT neighborhood_id, 'Room 11', 'American', '$$', 4.3, 38.9270, -77.0300 FROM neighborhoods WHERE name = 'Columbia Heights';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Hot Cookie', 'Dessert', '$', 4.5, 37.7614, -122.4351 FROM neighborhoods WHERE name = 'Castro';
+            SELECT neighborhood_id, 'Thip Khao', 'Laotian', '$$', 4.5, 38.9260, -77.0280 FROM neighborhoods WHERE name = 'Columbia Heights';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Meridian Pint', 'American', '$$', 4.2, 38.9280, -77.0310 FROM neighborhoods WHERE name = 'Columbia Heights';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Ulivo', 'Italian', '$$', 4.4, 38.9255, -77.0295 FROM neighborhoods WHERE name = 'Columbia Heights';
 
+        -- U Street / Shaw
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Firefly', 'American', '$$$', 4.6, 37.7508, -122.4322 FROM neighborhoods WHERE name = 'Noe Valley';
+            SELECT neighborhood_id, 'The Dabney', 'American', '$$$$', 4.7, 38.9160, -77.0250 FROM neighborhoods WHERE name = 'U Street / Shaw';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Bacon Bacon', 'American', '$$', 4.0, 37.7514, -122.4340 FROM neighborhoods WHERE name = 'Noe Valley';
+            SELECT neighborhood_id, 'Ben''s Chili Bowl', 'American', '$', 4.6, 38.9175, -77.0275 FROM neighborhoods WHERE name = 'U Street / Shaw';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Maydan', 'Middle Eastern', '$$$', 4.6, 38.9150, -77.0260 FROM neighborhoods WHERE name = 'U Street / Shaw';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Baan Mae', 'Laotian', '$$', 4.5, 38.9165, -77.0280 FROM neighborhoods WHERE name = 'U Street / Shaw';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Le Diplomate', 'French', '$$$', 4.5, 38.9140, -77.0310 FROM neighborhoods WHERE name = 'U Street / Shaw';
 
+        -- Logan Circle
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'House of Prime Rib', 'American', '$$$', 4.7, 37.7913, -122.4218 FROM neighborhoods WHERE name = 'Richmond District';
+            SELECT neighborhood_id, 'Chicatana', 'Mexican', '$$$', 4.7, 38.9100, -77.0300 FROM neighborhoods WHERE name = 'Logan Circle';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Burma Superstar', 'Burmese', '$$', 4.5, 37.7809, -122.4636 FROM neighborhoods WHERE name = 'Richmond District';
+            SELECT neighborhood_id, 'Estadio', 'Spanish', '$$$', 4.4, 38.9110, -77.0310 FROM neighborhoods WHERE name = 'Logan Circle';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Pearl Dive Oyster Palace', 'Seafood', '$$$', 4.3, 38.9090, -77.0280 FROM neighborhoods WHERE name = 'Logan Circle';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'MXDC', 'Mexican', '$$', 4.2, 38.9105, -77.0295 FROM neighborhoods WHERE name = 'Logan Circle';
 
+        -- Navy Yard / Capitol Riverfront
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'A16', 'Italian', '$$$', 4.4, 37.8005, -122.4356 FROM neighborhoods WHERE name = 'Marina District';
+            SELECT neighborhood_id, 'The Salt Line', 'Seafood', '$$$', 4.5, 38.8750, -77.0060 FROM neighborhoods WHERE name = 'Navy Yard / Capitol Riverfront';
         INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
-            SELECT neighborhood_id, 'Blue Barn Gourmet', 'American', '$$', 4.2, 37.7998, -122.4386 FROM neighborhoods WHERE name = 'Marina District';
+            SELECT neighborhood_id, 'All-Purpose Pizzeria', 'Pizza', '$$', 4.4, 38.8770, -77.0080 FROM neighborhoods WHERE name = 'Navy Yard / Capitol Riverfront';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Bluejacket', 'American', '$$', 4.3, 38.8740, -77.0050 FROM neighborhoods WHERE name = 'Navy Yard / Capitol Riverfront';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Due South', 'Southern', '$$', 4.2, 38.8760, -77.0070 FROM neighborhoods WHERE name = 'Navy Yard / Capitol Riverfront';
+
+        -- Foggy Bottom
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Founding Farmers', 'American', '$$', 4.3, 38.9010, -77.0450 FROM neighborhoods WHERE name = 'Foggy Bottom';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Equinox', 'American', '$$$', 4.4, 38.8990, -77.0400 FROM neighborhoods WHERE name = 'Foggy Bottom';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Oval Room', 'American', '$$$$', 4.5, 38.8970, -77.0380 FROM neighborhoods WHERE name = 'Foggy Bottom';
+
+        -- Penn Quarter / Chinatown
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Centrolina', 'Italian', '$$$', 4.6, 38.9000, -77.0250 FROM neighborhoods WHERE name = 'Penn Quarter / Chinatown';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Fiola', 'Italian', '$$$$', 4.5, 38.8980, -77.0230 FROM neighborhoods WHERE name = 'Penn Quarter / Chinatown';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'China Chilcano', 'Peruvian', '$$', 4.3, 38.8995, -77.0200 FROM neighborhoods WHERE name = 'Penn Quarter / Chinatown';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Matchbox', 'American', '$$', 4.2, 38.8975, -77.0220 FROM neighborhoods WHERE name = 'Penn Quarter / Chinatown';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Zaytinya', 'Mediterranean', '$$$', 4.4, 38.9005, -77.0240 FROM neighborhoods WHERE name = 'Penn Quarter / Chinatown';
+
+        -- Mount Pleasant
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Don Juan Restaurant', 'Latin American', '$$', 4.3, 38.9320, -77.0380 FROM neighborhoods WHERE name = 'Mount Pleasant';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Haydee''s Restaurant', 'Salvadoran', '$', 4.4, 38.9310, -77.0410 FROM neighborhoods WHERE name = 'Mount Pleasant';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Marx Cafe', 'American', '$$', 4.1, 38.9305, -77.0390 FROM neighborhoods WHERE name = 'Mount Pleasant';
+
+        -- Cleveland Park
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, '2 Amys', 'Pizza', '$$', 4.5, 38.9350, -77.0570 FROM neighborhoods WHERE name = 'Cleveland Park';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Palena Cafe', 'American', '$$$', 4.4, 38.9370, -77.0590 FROM neighborhoods WHERE name = 'Cleveland Park';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Open City', 'Cafe', '$$', 4.2, 38.9340, -77.0560 FROM neighborhoods WHERE name = 'Cleveland Park';
+
+        -- Woodley Park
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Lebanese Taverna', 'Lebanese', '$$', 4.3, 38.9270, -77.0500 FROM neighborhoods WHERE name = 'Woodley Park';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'New Heights', 'American', '$$$', 4.4, 38.9290, -77.0530 FROM neighborhoods WHERE name = 'Woodley Park';
+
+        -- Petworth
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Himchuli', 'Nepalese', '$$', 4.4, 38.9510, -77.0240 FROM neighborhoods WHERE name = 'Petworth';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Qualia Coffee', 'Cafe', '$', 4.5, 38.9490, -77.0260 FROM neighborhoods WHERE name = 'Petworth';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Brookland''s Finest', 'American', '$$', 4.2, 38.9505, -77.0230 FROM neighborhoods WHERE name = 'Petworth';
+
+        -- Brookland
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Menomale', 'Pizza', '$$', 4.5, 38.9290, -76.9910 FROM neighborhoods WHERE name = 'Brookland';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Brookland Pint', 'American', '$$', 4.2, 38.9310, -76.9890 FROM neighborhoods WHERE name = 'Brookland';
+
+        -- H Street NE / Atlas District
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Toki Underground', 'Japanese', '$$', 4.5, 38.9005, -76.9880 FROM neighborhoods WHERE name = 'H Street NE / Atlas District';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Daru', 'Indian', '$$$', 4.6, 38.8990, -76.9910 FROM neighborhoods WHERE name = 'H Street NE / Atlas District';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Sticky Rice', 'Asian Fusion', '$$', 4.3, 38.9010, -76.9890 FROM neighborhoods WHERE name = 'H Street NE / Atlas District';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'The Atlas Room', 'American', '$$$', 4.4, 38.9000, -76.9920 FROM neighborhoods WHERE name = 'H Street NE / Atlas District';
+
+        -- Anacostia
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Uniontown Bar & Grill', 'American', '$$', 4.2, 38.8640, -76.9840 FROM neighborhoods WHERE name = 'Anacostia';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Anacostia Coffee', 'Cafe', '$', 4.3, 38.8620, -76.9820 FROM neighborhoods WHERE name = 'Anacostia';
+
+        -- Southwest Waterfront / The Wharf
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Del Mar', 'Spanish', '$$$$', 4.6, 38.8790, -77.0240 FROM neighborhoods WHERE name = 'Southwest Waterfront / The Wharf';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Kaliwa', 'Asian Fusion', '$$$', 4.4, 38.8810, -77.0260 FROM neighborhoods WHERE name = 'Southwest Waterfront / The Wharf';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Whaley''s', 'Seafood', '$$', 4.3, 38.8780, -77.0230 FROM neighborhoods WHERE name = 'Southwest Waterfront / The Wharf';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Cantina Bambina', 'Mexican', '$$', 4.2, 38.8805, -77.0255 FROM neighborhoods WHERE name = 'Southwest Waterfront / The Wharf';
+
+        -- NoMa
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Union Market Food Hall', 'American', '$$', 4.3, 38.9080, -77.0030 FROM neighborhoods WHERE name = 'NoMa';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Masseria', 'Italian', '$$$$', 4.5, 38.9060, -77.0040 FROM neighborhoods WHERE name = 'NoMa';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'St. Anselm', 'Steakhouse', '$$$', 4.4, 38.9075, -77.0060 FROM neighborhoods WHERE name = 'NoMa';
+
+        -- Bloomingdale
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Red Hen', 'Italian', '$$$', 4.5, 38.9140, -77.0110 FROM neighborhoods WHERE name = 'Bloomingdale';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Boundary Stone', 'American', '$$', 4.2, 38.9160, -77.0130 FROM neighborhoods WHERE name = 'Bloomingdale';
+
+        -- LeDroit Park
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Florida Avenue Grill', 'Southern', '$$', 4.4, 38.9180, -77.0160 FROM neighborhoods WHERE name = 'LeDroit Park';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'The Royal', 'American', '$$', 4.3, 38.9190, -77.0140 FROM neighborhoods WHERE name = 'LeDroit Park';
+
+        -- Glover Park
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Surfside', 'Mexican', '$$', 4.2, 38.9210, -77.0780 FROM neighborhoods WHERE name = 'Glover Park';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Bread Furst', 'Bakery', '$', 4.5, 38.9230, -77.0810 FROM neighborhoods WHERE name = 'Glover Park';
+
+        -- Tenleytown
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Cactus Cantina', 'Mexican', '$$', 4.1, 38.9470, -77.0790 FROM neighborhoods WHERE name = 'Tenleytown';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Guapo''s', 'Mexican', '$$', 4.2, 38.9490, -77.0810 FROM neighborhoods WHERE name = 'Tenleytown';
+
+        -- Friendship Heights
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Chef Geoff''s', 'American', '$$$', 4.3, 38.9590, -77.0840 FROM neighborhoods WHERE name = 'Friendship Heights';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Maggiano''s Little Italy', 'Italian', '$$', 4.1, 38.9610, -77.0860 FROM neighborhoods WHERE name = 'Friendship Heights';
+
+        -- Congress Heights
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Anacostia Restaurant', 'Southern', '$$', 4.0, 38.8410, -76.9910 FROM neighborhoods WHERE name = 'Congress Heights';
+
+        -- Deanwood
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Kenilworth Market Cafe', 'American', '$', 4.1, 38.9110, -76.9320 FROM neighborhoods WHERE name = 'Deanwood';
+
+        -- Barracks Row
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Belga Cafe', 'Belgian', '$$$', 4.4, 38.8810, -76.9940 FROM neighborhoods WHERE name = 'Barracks Row';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Matchbox Barracks Row', 'American', '$$', 4.3, 38.8790, -76.9960 FROM neighborhoods WHERE name = 'Barracks Row';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Banana Cafe', 'Cuban', '$$', 4.2, 38.8805, -76.9955 FROM neighborhoods WHERE name = 'Barracks Row';
+
+        -- West End
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Marcel''s', 'French', '$$$$', 4.6, 38.9040, -77.0480 FROM neighborhoods WHERE name = 'West End';
+        INSERT INTO restaurants (neighborhood_id, name, cuisine, price_range, rating, latitude, longitude)
+            SELECT neighborhood_id, 'Ris', 'American', '$$$', 4.4, 38.9060, -77.0510 FROM neighborhoods WHERE name = 'West End';
         COMMIT;
 
-        -- theaters: 1-2 per neighborhood
+        -- -------------------------------------------------------------------
+        -- Theaters (14)
+        -- -------------------------------------------------------------------
         INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
-            SELECT neighborhood_id, 'Alamo Drafthouse New Mission', 6, '2550 Mission St', 37.7566, -122.4189 FROM neighborhoods WHERE name = 'Mission District';
+            SELECT neighborhood_id, 'AMC Georgetown 14', 14, '3111 K Street NW', 38.9030, -77.0610 FROM neighborhoods WHERE name = 'Georgetown';
         INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
-            SELECT neighborhood_id, 'AMC Metreon 16', 16, '135 4th St', 37.7846, -122.4034 FROM neighborhoods WHERE name = 'SoMa';
+            SELECT neighborhood_id, 'Regal Gallery Place & 4DX', 14, '701 7th Street NW', 38.8985, -77.0215 FROM neighborhoods WHERE name = 'Penn Quarter / Chinatown';
         INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
-            SELECT neighborhood_id, 'Castro Theatre', 1, '429 Castro St', 37.7621, -122.4350 FROM neighborhoods WHERE name = 'Castro';
+            SELECT neighborhood_id, 'Landmark Atlantic Plumbing Cinema', 6, '807 V Street NW', 38.9175, -77.0255 FROM neighborhoods WHERE name = 'U Street / Shaw';
         INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
-            SELECT neighborhood_id, 'Vogue Theatre', 1, '3290 Sacramento St', 37.7896, -122.4409 FROM neighborhoods WHERE name = 'Richmond District';
+            SELECT neighborhood_id, 'Alamo Drafthouse DC Bryant Street', 9, '630 Rhode Island Avenue NE', 38.9200, -76.9950 FROM neighborhoods WHERE name = 'NoMa';
         INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
-            SELECT neighborhood_id, 'CGV Cinemas', 8, '1746 Post St', 37.7853, -122.4308 FROM neighborhoods WHERE name = 'Richmond District';
+            SELECT neighborhood_id, 'Angelika Pop-Up at Union Market', 3, '550 Penn Street NE', 38.9085, -77.0020 FROM neighborhoods WHERE name = 'NoMa';
+        INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
+            SELECT neighborhood_id, 'Avalon Theatre', 2, '5612 Connecticut Avenue NW', 38.9500, -77.0700 FROM neighborhoods WHERE name = 'Friendship Heights';
+        INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
+            SELECT neighborhood_id, 'Miracle Theatre', 1, '535 8th Street SE', 38.8800, -76.9950 FROM neighborhoods WHERE name = 'Barracks Row';
+        INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
+            SELECT neighborhood_id, 'Suns Cinema', 1, '3107 Mount Pleasant Street NW', 38.9310, -77.0380 FROM neighborhoods WHERE name = 'Mount Pleasant';
+        INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
+            SELECT neighborhood_id, 'Lockheed Martin IMAX Theater', 1, 'National Air and Space Museum, Independence Ave SW', 38.8880, -77.0200 FROM neighborhoods WHERE name = 'Southwest Waterfront / The Wharf';
+        INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
+            SELECT neighborhood_id, 'Lincoln Theatre', 1, '1215 U Street NW', 38.9170, -77.0280 FROM neighborhoods WHERE name = 'U Street / Shaw';
+        INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
+            SELECT neighborhood_id, 'Howard Theatre', 1, '620 T Street NW', 38.9160, -77.0220 FROM neighborhoods WHERE name = 'U Street / Shaw';
+        INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
+            SELECT neighborhood_id, 'Warner Theatre', 1, '513 13th Street NW', 38.8970, -77.0290 FROM neighborhoods WHERE name = 'Penn Quarter / Chinatown';
+        INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
+            SELECT neighborhood_id, 'National Theatre', 1, '1321 Pennsylvania Avenue NW', 38.8960, -77.0310 FROM neighborhoods WHERE name = 'Penn Quarter / Chinatown';
+        INSERT INTO theaters (neighborhood_id, name, screen_count, address, latitude, longitude)
+            SELECT neighborhood_id, 'E Street Cinema (Landmark)', 8, '555 11th Street NW', 38.8965, -77.0270 FROM neighborhoods WHERE name = 'Penn Quarter / Chinatown';
         COMMIT;
 
+        -- -------------------------------------------------------------------
+        -- Sample user_favorites (demo APEX users)
+        -- -------------------------------------------------------------------
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'DEMO', neighborhood_id FROM neighborhoods WHERE name = 'Georgetown';
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'DEMO', neighborhood_id FROM neighborhoods WHERE name = 'Capitol Hill';
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'DEMO', neighborhood_id FROM neighborhoods WHERE name = 'Dupont Circle';
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'DEMO', neighborhood_id FROM neighborhoods WHERE name = 'U Street / Shaw';
+
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'ADMIN', neighborhood_id FROM neighborhoods WHERE name = 'Navy Yard / Capitol Riverfront';
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'ADMIN', neighborhood_id FROM neighborhoods WHERE name = 'Southwest Waterfront / The Wharf';
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'ADMIN', neighborhood_id FROM neighborhoods WHERE name = 'Penn Quarter / Chinatown';
+
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'APEX_PUBLIC_USER', neighborhood_id FROM neighborhoods WHERE name = 'Adams Morgan';
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'APEX_PUBLIC_USER', neighborhood_id FROM neighborhoods WHERE name = 'Columbia Heights';
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'APEX_PUBLIC_USER', neighborhood_id FROM neighborhoods WHERE name = 'Logan Circle';
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'APEX_PUBLIC_USER', neighborhood_id FROM neighborhoods WHERE name = 'H Street NE / Atlas District';
+
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'TESTUSER', neighborhood_id FROM neighborhoods WHERE name = 'Mount Pleasant';
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'TESTUSER', neighborhood_id FROM neighborhoods WHERE name = 'Cleveland Park';
+        INSERT INTO user_favorites (app_user, neighborhood_id)
+            SELECT 'TESTUSER', neighborhood_id FROM neighborhoods WHERE name = 'Petworth';
+        COMMIT;
+
+        -- -------------------------------------------------------------------
         -- app_settings: current city default
+        -- -------------------------------------------------------------------
         MERGE INTO app_settings s
-        USING (SELECT 'current_city' AS setting_key, 'San Francisco' AS setting_value FROM dual) src
+        USING (SELECT 'current_city' AS setting_key, 'Washington' AS setting_value FROM dual) src
         ON (s.setting_key = src.setting_key)
         WHEN MATCHED THEN UPDATE SET setting_value = src.setting_value, updated_at = SYSTIMESTAMP
         WHEN NOT MATCHED THEN INSERT (setting_key, setting_value) VALUES (src.setting_key, src.setting_value);

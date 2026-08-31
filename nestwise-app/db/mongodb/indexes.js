@@ -21,7 +21,13 @@ db.mflix_movies.createIndex({ popularity_score: -1 });           // default "cur
 db.weather_snapshots.createIndex({ neighborhood_id: 1, observed_at: -1 }); // "latest snapshot for this neighborhood"
 db.weather_snapshots.createIndex({ city: 1, observed_at: -1 });            // "latest snapshots for this city" (dashboard)
 
+// venues — Entertainment page's nightlife region
+db.venues.createIndex({ neighborhood_id: 1 });                   // GET /api/venues?neighborhood_id=
+db.venues.createIndex({ venue_type: 1 });                        // optional type filter
+db.venues.createIndex({ neighborhood_id: 1, venue_type: 1 });    // compound: "bars in this neighborhood"
+
 print("NestWise MongoDB indexes created.");
 db.listings.getIndexes().forEach(i => print(" listings: " + JSON.stringify(i.key)));
 db.mflix_movies.getIndexes().forEach(i => print(" mflix_movies: " + JSON.stringify(i.key)));
 db.weather_snapshots.getIndexes().forEach(i => print(" weather_snapshots: " + JSON.stringify(i.key)));
+db.venues.getIndexes().forEach(i => print(" venues: " + JSON.stringify(i.key)));

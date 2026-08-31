@@ -22,8 +22,17 @@ CREATE TABLE app_settings (
 -- lat/long are seeded, not geocoded live (see architecture.md scope cuts) —
 -- good enough for a Map region.
 -- ---------------------------------------------------------------------------
+-- neighborhood_id is deliberately NOT an IDENTITY column. MongoDB's
+-- listings/weather_snapshots/mflix_movies reference these integers as their
+-- cross-database join key, so the values must be stable and reproducible
+-- across seed reloads. An IDENTITY column is not: DELETE does not reset the
+-- sequence, so each reload produced a fresh higher range and silently broke
+-- every Mongo-backed region (see db/mongodb/schema_notes.md and
+-- db/oracle/04_neighborhood_id_stability.sql). The seed script supplies these
+-- IDs explicitly instead. Nothing in the app inserts neighborhoods at runtime,
+-- so generated keys buy nothing here.
 CREATE TABLE neighborhoods (
-    neighborhood_id   NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    neighborhood_id   NUMBER PRIMARY KEY,
     name              VARCHAR2(100)  NOT NULL,
     city              VARCHAR2(100)  NOT NULL,
     description       VARCHAR2(4000),
@@ -99,11 +108,18 @@ CREATE TABLE user_preferences (
     preferred_cuisine      VARCHAR2(50),
     budget_price_range     VARCHAR2(4)    DEFAULT '$$',
     weather_preference     VARCHAR2(20)   DEFAULT 'mild',
+    -- Minimum acceptable rating, applied as a FILTER (not a scoring bonus) by
+    -- both recommendation surfaces: restaurant_pkg.recommend_for_user in Oracle
+    -- and the proxy's /api/listings/recommend/for-user in MongoDB. Same
+    -- semantics as Restaurant Finder's existing Min Rating filter.
+    min_rating             NUMBER(2,1)    DEFAULT 0,
     created_at             TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
     updated_at             TIMESTAMP DEFAULT SYSTIMESTAMP NOT NULL,
     CONSTRAINT pk_user_preferences PRIMARY KEY (app_user),
     CONSTRAINT ck_user_prefs_budget
         CHECK (budget_price_range IN ('$','$$','$$$','$$$$')),
     CONSTRAINT ck_user_prefs_weather
-        CHECK (weather_preference IN ('cold','mild','warm','hot','any'))
+        CHECK (weather_preference IN ('cold','mild','warm','hot','any')),
+    CONSTRAINT ck_user_prefs_min_rating
+        CHECK (min_rating BETWEEN 0 AND 5)
 );

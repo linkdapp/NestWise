@@ -18,6 +18,7 @@ app.use(express.json());
 app.use('/api/listings', require('./routes/listings'));
 app.use('/api/movies',   require('./routes/movies'));
 app.use('/api/weather',  require('./routes/weather'));
+app.use('/api/venues',   require('./routes/venues'));
 app.use('/api/admin',    require('./routes/admin'));
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'nestwise-mongo-proxy' }));

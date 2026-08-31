@@ -38,7 +38,7 @@ router.get('/:id', async (req, res) => {
     }
 });
 
-// GET /api/listings/recommend/for-user?budget=$$&weather=mild
+// GET /api/listings/recommend/for-user?budget=$$&weather=mild&rating=4
 // Backs "Recommend for me" on the Stay/Listings page. Deliberately a simple,
 // explainable weighted-sum heuristic — same spirit as restaurant_pkg's
 // recommend_for_user in Oracle, not a trained model (see apex/page_plan.md).
@@ -46,10 +46,16 @@ router.get('/:id', async (req, res) => {
 // Score = avg_rating (0-5) + 3 if price_per_night fits the budget bucket
 //                           + 2 if the listing's neighborhood weather_score
 //                             matches the weather preference band.
+//
+// `rating` is the user's saved minimum acceptable rating. It is applied as a
+// FILTER, not a scoring bonus — "minimum rating" means exactly that, and it
+// matches how Restaurant Finder's existing Min Rating control behaves. A high
+// value can legitimately return fewer than 10 rows, or none.
 router.get('/recommend/for-user', async (req, res) => {
     const db = await connect();
     const budget = req.query.budget || '$$';
     const weatherPref = req.query.weather || 'any';
+    const minRating = Number(req.query.rating) || 0;
 
     const budgetCeiling = { '$': 120, '$$': 190, '$$$': 260, '$$$$': 100000 }[budget] || 190;
 
@@ -71,7 +77,7 @@ router.get('/recommend/for-user', async (req, res) => {
     };
 
     const listings = await db.collection('listings')
-        .find({})
+        .find({ avg_rating: { $gte: minRating } })
         .project({ reviews: 0 })
         .toArray();
 

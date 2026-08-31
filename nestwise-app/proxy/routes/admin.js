@@ -17,7 +17,15 @@ const { exec } = require('child_process');
 const router = express.Router();
 
 const ADMIN_TOKEN  = process.env.NESTWISE_ADMIN_TOKEN || 'change-me';
-const MONGO_DB_NAME = process.env.NESTWISE_MONGO_DB || 'nestwise';
+// Reuse the same authenticated connection string db.js uses for the app's
+// own driver connection -- shelling out to a bare `mongosh <db-name>` (the
+// original version of this file) carries no credentials, so it silently
+// worked when MongoDB had auth disabled and broke the moment auth was
+// enabled ("command delete requires authentication"). NESTWISE_MONGO_URL
+// already has the right user/password/authSource baked in (see
+// /etc/nestwise-proxy.env), so mongosh just needs to be pointed at it
+// directly instead of a bare database name.
+const MONGO_URL = process.env.NESTWISE_MONGO_URL || 'mongodb://localhost:27017/nestwise';
 const SEED_FILE = path.join(__dirname, '..', '..', 'db', 'mongodb', 'seed_data.js');
 
 router.post('/reload', (req, res) => {
@@ -26,7 +34,7 @@ router.post('/reload', (req, res) => {
         return res.status(401).json({ error: 'unauthorized' });
     }
 
-    exec(`mongosh ${MONGO_DB_NAME} "${SEED_FILE}"`, (err, stdout, stderr) => {
+    exec(`mongosh "${MONGO_URL}" "${SEED_FILE}"`, (err, stdout, stderr) => {
         if (err) {
             console.error('[nestwise-proxy] mongo reload failed:', stderr);
             return res.status(500).json({ error: 'mongo reload failed', detail: stderr });
