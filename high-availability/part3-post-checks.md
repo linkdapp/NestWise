@@ -206,9 +206,12 @@ briefly, throughput dropping to near zero — then recovering on their own, no m
 reconnect, back to baseline levels by roughly 14:59. `Logged on Users` never dropped
 from 16 throughout.
 
-📸 *Screenshot: Swingbench chart showing the TPS/DML/response-time dip and recovery
-across the switchover (`16b-swingbench-switchover-dip-recovery.png`, not yet saved
-to `screenshots/` — swap this marker for a real embed once it is).*
+![Swingbench chart showing the TPS, DML and response-time dip and recovery across the switchover](screenshots/16b-swingbench-switchover-dip-recovery.png)
+
+*Swingbench throughput through the switchover. The baseline chart is
+[`16a-swingbench-baseline.png`](screenshots/16a-swingbench-baseline.png), and the
+client-side Application Continuity view is
+[`show_swingbench_failover_app_con.png`](screenshots/show_swingbench_failover_app_con.png).*
 
 **What this confirms, stated in RPO/RTO terms.** This was a planned switchover, not
 an unplanned failover, and the two numbers that actually matter for a Data Guard SLA
