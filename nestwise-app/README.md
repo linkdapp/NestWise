@@ -1,3 +1,7 @@
+---
+title: NestWise App
+---
+
 # NestWise
 
 A hybrid Oracle + MongoDB application built to put **real, application-shaped
