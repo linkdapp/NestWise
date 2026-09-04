@@ -16,3 +16,14 @@ response-files/*.rsp.local
 # Real sys_password/system_password overrides — see group_vars/all.yml's comment
 # and docs/known-risks.md #45. Never commit real values in group_vars/all.yml itself.
 group_vars/all_local.yml
+
+# Debris from pasting a role's `shell: |` block straight into a terminal. Ansible
+# renders `{{ oem_repo_log }}`; bash does not, so a line like
+#   exec > >(tee -a {{ oem_repo_log }}) 2>&1
+# run by hand creates three files named `{{`, `oem_repo_log` and `}}`, each holding
+# "ERROR!: command not found". Harmless, but they turn up as untracked noise in
+# every `git status` until someone deletes them. Copy commands from the runbook,
+# which has them already substituted, not from the role.
+{{
+}}
+oem_repo_log

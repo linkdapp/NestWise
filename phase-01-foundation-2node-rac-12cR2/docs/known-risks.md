@@ -7400,4 +7400,922 @@ an oversight or something still being scoped: the induced-failover mechanism
 itself is now proven end to end by hand (this entry), and automating the
 drill into its own repeatable role is deliberately deferred rather than
 treated as an immediate next step.
+
+## 141. Consolidating `cross_cluster_ssh_trust` into `ssh_equivalence` silently converted the play's host loop from *parallelism* into *duplication* — the same mesh built twice, concurrently, both forks appending to the same `authorized_keys`
+
+Phase 7a needed `oracle@oradbserv05 → oracle@oemserver01` so the OEM repository
+RU zip could be `rsync`'d directly instead of routed through the Ansible
+controller. Two roles already existed that could almost do it. `ssh_equivalence`
+built the bidirectional `grid` + `oracle` mesh across a cluster for the Grid
+Infrastructure prerequisite; `cross_cluster_ssh_trust` was that same logic
+hardcoded to one pair (`oradbserv05 → oradbserv09`) for Phase 6's software copy.
+
+James's call was to stop maintaining two: *"instead of recreating this ssh trust
+all the time, why don't you rework the `ssh_equivalence` tasks and I give it
+source and target, and if I need it both ways I say bidirectional."* Correct on
+the merits — every hard-won detail in these roles (PEM-format keys for
+`gridSetup.sh`'s bundled Java client, #16; no pre-seeded IP entry, #62; no
+`UserKnownHostsFile /dev/null`, #63; `CheckHostIP` off, #64) had to be remembered
+twice, and the two had already drifted on whether `known_hosts` was written
+additively or wholesale.
+
+**What the rewrite had to change, and the consequence that came with it.** The
+old mesh implementation could not express `oradbserv05 → oemserver01` at all, and
+not for a superficial reason. It relied on the play's own host loop plus
+`hostvars`: the play targeted `rac_nodes`, every host published its public key as
+a fact, and a later task read peers' facts back out. That only works when every
+host involved is *in the current play* — which is exactly why #61's
+`groups['rac_nodes']` bug silently skipped every iteration when run under
+`--tags standby_ssh_equivalence`. So the rewrite made every task
+`delegate_to`-driven instead, with no dependency on play membership.
+
+That is the right shape, and it introduced the bug. Once nothing in the role
+depends on which host the play is iterating, the play's host loop stops being
+parallelism and becomes pure repetition. A play with `hosts: rac_nodes` — which
+is precisely what `site.yml`'s `ssh_equivalence` play is — would fork twice, and
+*both forks would build the entire mesh*. Not merely wasteful: both forks run
+`lineinfile` against the **same** `/home/grid/.ssh/authorized_keys` on the
+**same** delegated target at the **same** time. `lineinfile` is
+read-modify-write via a temp file and a rename, so two concurrent writers can
+each read the pre-existing file and the second rename can discard the first's
+addition. The lost entry is a missing authorized key, and a missing authorized
+key is #6: `gridSetup.sh` hangs indefinitely with no output rather than failing.
+
+Caught before it ran, from James's question about a *different* thing — "how
+would it know the server that I am targeting?" — which forced actually reading
+`site.yml` rather than assuming the invocation I had just recommended was sound.
+The honest answer to his question is that the tag selects nothing about hosts;
+the play's `hosts:` line does. But arriving at that answer meant looking at
+`hosts: rac_nodes` sitting above a now-fully-delegated role, which is where the
+duplication became obvious.
+
+**Fix:** `tasks/main.yml` is now a one-task wrapper that `include_tasks` the real
+work (`configure.yml`) under
+
+```yaml
+when: >
+  not (ssh_equiv_run_once | bool)
+  or inventory_hostname == ansible_play_hosts[0]
+```
+
+with `ssh_equiv_run_once: true` in `defaults/main.yml`. Three deliberate choices
+in that one line:
+
+- `ansible_play_hosts`, not `ansible_play_hosts_all` — the former excludes hosts
+  already failed or unreachable, so if the first inventory host is down the mesh
+  is still built from the next live one rather than skipped entirely.
+- `include_tasks` with a `when`, not `meta: end_host` — `end_host` would end the
+  host for the **whole play**, silently skipping any role listed after this one.
+  This gate is scoped to this role.
+- A variable rather than a hardcoded gate, purely as an escape hatch. Nothing in
+  this project sets it false.
+
+**What did *not* change:** `defaults/main.yml` reproduces the original mesh
+exactly (every host in `nodes`, both users, both directions, self included), so
+`site.yml`'s `ssh_equivalence` and `standby_ssh_equivalence` plays are untouched.
+`cross_cluster_ssh_trust` survives as a deprecation shim forwarding to the new
+interface, so `upgrade-19c-rolling.yml`'s call site keeps working until it is
+updated and re-tested.
+
+**Still unconfirmed.** Both the delegation rewrite and this gate are reasoned,
+not observed. This is a load-bearing GI prerequisite whose failure mode is a
+silent hang, so run `--tags ssh_equivalence` and `--tags standby_ssh_equivalence`
+on their own and read the per-pair verification output before the next
+`grid_infrastructure` run — do not discover it inside a four-hour build.
+
+## 142. Reading patch 39472050's actual README found six things wrong in the Phase 7a runbook and role — and the biggest one was a correct finding about a *different* patch, generalised
+
+James pasted the real Oracle README for Database Release Update 19.32.0.0.260721
+(patch 39472050). Everything Phase 7a had been built on until then was reasoned
+from this project's own 12.2 GI experience plus general Oracle practice. Six
+discrepancies, worth recording individually because they fail in different ways:
+
+**1. The "System Patch" assumption — the serious one.** Both the runbook (§0.5,
+§4) and the role's comments said to expect plain `opatch prereq` and `opatch
+apply` to be refused with *"This command doesn't support System Patch"*, citing
+`patching-strategy.md`'s confirmed 12.2 finding, and to fall back to
+`opatchauto`.
+
+That finding is real and it is about a different patch. **39467003, the combo, is
+the system patch. 39472050, the Database RU component inside it, is not.** And
+39472050 is what this home actually gets, because `oemserver01` has no Grid
+Infrastructure, so the combo's ACFS / Tomcat / DBWLM components are out of scope
+entirely. Oracle's README for 39472050 documents plain `opatch apply` (§3.2,
+non-RAC path) with no mention of `opatchauto`.
+
+The error was not the original finding. It was generalising "the 12.2 GI combo
+needed opatchauto" into "expect the same here" without noticing that "here" is a
+component of a combo, not the combo.
+
+**2. The conflict check could not fail.** The task ran
+`CheckConflictAgainstOHWithDetail ... || true`, justified in its own comment by
+#1's assumption: if a refusal is expected, swallowing the return code looks
+reasonable. With #1 corrected, it stops being reasonable — a conflict check that
+cannot fail is decoration. Now gated by `oem_repo_conflict_check_fatal` (default
+true), with an override for the case where a human reads the report and decides
+the conflict is ignorable, per Oracle's KB145571 pointer.
+
+**3. Wrong flag: `-ph`, not `-phBaseDir`.** Oracle documents `-phBaseDir` for
+this prereq. `-ph` and `-phBaseDir` are not synonyms. This is the kind of thing
+that either errors loudly or, worse, checks something other than what was
+intended.
+
+**4. `CheckMinimumOPatchVersion` was missing entirely** (README §3.1.3 step 3).
+This also resolves an open question that had been sitting in `group_vars/all.yml`
+next to `oem_repo_opatch_zip`: *"check 39472050's own README for the minimum
+OPatch version it requires."* The README names **no version number at all** — the
+check is programmatic. There was never anything to look up.
+
+**5. No CDB branch, and Oracle's procedure has one.** README §3.3.2's Table 2
+gives two datapatch procedures, and the multitenant one has a step the non-CDB
+one does not: `ALTER PLUGGABLE DATABASE ALL OPEN` **before** datapatch. Without
+it, datapatch patches `CDB$ROOT` and whatever PDBs happen to be open, leaving
+closed PDBs on an unpatched dictionary — silent until that PDB is opened or
+unplugged.
+
+The role had a bare `STARTUP`. Rather than guess, the role now asks
+(`SELECT cdb FROM v$database`) and branches.
+
+**Answered the same day, against the live database: `CDB` is `NO`.** `OEMCDB` is
+a non-CDB, despite the name. So the bare `STARTUP` was in fact correct *today* —
+which is precisely why this is worth an entry rather than a silent fix. It was
+correct by luck, not by check, and it had an expiry date: Phase 7d converts this
+database, and from that moment a hardcoded non-CDB path would silently patch only
+`CDB$ROOT` and leave every PDB on an unpatched dictionary.
+
+The detection stays for that reason, not collapsed back into a variable now that
+the answer is known. It costs one query against an already-running instance, it
+prints the answer into every run log, and it makes the day 7d lands a non-event.
+
+Two follow-ons from the confirmation, both recorded in
+`monitoring/phase-7a-repository-db-ru32.md` rather than here:
+
+- Non-CDB architecture was deprecated in 12.1 and is desupported from Oracle
+  Database 21c. If that holds, Phase 7d's conversion is a **hard prerequisite for
+  taking this database past 19c**, not a tidiness exercise. Verify against current
+  Oracle documentation before planning around it — desupport specifics move.
+- Whether EM 24ai's repository itself requires a CDB is a separate question this
+  project has not established. It belongs in Phase 7b's scoping, not in the middle
+  of an OMS upgrade.
+
+**6. `utlrp.sql` instead of `catcon.pl`.** Oracle documents
+`catcon.pl -n 1 -e -b utlrp -d $ORACLE_HOME/rdbms/admin utlrp.sql`. On a non-CDB
+the bare form is equivalent, so this would have "worked" — and would have stopped
+being equivalent the moment Phase 7d converts the database, because the bare form
+only recompiles the container it is connected to. A latent bug with a scheduled
+detonation date.
+
+(Phase numbering: the CDB conversion is **7d**, not 7c. 7c is administration
+groups and the agent golden image. Earlier drafts of this entry and of
+`monitoring/phase-7a-repository-db-ru32.md` collided the two — the original
+scoping had RU32 at 7b and the conversion at 7c, and everything shifted when RU32
+moved to 7a as a hard prerequisite for the OMS upgrade. Corrected 2026-08-31.)
+
+**Also added, both absent and both documented:** `datapatch -sanity_checks`
+before `-verbose` (README calls it optional, then says Oracle highly recommends
+it), and `chown root` / `chmod 4750` on `$ORACLE_HOME/bin/extjob` (§3.3.5).
+`extjob` is the delayed-failure one: relinking during an RU can reset its owner
+and setuid bit, and the symptom — `DBMS_SCHEDULER` external jobs failing — shows
+up days later with nothing obviously tying it to the patch.
+
+**And the rollback order was inverted.** The runbook rolled the dictionary back
+first (`datapatch -rollback`) then the binaries. README §4.1/§4.2 does the
+opposite: `opatch rollback` with everything down, *then* start the database and
+run plain `datapatch` as the documented post-deinstallation step — no `-rollback`
+flag needed, since with the binaries gone datapatch works out what to undo.
+
+**The generalisable lesson**, and the reason this entry is long: every one of
+these came from a *plausible* inference. The System Patch one was even backed by
+a real, confirmed, correctly-recorded finding from this same project. What made
+it wrong was scope — the finding was about the combo, the role applies a
+component. A patch README is two pages and takes five minutes; none of this
+needed to be inferred at all.
+
+**Still unconfirmed.** All six fixes are from reading Oracle's document, not from
+a run. The preflight tag is read-only and safe at any time — run
+`--tags oem_repo_patch_preflight` and confirm the CDB determination, the
+`CheckMinimumOPatchVersion` result and the conflict report before booking a
+window.
+
+## 143. A Jinja `{%` at column 0 inside a `shell: |` block does not sit "outside the SQL" — it ends the YAML string, and the playbook will not parse at all
+
+The CDB branch added in #142 was written like this:
+
+```yaml
+  shell: |
+    sqlplus -s / as sysdba <<'SQL'
+    STARTUP
+{% if oem_repo_is_cdb | bool %}
+    ALTER PLUGGABLE DATABASE ALL OPEN;
+{% endif %}
+    SQL
+```
+
+James ran `--tags oem_repo_patch_preflight` and got:
+
+```
+ERROR! We were unable to read either as JSON nor YAML
+Syntax Error while loading YAML.
+  found character that cannot start any token
+The offending line appears to be:
+    STARTUP
+{% if oem_repo_is_cdb | bool %}
+ ^ here
+```
+
+**Root cause.** A YAML block scalar's indentation is fixed by its first non-empty
+line, and **any subsequent line at a shallower indent terminates the block**. The
+shell body sits at four spaces, so `{%` at column 0 is not merely un-indented
+text inside the string — it is *outside the string*. YAML then tries to parse it
+as the next node, sees `{`, and reads it as the start of a flow mapping. Hence
+"found character that cannot start any token", and hence the whole file failing
+to load rather than the task failing at run time.
+
+**Fix:** indent the Jinja tags to match the rest of the shell body. That is the
+only change needed, and it works on both passes: YAML strips the common
+four-space indent, so Jinja still sees the tag at the start of its own line, and
+Ansible's `trim_blocks` (#70) removes the newline after `%}` so the tag line
+disappears rather than leaving a blank one.
+
+**The part worth being uncomfortable about.** The column-0 placement was not a
+slip. It carried a comment asserting it was deliberate, explaining a rationale
+about `trim_blocks` and leading whitespace, and instructing the reader **"Do not
+'tidy' this."**
+
+The reasoning was half-right, which is what made it convincing: `trim_blocks`
+does eat the newline after `%}`, and the concern about stray whitespace on the
+tag line is a real one — it is simply solved by YAML's indent-stripping, which
+the argument never accounted for. Reasoning carefully about the templating pass
+while forgetting there is a YAML pass in front of it produced a confident,
+specific, wrong instruction that would have survived review precisely because it
+looked considered.
+
+A comment telling future readers not to fix a bug is worse than the bug. The
+replacement comment states the rule (a shallower-indented line ends the block)
+rather than the conclusion, so the next person can check it.
+
+**Same rule, second application.** Heredoc terminators depend on this identically.
+`<<'SQL'` needs its terminator at column 0 *of the resulting string*, which means
+at the block's base indent in the file. A terminator indented one level deeper is
+a heredoc that never closes. Audited across the repository: 16 openers, 16
+terminators, all at base indent, in `oem_repo_patch`, `dbca_noncdb` and
+`rolling_postupgrade`. Clean.
+
+**Audit run at the same time**, over all 40 task files and playbooks — no tabs, no
+unquoted `{{ }}` opening a YAML value, no other column-0 Jinja. Two other findings:
+`ssh_equivalence/tasks/per_user.yml` is orphaned dead code left by the #141
+rewrite and should be `git rm`'d, and `oem_repo_is_cdb` had a partial-tag hazard
+(its `set_fact` resolves false when preflight has not run, silently selecting the
+non-CDB path on a CDB) which now fails loudly instead.
+
+**Standing lesson:** `--syntax-check` only parses files a playbook actually
+reaches. Parse every `*.yml` directly as well — a role task file that no play
+currently includes will otherwise carry a YAML error until the day something
+includes it. The commands are in `monitoring/phase-7a-ansible.md`.
+
+## 144. `echo "... \\"` — a backslash before an end-of-line quote is valid YAML, valid bash, and breaks Ansible's argument splitter, failing the entire playbook
+
+Immediately after #143's fix, `bash syntax-check.sh` reported YAML parsing clean
+across all 46 files and then failed `oem-repo-patch.yml` on:
+
+```
+ERROR! failed at splitting arguments, either an unbalanced jinja2 block or quotes
+```
+
+pointing at `- name: Close the run log with a summary` while dumping the whole
+shell body — the usual "the error is somewhere in this block" report.
+
+**Root cause.** The summary task's last-but-one line was:
+
+```yaml
+    echo " diff -u {{ oem_repo_log_dir }}/baseline_pre_{{ oem_run_ts }}.txt \\"
+    echo "         {{ oem_repo_log_dir }}/baseline_post_{{ oem_run_ts }}.txt"
+```
+
+The `\\` was there to print a shell line-continuation into the suggested `diff`
+command, so the operator could copy a two-line command out of the log. In a YAML
+literal block those are two literal backslashes, and bash inside double quotes
+renders them as one. Correct on both of those passes.
+
+The pass it is not correct on is Ansible's own. `split_args` tracks quote state
+with `_get_quote_state`, which treats a quote character preceded by `\` as
+escaped and therefore *not* closing the string. The closing `"` on that line is
+preceded by a backslash, so as far as Ansible is concerned the double quote opens
+and never closes, and every subsequent line is inside it. The unbalanced-quote
+error is raised for the whole task.
+
+**Fix:** stop needing the escape. The diff suggestion is one long line now. Trying
+to escape it "correctly" is the wrong instinct — there is no spelling of
+backslash-then-quote that satisfies YAML, bash and `split_args` simultaneously
+without more cleverness than a log banner deserves.
+
+**What this says about the checking, which is the useful part.** #143's lesson was
+that `--syntax-check` is insufficient because it only parses files a playbook
+reaches. This is the same lesson from the opposite direction: **raw YAML parsing
+is insufficient too**, because this construct is *valid YAML*. It parsed fine in
+check 1 and was caught only by check 2.
+
+Neither check subsumes the other:
+
+| | catches | misses |
+|---|---|---|
+| `yaml.safe_load` on every file | malformed YAML anywhere, including unreferenced files | anything valid as YAML but invalid to Ansible |
+| `ansible-playbook --syntax-check` | Ansible-specific parse errors like this one | any file no play currently reaches |
+
+Both are now in `ansible/syntax-check.sh`, along with a dedicated grep for
+backslash-before-end-of-line-quote (check 6), because a targeted grep names the
+offending line directly rather than dumping a 20-line shell body and pointing at
+the task header.
+
+**Scope check:** one occurrence in the repository, in code added this session.
+Every other `shell:` block across the 46 files is clean.
+
+## 145. #48 recurred — `connection: local` re-added to a new `hosts: localhost` play, breaking every delegated task in exactly the documented way
+
+The first real run of `oem-repo-patch.yml --tags oem_repo_patch_preflight` got
+past both syntax bugs (#143, #144), reached the trust play, resolved its pairs
+correctly, and then died on the first delegated task:
+
+```
+TASK [ssh_equivalence : [oradbserv05 -> oemserver01] Ensure oracle's .ssh exists on the source]
+fatal: [localhost -> oradbserv05]: FAILED! =>
+  msg: Failed to set permissions on the temporary files Ansible needs to create
+       when becoming an unprivileged user (rc: 1, err: chmod: invalid mode:
+       'A+user:oracle:rx:allow')
+```
+
+**Cause: `connection: local` on the play.** Set explicitly at play level it pins
+every task to a local connection, *including delegated ones* — `delegate_to` does
+not override it, because Ansible only resolves a delegated task's connection from
+the delegate's inventory vars when the play has not already pinned one, and
+`oradbserv05` carries no explicit `ansible_connection` to win that argument.
+
+So the task ran on the WSL2 control node while the output read
+`[localhost -> oradbserv05]`. `chmod A+user:oracle:rx:allow` is Ansible's Solaris
+ACL fallback, reached after `setfacl` failed, trying to hand a temp file to an
+`oracle` user that does not exist on the controller. The error names a become
+problem; the actual problem is that it never left the laptop.
+
+**None of this was new.** It is `#48`'s third update, verbatim, and the fix — drop
+the keyword, keep `hosts: localhost` — was already written out in comments above
+**four** existing plays and roles: `gi_db_home_clone`, `dataguard_standby_prep`,
+`dataguard_convert_rac`, and site.yml's Phase 4 play. `upgrade-19c-rolling.yml`'s
+`cross_cluster_ssh_trust` play — the direct predecessor of the play that broke —
+gets it right, with `hosts: localhost` and no `connection:` line.
+
+**Why it recurred anyway, which is the part worth fixing.** Adding
+`connection: local` under `hosts: localhost` is the *obvious* thing to write. It
+reads as clarifying intent, and it is what most Ansible documentation shows for a
+control-node play. The knowledge that it is wrong here lived only in comments
+attached to the plays that already avoid it — so it was reachable when reading
+existing code, and invisible when writing new code. A comment on the correct
+implementations cannot warn the person writing a new one.
+
+**Fixes:**
+
+1. Dropped `connection: local` from `oem-repo-patch.yml`'s trust play, with the
+   full reasoning inline rather than a cross-reference, so the next person editing
+   *that* file sees it without needing to know #48 exists.
+2. Added check 7 to `ansible/syntax-check.sh`: warn on any file containing both
+   `connection: local` and `delegate_to`. A warning rather than a failure —
+   `clone-node.yml` legitimately uses `connection: local` for VBoxManage and
+   delegates nothing — and per-file rather than per-play, which the output says
+   out loud so a WARN gets read rather than dismissed.
+
+Audited at the same time: `clone-node.yml` is the only remaining
+`connection: local` in the repository, and it is correct.
+
+**The general lesson for this project's documentation habit.** Recording a trap
+next to the code that avoids it is necessary but not sufficient — it documents the
+cure where only the already-cured can see it. Traps that are easy to re-introduce
+need a mechanical check, not just a comment. #143, #144 and #145 are all now greps
+in `syntax-check.sh` for that reason.
+
+## 146. Reviewing `oem_repo_patch` against this document — which should have happened before it was ever handed over — found four more issues, one of them a check that would have failed a successful backup
+
+James's challenge after #145, and it is the correct one: *"if these issues are
+already resolved in known-risks.md, why don't you check the doc to see if your
+design has any issues we have fixed before submitting the files for execution?
+We shouldn't be repeating issues we have spent hours debugging."*
+
+Three consecutive failed runs (#143, #144, #145) on code written without once
+consulting a 145-entry register of this project's own hard-won findings. #145 was
+not merely documented — the fix was spelled out in comments above four separate
+plays. The review below is what should have preceded the handover.
+
+**1. `'RMAN-' in stdout` would have failed a healthy backup.** The RMAN backup
+task failed the play if the substring `RMAN-` appeared anywhere in stdout. RMAN
+emits informational `RMAN-08xxx` messages during entirely normal operation, so a
+successful backup would have aborted the maintenance window — after the blackout
+was up and the OMS was down, which is the worst possible place to stop.
+
+This is #109's lesson exactly: check a positive completion marker, not the absence
+of an error-shaped string, and confirm the thing being searched can actually reach
+the stream being searched. Now requires `Recovery Manager complete.` and treats
+only `RMAN-00569` — the header of RMAN's real error stack — as failure. A comment
+warns against adding `log=` to the invocation without rewriting the condition,
+since that is precisely what made #109 unfalsifiable.
+
+**2. Six `sqlplus -s` calls, against a standing convention.** #80 records James
+asking for full transcript-style output on every task, and states the rule for all
+future phases: *"always full transcript-style output, always a `debug` task right
+after, never silent."* `-s` dropped from all six.
+
+Partially resolved, and recorded as such in
+`docs/ansible-preflight-checklist.md`: dropping `-s` restores the banner, the
+`SQL>` prompts and the results, but not the statement text, because #82 established
+that `SET ECHO ON` does not echo heredoc stdin — only scripts run with `@`. Meeting
+the convention fully means writing each block to a `.sql` file, as
+`dataguard_primary_prep` does. Not done. Stated rather than quietly skipped.
+
+**3. `groups['rac_nodes'][0]` in the role, `groups['rac_node1'][0]` in the
+playbook.** Both resolve to `oradbserv05` today, so the trust would be established
+from the host the copy then runs on — by coincidence, not construction. #61's bug
+class. Unified on `rac_node1`.
+
+**4. A partial-tag hazard** already covered under #142: `oem_repo_is_cdb` resolving
+to a safe-looking `false` when its preflight source task had not run. Now fails
+loudly.
+
+**The process change, which is the actual point.** A checklist —
+`docs/ansible-preflight-checklist.md` — grouped by play structure, shell/SQL\*Plus
+construction, result checking, variables and tags, idempotency, and a handover
+gate. Each item names the entry it comes from.
+
+It exists because of #145's diagnosis: a trap recorded as a comment on the code
+that avoids it is invisible to whoever writes the next role. Comments reach readers
+of the cured; a checklist reaches the author of the next patient. Where a check can
+be mechanised it belongs in `syntax-check.sh` instead — the checklist is for the
+judgement calls that cannot be grepped.
+
+**Honest scope note:** this review covered `oem_repo_patch`, `ssh_equivalence` and
+`oem-repo-patch.yml` — the code written in this session. It is a read of the code
+against the register, not a run. Items 1 and 3 are fixed and unverified; item 2 is
+partially fixed by design and the remainder is recorded as an outstanding
+deviation.
+
+## 147. `delegate_to` resolved to the hostname "1" and Ansible tried to reach 0.0.0.1 — an inner `loop:` silently rebound `item` out from under the include's lazily-evaluated vars
+
+The trust play got further than ever before: pairs resolved, the keypair was
+found, the target's host keys were scanned. Then:
+
+```
+[WARNING]: The loop variable 'item' is already in use.
+failed: [localhost -> 1] (item=|1|xp3QRk...=|FabD6r...= ecdsa-sha2-nistp256 AAAA...)
+  msg: 'Failed to connect to the host via ssh: ssh: connect to host 0.0.0.1 port 22: Connection refused'
+fatal: [localhost -> {{ ssh_pair_source }}]: UNREACHABLE!
+```
+
+Two tells in that output. Ansible is delegating to a host literally named `1`
+(resolved as `0.0.0.1`), and the final line reports the delegate as the raw,
+un-rendered string `{{ ssh_pair_source }}`.
+
+**Root cause.** `configure.yml` loops over user × pair and passes the parts into
+`pair.yml` as include vars:
+
+```yaml
+  include_tasks: pair.yml
+  vars:
+    ssh_pair_source: "{{ item.1.0 }}"
+  loop: "{{ ssh_equiv_users | product(ssh_equiv_pairs) | list }}"
+```
+
+Those vars are **lazy** — re-evaluated at each point of use inside `pair.yml`, not
+captured once at include time. And the known_hosts task inside `pair.yml` has a
+`loop:` of its own, over `ssh-keyscan` output lines. For the duration of that task,
+`item` is the keyscan line.
+
+So `ssh_pair_source` was re-evaluated as `"<keyscan line>.1.0"`. Jinja does not
+object: `item[1]` on that string is the character `1`, and `'1'[0]` is `'1'`.
+`delegate_to` therefore received `"1"`, which Ansible resolved to `0.0.0.1`.
+
+Every earlier task in `pair.yml` worked precisely because none of them has an inner
+loop — `item` still held the outer element, so `.1.0` gave `oradbserv05` as
+intended. The failure appears at the first inner loop and nowhere before it. Ansible
+does warn, but only as a WARNING, and then does the wrong thing anyway.
+
+**Fix:** `loop_control: loop_var: ssh_equiv_item` on the include, with the three
+vars, the label and the `when:` all switched to it. Now nothing an included task
+does to `item` can reach them.
+
+**James's question was the right one:** *"you did this 05 to 09 and copied files
+over. What is the difference here?"*
+
+The difference is the generalisation, and it is worth being precise rather than
+defensive about it. `cross_cluster_ssh_trust` handled exactly one pair and one
+user. It had no outer loop, so `item` inside it always belonged to whichever inner
+loop was running, and there was nothing to collide with. Parameterising the role
+over (users × pairs) — the right change, and the one James asked for — introduced
+an outer loop, and with it a variable-shadowing hazard that simply did not exist in
+the code being replaced.
+
+That is a normal cost of generalising: the new failure modes are not in the diff,
+they are in the interaction between the new structure and code that was already
+there. The lesson is not "do not generalise" — it is that a rewrite from
+"one hardcoded case" to "a loop over cases" should be reviewed specifically for
+what the new loop shadows.
+
+**Mechanised** as check 8 in `ansible/syntax-check.sh`: any `include_tasks` /
+`include_role` / `import_tasks` carrying a `loop:` without a `loop_var:` fails the
+check. This is the fourth defect in this sequence (#143, #144, #145, #147) to
+become a grep rather than only a comment, which is the pattern #145 argued for.
+
+**Note for the next role in this project that uses this pattern:** the include-with-
+lazy-vars idiom is common here. Any role passing `vars:` derived from `item` into an
+included file is exposed to this the moment someone adds a loop inside that file —
+even years later, even in a task unrelated to the vars. `loop_var` on every looping
+include is cheap insurance, which is why the check fails rather than warns.
+
+## 148. `become: false` on the patch play meant every task ran as the login user — and fixing it exposed two more identity bugs that had not run yet
+
+With #147 fixed, the SSH trust play succeeded end to end for the first time
+(`oracle@oradbserv05 -> oemserver01: OK`). The second play then failed on its
+first real task:
+
+```
+TASK [oem_repo_patch : Ensure the log and staging directories exist]
+failed: [oemserver01] (item=/u01/app/oracle/logs/oem_repo_patch)
+  msg: 'There was an issue creating /u01/app/oracle/logs as requested:
+        [Errno 13] Permission denied'
+```
+
+**Cause.** The play carried `become: false`, so every task ran as the `ansible`
+login user, which owns nothing under `/u01/app/oracle`.
+
+`become: false` was there to stop `ansible.cfg`'s global `become = True` /
+`become_user = root` from running the whole role as root — a real concern, since
+OPatch and datapatch run as root leave root-owned files scattered through the
+Oracle home and inventory. But the correction to "not root" was made without
+asking the actual question, which is *which* user this work belongs to. The answer
+is `oracle`, and the play now says so: `become: true` with
+`become_user: "{{ oracle_user }}"`. Same pattern `dataguard_fsfo` already uses
+successfully against this host.
+
+Had the directory task somehow succeeded, the failure would simply have moved
+later and got worse — `sqlplus / as sysdba`, `opatch`, `rman` and `emctl` all
+require being the software owner, not merely able to execute the binary.
+
+**Two consequential bugs, found by asking what else the change affects rather than
+by running it.**
+
+**1. Two tasks needed `become_user: root` stating explicitly.** `opatchauto` and
+the `extjob` permission fix both carried a bare `become: true`, which meant root
+while the play defaulted to root. With a play-level `become_user: oracle`, a bare
+`become: true` now means *become oracle*. `opatchauto` would have failed on
+privilege; worse, the `extjob` task also carries `failed_when: false`, so oracle
+failing to `chown` a file to root would have been **swallowed silently** — leaving
+`extjob` wrong in precisely the way that task exists to prevent, and reporting
+success. Both now say `become_user: root`.
+
+**2. `synchronize` had to go, and should never have been there.** The two
+cross-cluster copy tasks used `ansible.posix.synchronize`. Two independent
+problems:
+
+- **It contradicts an explicit project decision** — one recorded in
+  `ssh_equivalence`'s own header, which *this same session wrote*, and in
+  `db19c_software_install`'s cross-cluster copy: this project deliberately does not
+  depend on ansible.posix, and invokes the real `rsync` binary through
+  `command`. The comment was written in one role and violated in its sibling.
+- **`synchronize` resolves the remote-side user from the inventory host's
+  connection user, not from `become_user`.** Under the new play identity it would
+  still have attempted `ansible@oemserver01:` — against a trust that exists for
+  `oracle` only. The copy would have failed on authentication, pointing at the
+  trust, which had just been proven working. That is an expensive diagnosis.
+
+Both replaced with the explicit form `db19c_software_install` uses and has had
+working on these hosts since 2026-08-21, plus a result-reporting `debug` task each
+(#80's convention). Deliberately *not* `failed_when: false` the way that role's
+version is — it has a controller-routed fallback to fall back to, and this one does
+not, so a failed copy must stop the run.
+
+**What this sequence says.** #146 reviewed the code against this register and found
+four issues. It did not find these three, because they are not visible in a static
+read of the role alone — they only appear once you ask what identity each task runs
+under, and compare that against a sibling role's stated conventions. A checklist
+catches recurring traps; it does not substitute for reading the neighbouring code
+that already solved the same problem. `db19c_software_install` had the answer to
+the cross-cluster copy question the entire time.
+
+## 149. `ssh-keyscan -H` made the trust rebuild itself on every run, and `dba_registry_sqlpatch` has no `version` column — both found by the first successful preflight
+
+The first clean preflight run. Two defects it surfaced, plus a design change James
+asked for on the back of one of them.
+
+**1. `ORA-00904: "VERSION": invalid identifier`.** The pre-patch baseline's
+`dba_registry_sqlpatch` query selected a `version` column. That view has no such
+column — it has `ru_version` and `source_version`, and the column that belongs in a
+patch summary is `patch_type` (INTERIM vs RU). James supplied the corrected query
+directly. Applied to both the pre-patch baseline and the post-patch verification,
+which carried the identical block.
+
+Worth noting what this cost: nothing yet, but the post-patch half of the same query
+runs *after* the RU is applied, at the point where the run is deciding whether the
+dictionary patch registered as SUCCESS. The error would have surfaced mid-window,
+with the OMS down, on a query whose whole purpose is to tell you whether it is safe
+to bring the OMS back up.
+
+**2. The SSH trust rebuilt itself on every single run.** The known_hosts task
+reported `changed` on all six key lines each time, even immediately after a
+successful run.
+
+Cause: `ssh-keyscan -H`. The `-H` flag hashes the hostname field with a **random
+salt**, so the same host and the same key produce *different text* on every
+invocation. `lineinfile` therefore never matched what was already in the file,
+appended six more lines, and reported changed — every run, forever, with
+`known_hosts` growing without bound.
+
+Dropped `-H`. Unhashed entries are stable text, so `lineinfile` is genuinely
+idempotent. Hashing only obscures which hosts a user has connected to, which buys
+nothing on a lab whose entire inventory is committed to this repository.
+
+**3. James's design correction, which is the durable part.** Seeing the rebuild, he
+asked for the obvious structure the role did not have:
+
+> *"Does it have to do this all the time? Can it check for the SSH first before
+> setting up if missing? It is always a 3 step process. 1. Check first if not there
+> or not configured 2. then do it and 3. check to make sure that it is done."*
+
+`pair.yml` is now exactly that. Step 1 runs
+`ssh -o BatchMode=yes <target> hostname` as the target user. If it returns 0 the
+entire setup block is skipped. Step 2 runs only on failure. Step 3 runs the same
+command again unconditionally and records the result.
+
+Two details that make it honest rather than decorative:
+
+- **The check is a real connection, not a file inspection.** Whether
+  `authorized_keys` contains the right line is a proxy; whether the SSH actually
+  opens is the thing itself. `BatchMode=yes` is what makes it a test rather than a
+  hang — it refuses to prompt, so an unconfigured trust fails in five seconds
+  instead of blocking on input that can never arrive (the #6 hang, in miniature).
+- **The stale `.ssh/config` cleanup is deliberately NOT gated on the pre-check.**
+  A config containing `UserKnownHostsFile /dev/null` (#63) still *passes* the
+  pre-check — `StrictHostKeyChecking no` plus `/dev/null` connects fine, just
+  noisily and without persisting anything. So the pre-check cannot detect that
+  state, and the cleanup has to run either way.
+
+The role now also prints a one-line summary — how many pairs were already
+configured versus built this run — so "did it rebuild everything again?" is
+answerable from the output rather than by reading six `changed` lines.
+
+**The general point.** An idempotency bug and a missing guard look like the same
+symptom (`changed` on every run) and are not the same defect. `-H` was the bug;
+check-first is the design. Fixing only the guard would have hidden the growing
+`known_hosts` behind a skip, and fixing only `-H` would have left the role
+rebuilding a working trust from scratch every time. Both were real.
+
+**CONFIRMED 2026-08-31 — the rebuild path, tested properly.** James restored
+`oemserver01` from a snapshot, wiping its configuration including
+`/home/oracle/.ssh/authorized_keys`, specifically to see whether the role would
+recover on its own. It did:
+
+```
+TASK [ssh_equivalence : CHECK  oracle@oradbserv05 -> oemserver01]
+  -> NOT configured, will set up
+  rc=255 — Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password)
+...
+TASK [ssh_equivalence : [oemserver01] Authorise oradbserv05's oracle key]
+changed
+TASK [ssh_equivalence : VERIFY oracle@oradbserv05 -> oemserver01]
+  OK — oemserver01.usat.com [newly configured this run]
+  1 pair(s) checked — 0 already configured (setup skipped), 1 built this run.
+```
+
+Worth noting how much better that test is than a re-run against an untouched host.
+A re-run only ever exercises the skip path; wiping the target is the only way to
+exercise the *rebuild* path, which is the one that matters when a node is rebuilt
+or recloned. Both halves now need to hold, and only one of them has been proven —
+the skip path (pre-check passes, setup skipped, zero changes) is still unverified
+and should be confirmed on the next run against the now-configured host.
+
+It also cost a false diagnosis first: the failure was read as a defect —
+"the trust did not survive between runs" — because the preceding run had ended
+with it working and nothing in the automation explained the regression. The
+explanation was outside the automation entirely. **When state changes between runs
+and nothing in the code accounts for it, ask what happened to the host before
+theorising about the code.**
+
+The pre-check now classifies its own failure (`Permission denied (publickey` →
+target's `authorized_keys` and home/.ssh permissions; `Host key verification
+failed` → source's `known_hosts`; `Connection refused` → not a trust problem),
+which is what made the cause legible here in one line.
+
+## 154. A real `failed_when` on a LOOPED task failed against directories that plainly existed — twice — and this project already had a convention that avoids the question entirely
+
+Staging the OJVM+DBRU combo unzipped correctly, and the verification task then
+failed both iterations with the evidence of success in its own output:
+
+```
+failed: [oemserver01] (item=.../39618649/39472050) => changed=false
+  failed_when_result: true
+  stat:
+    isdir: true
+```
+
+Two attempts, both wrong:
+
+```yaml
+failed_when: not (oem_combo_components.stat.isdir | default(false))
+# register is not assigned until the whole loop finishes, and then as
+# .results — so this resolved false every iteration, and `not false` failed.
+
+failed_when: not (stat.isdir | default(false))
+# also failed, with stat.isdir: true visible in the result.
+```
+
+The second is the form the documentation implies should work, and it did not.
+Rather than attempt a third guess at what is in scope inside a loop-scoped
+conditional, the check moved out of the loop.
+
+**The cross-check is the point of this entry.** Asked to review history before
+guessing again, a grep for `.results |` found that **this project has had a
+settled convention for exactly this since early on, used in at least eight
+roles** — `os_prep`, `db19c_software_install`, `asmlib_disks`,
+`dataguard_role_services`, `dataguard_net_config`, `dataguard_switchover_test`,
+`rolling_postupgrade`, `ssh_equivalence`:
+
+```yaml
+- name: <looped check>
+  command: ...
+  register: chk_thing
+  changed_when: false
+  failed_when: false          # never a real condition on the looped task
+  loop: [...]
+
+- name: <act or fail on the outcome>
+  when: chk_thing.results | rejectattr('rc', 'equalto', 0) | list | length > 0
+```
+
+`rolling_postupgrade`'s preflight is the closest analogue to what was needed
+here, evaluating `(<reg>.results | selectattr(...) | first).stdout` in a `fail`
+task *after* the loop. **Nowhere in this codebase is there a meaningful
+per-iteration `failed_when` on a looped task referencing module output.** The
+construct that failed twice is one this project had already, implicitly, decided
+not to use.
+
+It also rhymes with #97, #99 and #130, which all concluded the same thing from a
+different direction: do not encode the verdict in a task's own exit condition
+where you cannot see what is being tested — register the result and evaluate it
+explicitly, in the open, afterwards.
+
+**Fix:** `failed_when` removed from the looped `stat`; a `debug` reports
+present/MISSING per directory, and a separate `fail` task evaluates
+`oem_combo_components.results | map(attribute='stat.isdir', default=false)`. The
+`default=false` matters: for a path that does not exist, `stat` returns
+`exists: false` and carries no `isdir` key at all, so the lookup raises rather
+than returning false without it.
+
+**Standing rule, now in `docs/ansible-preflight-checklist.md`:** a looped task
+gets `failed_when: false`; the verdict goes in the next task, against `.results`.
+
+---
+
+## 155. Grepping datapatch's logs for `ORA-` produced ~300 hits on a completely successful patch — the check was noise, and noise is worse than no check
+
+**Where:** `roles/oem_repo_patch/tasks/main.yml`, the post-datapatch log task;
+`monitoring/phase-7a-part3-verification.md` §16 check 4.
+
+**What I wrote:**
+
+```bash
+grep -Rn -E "ORA-[0-9]{5}|SP2-[0-9]{4}|Error" ${LOGDIR} || echo "no lines found"
+```
+
+It reads like due diligence. On the 2026-09-04 run — a patch that succeeded on
+every other measure, `failed=0`, invalid objects 2 → 0 — it emitted roughly
+three hundred matching lines, and not one of them indicated a problem.
+
+**Why every hit was noise.** Oracle's own RU scripts are full of `ORA-` text
+that has nothing to do with a failure:
+
+- `IGNORABLE ERRORS: ORA-00955` and similar are *declarations at the top of the
+  script*, telling the harness which errors to expect and swallow. The string
+  `ORA-00955` appearing in a log is the script working as designed.
+- `ORA-00955: name is already used by an existing object` is raised and caught
+  by design on every `CREATE` for an object that already exists — which, in an
+  RU applied to an existing database, is most of them.
+- `ORA-` codes appear in comments and in error-handler text that never fired.
+
+**The deeper problem.** A check that fires three hundred false alarms does not
+degrade to a useless check — it degrades to a *harmful* one, because the next
+person scrolls past the block, and the run where one of those lines is real
+looks exactly like this one. Same failure mode as #153, where my apostrophe
+check produced 139 false positives and would have been ignored within a day.
+The cost of a noisy check is not the noise. It is the real finding you will
+miss inside it.
+
+**Fix:** the grep is gone. Datapatch already validates its own logfiles and
+prints a verdict per patch:
+
+```
+Patch 39472050 apply: SUCCESS
+  logfile: .../39472050_apply_OEMCDB_2026Sep04_07_10_39.log (no errors)
+```
+
+`(no errors)` is the authoritative signal and it comes from the tool that knows
+which errors it declared ignorable. The task now lists the log *locations* only,
+with a comment explaining why it deliberately does not grep them — so that
+somebody reading it does not helpfully add the grep back.
+
+**Standing rule:** before adding a check, estimate its false-positive rate on a
+*known-good* run. If you cannot, run it against one before you ship it. Prefer a
+verdict emitted by the tool that did the work over a pattern you invented to
+second-guess it.
+
+---
+
+## 156. The fix for #155 reintroduced #153's bug two lines away from the comment explaining it — and `syntax-check.sh` printed `FAIL` and `ok` for the same check
+
+**Where:** `roles/oem_repo_patch/tasks/main.yml`, the "Locate the datapatch apply
+logs" task; `syntax-check.sh` checks 2 and 9.
+
+Three separate defects, found in one run. Worth keeping together because they
+share a shape: **every one of them is a check or a fix that misreports.**
+
+### 156a. An apostrophe inside a `shell:` block, in the comment explaining #155
+
+The #155 fix replaced a noisy grep with a comment explaining why the grep was
+gone. The comment was written *inside* the `shell: |` block and contained:
+
+```
+# The authoritative verdict is datapatch's OWN log validation, which it prints
+```
+
+`datapatch's`. One apostrophe, odd count, inside a free-form module argument.
+Ansible's `split_args` counts quote characters across the whole block, so that
+single character unbalances the task and the playbook fails to parse — exactly
+#144 and #153, in a comment whose subject was being careful.
+
+**What makes this entry worth writing rather than just fixing:** the rule was
+already known, already documented, and already had a check. Knowing a rule does
+not apply it. The check did.
+
+**Fix:** the prose moved to a **task-level YAML comment**, above `shell:`, which
+is stripped before templating and is therefore safe at any length with any
+punctuation. The shell block keeps one plain `echo`. A note in that comment now
+tells the next editor why the prose lives where it does.
+
+### 156b. `$?` after a `||` compound is always 0
+
+`syntax-check.sh` check 9 reported the apostrophe correctly, then printed
+`ok none found` on the very next line:
+
+```
+   FAIL  roles\oem_repo_patch\tasks\main.yml:1935: ...
+   checked, 1 issue(s)
+   ok    none found
+```
+
+The cause:
+
+```bash
+python3 - <<'PY' || FAILED=1
+...
+PY
+[ $? -eq 0 ] && ok "none found"       # WRONG
+```
+
+`$?` there is not python's exit status. It is the status of the whole
+`cmd || assignment` compound, and the assignment always succeeds, so `$?` is
+**always 0** and the `ok` always fires. The overall gate still worked — `FAILED`
+was set, and the run ended with `FAILURES ABOVE` — but the per-check line said
+both things at once.
+
+**Fix:**
+
+```bash
+python3 - <<'PY'
+...
+PY
+rc=$?
+if [ "$rc" -eq 0 ]; then ok "none found"; else FAILED=1; fi
+```
+
+Capture the status on its own line before anything else runs. Same class as
+#109: gate on a positive marker rather than on something adjacent to it.
+
+### 156c. A missing dependency reported as six playbook failures
+
+Run from Git Bash / MINGW64 on the Windows side instead of from WSL2,
+`syntax-check.sh` produced:
+
+```
+   FAIL  site.yml
+         syntax-check.sh: line 79: ansible-playbook: command not found
+   FAIL  oem-repo-patch.yml
+   ... four more identical ...
+FAILURES ABOVE — do not run the playbook yet.
+```
+
+Six red failures and a red banner, none of which said anything about the
+playbooks. The script already handled a missing PyYAML gracefully with a `SKIP`
+and an explanation; it did not extend the same courtesy to a missing
+`ansible-playbook`.
+
+**Fix:** `command -v ansible-playbook` gates the loop, and its absence prints a
+`SKIP` naming the WSL2 path where ansible actually lives.
+
+**The connecting rule, and it is the same one as #155:** a check that reports a
+red failure for its own missing dependency, or that reports two verdicts at once,
+teaches the reader to stop believing the banner. The cost is not the noise. It is
+the real failure that goes unread inside it.
 {% endraw %}
