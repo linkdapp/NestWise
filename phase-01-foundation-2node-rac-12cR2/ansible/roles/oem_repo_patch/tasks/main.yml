@@ -1,0 +1,2347 @@
+---
+# Patches the OEM Management Repository database on oemserver01 from 19.19.0.0.0
+# to 19c RU32 (39472050, the Database Release Update component of combo 39467003).
+#
+# WHY THIS IS AUTOMATED, when db_silent_install's equivalent step deliberately is
+# NOT: docs/patching-strategy.md stops at a manual pause before applying a patch,
+# and that was right there — a RAC-registered 12.2 home, two cluster nodes, and
+# opatchauto behaviour not confirmed safe for a non-interactive command: task.
+# None of that applies here. oemserver01 is single-instance, no Grid
+# Infrastructure, no second node, no cluster registration. The safety comes from
+# the confirm gate instead.
+#
+# SAFETY GATE: refuses to run without -e oem_patch_confirm=yes.
+#
+# LOGGING: every shell task echoes its commands (set -x) and tees stdout+stderr
+# to {{ oem_repo_log }} on the target host. A patch you cannot reconstruct
+# afterwards is a patch you cannot defend in a post-incident review.
+#
+# SQL*Plus FORMATTING: every heredoc sets TAB OFF. SQL*Plus defaults to TAB ON
+# and pads output with tab characters, which mangles alignment and makes captured
+# output painful to read back. TRIMSPOOL ON strips trailing whitespace for the
+# same reason.
+
+# =============================================================================
+# 0. Preflight — all read-only, safe to run on its own
+# =============================================================================
+
+- name: Refuse to run without explicit confirmation
+  fail:
+    msg: >
+      This role stops the OMS and patches the OEM repository database. Re-run with
+      -e oem_patch_confirm=yes once you have a maintenance window and have read
+      monitoring/phase-7a-repository-db-ru32.md.
+  when: oem_patch_confirm | default('no') != 'yes'
+  tags: [oem_repo_patch, always]
+
+- name: Fail fast if patch variables are unset
+  fail:
+    msg: >
+      oem_repo_ru_patch_id / oem_repo_oracle_home are still REPLACE_ME in
+      group_vars/all.yml. Refusing to guess a patch number or an Oracle home.
+  when: >
+    oem_repo_ru_patch_id == "REPLACE_ME" or
+    oem_repo_oracle_home == "REPLACE_ME"
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+# TAGGED `always` DELIBERATELY. Everything downstream references oem_repo_log,
+# oem_run_ts and (later) oem_repo_sid. Without `always`, running a single tag
+# such as --tags oem_repo_patch_apply leaves them undefined and the role dies on
+# an unhelpful templating error rather than doing the work.
+- name: Set the run timestamp and log path
+  set_fact:
+    oem_run_ts: "{{ ansible_date_time.iso8601_basic_short }}"
+    oem_repo_log: "{{ oem_repo_log_dir }}/oem_repo_patch_{{ ansible_date_time.iso8601_basic_short }}.log"
+  tags: [always]
+
+- name: Ensure the log and staging directories exist
+  # oemserver01 sits outside the phase-01 build, so neither path can be assumed
+  # to exist the way it does on the RAC nodes.
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0755"
+  loop:
+    - "{{ oem_repo_log_dir }}"
+    - "{{ oem_repo_staging_dir }}/patches"
+  tags: [always]
+
+- name: Open the run log
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "============================================================"
+    echo " OEM repository patch run"
+    echo " started    : $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo " host       : $(hostname -f)"
+    echo " combo      : {{ oem_repo_combo_patch_id }}"
+    echo " component  : {{ oem_repo_ru_patch_id }}"
+    echo " oracle home: {{ oem_repo_oracle_home }}"
+    echo " mechanism  : {{ oem_repo_apply_mechanism }}"
+    echo "============================================================"
+  args:
+    executable: /bin/bash
+  changed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+# This check exists because of a genuine ambiguity in this project's own notes.
+# group_vars/all.yml describes this path as an "Oracle Client (19.19 DGMGRL)" and
+# inventory/hosts.ini calls it a DB Home "used only for its dgmgrl client", while
+# emctl reports the EM instance home beneath it. A client home and a repository
+# database home are not the same thing. Prove a database runs here before
+# touching anything.
+#
+# WHY THIS IS SPLIT INTO TWO TASKS — A LOGGED DIAGNOSTIC AND A SILENT CAPTURE:
+#
+# It used to be one task that tee'd to the run log, ran under `set -x`, AND had
+# its stdout parsed for the SID. Three attempts to make that parse reliable all
+# failed, each differently:
+#
+#   1. Match the line that is purely alphanumeric. Broke because `set -x` writes
+#      to stderr and `exec > >(tee ...) 2>&1` merges it into stdout. Two writers
+#      into one pipe are not line-atomic, so trace and output interleave
+#      mid-line. A healthy database was reported down.
+#   2. Turn xtrace off and emit a `PMON_SID=` marker. Still wrong: the literal
+#      shell source reached the captured stream, and the regex character class
+#      allowed `$`, so it matched `PMON_SID=$(ps ...` and set the SID to `$`.
+#      Every later task then looked for `ora_pmon_$`.
+#   3. Tighten the regex — which is where this stopped being a parsing problem
+#      and started being a design problem.
+#
+# The fault was never the pattern. It was asking one stream to be a human-readable
+# log AND a machine-readable value at the same time. Logging wants banners,
+# timestamps and tracing; capture wants exactly one token and nothing else. Those
+# requirements are in direct conflict, and any regex is just negotiating between
+# them.
+#
+# So: the first task logs and traces, and nothing reads it. The second runs no
+# tee, no trace and no banner, so its stdout IS the value — no marker, no regex,
+# nothing to interleave with. See docs/known-risks.md #153.
+#
+# The same split is worth applying to any other task here whose output is both
+# logged and parsed. The counters further down get away with markers because
+# their SQL*Plus output is not under xtrace.
+#
+# NOTE ON COMMENT PLACEMENT: this explanation lives here, at TASK level, not
+# inside the `shell:` block. Ansible runs a shell block through its own argument
+# splitter, which counts quote characters — so a prose apostrophe in an in-block
+# comment opens a quote that never closes and the whole playbook fails to parse.
+# YAML comments at task level are stripped before templating and can say
+# anything. Keep prose out here.
+- name: Log the running-instance diagnostic
+  # OBSERVABILITY ONLY. Nothing parses this task. It tees to the run log and
+  # traces, which is what makes a run reconstructable afterwards.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] discover running instance ---"
+    set -x
+    ps -eo pid= -o args= | awk '$2 ~ /^ora_pmon_/' || true
+    ps -eo pid= -o args= | awk '$2 ~ /^ora_pmon_/ { found=1 } END { if (!found) print "(no ora_pmon process found)" }'
+  args:
+    executable: /bin/bash
+  changed_when: false
+  failed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Capture the running SID
+  # DATA CAPTURE ONLY. No tee, no set -x, no banner — stdout is the value and
+  # nothing else, so it needs no marker and no regex to read back.
+  #
+  # MATCHES THE FIRST TOKEN OF args, NOT A SUBSTRING OF THE WHOLE COMMAND LINE.
+  # This is the fix for the self-match described in the task-level comment above:
+  # `ps -ef | grep ora_pmon_` matched the bash process running THIS script,
+  # because the script text contains `ora_pmon_`. Anchoring on the first argv
+  # token cannot do that — a real pmon has argv[0] == "ora_pmon_<sid>", whereas
+  # this script has argv[0] == "/bin/bash".
+  #
+  # `ps -eo args=` rather than `ps -ef`: one column, no header, so $1 IS argv[0]
+  # regardless of username or PID width.
+  #
+  # NOTE THE OPTION FORM. `ps -eo pid=,args=` looks equivalent and is not: with
+  # `-o field=HEADER` the header text runs to the END OF THE ARGUMENT, so `pid=`
+  # swallows `,args=` as its header and ps emits a SINGLE pid column. $2 is then
+  # always empty and nothing ever matches. Where more than one column is genuinely
+  # needed, use separate flags: `ps -eo pid= -o args=`.
+  shell: |
+    set -o pipefail
+    ps -eo args= | awk '$1 ~ /^ora_pmon_/ { print substr($1, 10); exit }'
+  args:
+    executable: /bin/bash
+  register: oem_pmon
+  changed_when: false
+  failed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Fail if no running instance was found
+  fail:
+    msg: >
+      No ora_pmon process on {{ inventory_hostname }}. Either the repository
+      database is not on this host, or it is down. Confirm where the OEM
+      repository actually runs before proceeding. The diagnostic dump is in
+      {{ oem_repo_log }}.
+  when: (oem_pmon.stdout | default('') | trim) | length == 0
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Record the discovered SID
+  # `tags: [always]` so a narrow --tags run still gets the fact — but the task it
+  # DERIVES from is preflight-tagged, so under e.g. --tags oem_repo_patch_stage
+  # the discovery is skipped and this ran against an undefined oem_pmon,
+  # crashing the whole play. `always` on a derived fact without this guard is
+  # worse than no tag at all: it guarantees the failure it was meant to prevent.
+  # Consumers are protected by the preflight-facts gate further down instead.
+  # No regex. The capture task emits the SID and nothing else, so stdout IS the
+  # value — see the task-level comment above it for why anything cleverer than
+  # this kept going wrong.
+  set_fact:
+    oem_repo_sid: "{{ oem_pmon.stdout | trim }}"
+  when:
+    - oem_pmon is defined
+    - (oem_pmon.stdout | default('') | trim) | length > 0
+  tags: [always]
+
+- name: Confirm the instance actually runs from the target Oracle home
+  # A SID alone is not proof. If two homes exist on this host, patching the wrong
+  # one is silent until something breaks.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] confirm instance home ---"
+    set -x
+    PMON_PID=$(ps -eo pid= -o args= | awk -v s="ora_pmon_{{ oem_repo_sid }}" '$2 == s { print $1; exit }')
+    echo "PMON_PID=${PMON_PID}"
+    ls -l /proc/${PMON_PID}/exe
+    readlink -f /proc/${PMON_PID}/exe
+  args:
+    executable: /bin/bash
+  register: oem_home_check
+  changed_when: false
+  failed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Fail if the running instance is not from the target home
+  fail:
+    msg: >
+      Instance {{ oem_repo_sid }} does not appear to run from
+      {{ oem_repo_oracle_home }}. Resolved binary was:
+      {{ oem_home_check.stdout | default('unknown') }}
+  when: oem_repo_oracle_home not in (oem_home_check.stdout | default(''))
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Check free space on the Oracle mount
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] free space ---"
+    set -x
+    df -h {{ oem_repo_oracle_home }}
+  args:
+    executable: /bin/bash
+  changed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Capture free space on the Oracle home mount, in KB
+  # Clean capture: no tee, no trace, no marker, no regex. stdout is the number.
+  # Same split as the SID capture — anything that both logs and is parsed
+  # eventually gets parsed wrong.
+  command: df -P {{ oem_repo_oracle_home }}
+  register: oem_free_df
+  changed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Fail if free space is below the floor
+  fail:
+    msg: >
+      Below the {{ oem_repo_min_free_gb }} GB floor on the mount holding
+      {{ oem_repo_oracle_home }}. OPatch backs up the existing home before
+      patching; running out mid-apply is a bad place to stop.
+  # No regex. df's second line, fourth field, is available KB — read with plain
+  # list indexing on the clean capture above.
+  when: >
+    (oem_free_df.stdout_lines[1].split()[3] | int)
+    < (oem_repo_min_free_gb | int * 1048576)
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Determine whether the repository database is a CDB
+  # This is not a detail. Oracle's README §3.3.2 gives TWO different datapatch
+  # procedures (its Table 2), and the multitenant one has an extra mandatory step:
+  #
+  #   SQL> alter pluggable database all open;
+  #
+  # before datapatch runs. Skip it on a CDB and datapatch patches CDB$ROOT plus
+  # whichever PDBs happen to be open, silently leaving the closed ones on an
+  # unpatched dictionary. That is exactly the state that bites later, at unplug/
+  # plug time or on the next open.
+  #
+  # ANSWERED 2026-08-31 against the live database: `SELECT cdb FROM v$database`
+  # returns NO. OEMCDB is a non-CDB, despite the name. So the non-CDB path is what
+  # actually runs today and the ALTER PLUGGABLE DATABASE branch stays dormant.
+  #
+  # The detection stays anyway, deliberately, rather than being collapsed into a
+  # variable now that the answer is known. Phase 7d converts this database to a
+  # CDB, and on that day the branch must already exist — a hardcoded "non-CDB"
+  # would keep working silently and patch only CDB$ROOT. Detection costs one query
+  # against an already-running instance; being wrong here costs a PDB left on an
+  # unpatched dictionary that nothing warns about until it is opened or unplugged.
+  #
+  # It also earns its keep as documentation: a database named OEMCDB that is not a
+  # CDB will mislead someone, and this task prints the answer into the run log
+  # every time.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] CDB detection ---"
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus / as sysdba <<'SQL'
+    SET TAB OFF TRIMSPOOL ON HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+    SELECT 'IS_CDB=' || cdb FROM v$database;
+    SELECT 'DB_NAME=' || name FROM v$database;
+    EXIT
+    SQL
+  args:
+    executable: /bin/bash
+  register: oem_cdb_check
+  changed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Record whether this is a CDB
+  # `always` for the same reason as the other set_facts here: the datapatch step
+  # branches on it, and a partial tag run that skipped this would die on an
+  # undefined variable rather than doing the work.
+  set_fact:
+    oem_repo_is_cdb: "{{ 'IS_CDB=YES' in (oem_cdb_check.stdout | default('')) }}"
+  # Same reason as the SID fact above — the detection task is preflight-tagged.
+  when: oem_cdb_check is defined
+  tags: [always]
+
+- name: Report the CDB determination
+  debug:
+    msg: >-
+      {{ oem_repo_sid }} is {{ 'a CDB — datapatch will be preceded by ALTER
+      PLUGGABLE DATABASE ALL OPEN' if oem_repo_is_cdb | bool else 'a non-CDB — the
+      single-instance datapatch path applies' }}.
+      Raw: {{ oem_cdb_check.stdout_lines | default([]) | join(' ') }}
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Capture the PRE-patch database baseline
+  # Three separate images, all needed, none derivable from the others:
+  #
+  #   dba_invalid_objects   — named objects, not just a count. "42 invalid" is
+  #                           unreadable without knowing WHICH 42, and the
+  #                           by-name list is what makes a post-patch diff
+  #                           meaningful.
+  #   dba_registry          — COMPONENT status. A patch can leave a component
+  #                           INVALID or parked at UPGRADED, and that is
+  #                           invisible in an object-level check. Without a
+  #                           pre-image you cannot tell whether you caused it.
+  #   dba_registry_sqlpatch — what was already applied, with INSTALL_ID,
+  #                           PATCH_UID and FLAGS, so the post-patch row can be
+  #                           identified unambiguously rather than by patch_id
+  #                           alone.
+  #
+  # Written to its own file as well as the run log, so the post-patch capture can
+  # be diffed against it directly.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] PRE-patch database baseline ---"
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus / as sysdba <<'SQL' | tee {{ oem_repo_log_dir }}/baseline_pre_{{ oem_run_ts }}.txt
+    SET TAB OFF TRIMSPOOL ON PAGESIZE 500 LINESIZE 300 FEEDBACK OFF ECHO OFF
+
+    PROMPT ===== dba_invalid_objects =====
+    COLUMN owner FORMAT A30
+    COLUMN object_name FORMAT A40
+    COLUMN object_type FORMAT A25
+    SELECT owner, object_name, object_type
+      FROM dba_invalid_objects
+     ORDER BY owner, object_type, object_name;
+
+    PROMPT ===== dba_registry (component status) =====
+    COLUMN comp_name FORMAT A40
+    COLUMN comp_id FORMAT A10
+    COLUMN version FORMAT A12
+    COLUMN status FORMAT A12
+    SELECT SUBSTR(comp_name,1,40) comp_name,
+           SUBSTR(comp_id,1,10)   comp_id,
+           SUBSTR(version,1,12)   version,
+           status
+      FROM dba_registry
+     ORDER BY comp_name;
+
+    PROMPT ===== dba_registry_sqlpatch =====
+    -- patch_type, NOT version. dba_registry_sqlpatch has no `version` column and
+    -- the first real run proved it: ORA-00904: "VERSION": invalid identifier.
+    -- (There are ru_version and source_version columns, but the one that belongs
+    -- in this summary is patch_type — INTERIM vs RU.)
+    SET LINESIZE 300
+    COLUMN action_time FORMAT A30
+    COLUMN status FORMAT A12
+    SELECT install_id, patch_id, patch_uid, patch_type, action, status, flags, action_time
+      FROM dba_registry_sqlpatch
+     ORDER BY action_time;
+
+    PROMPT ===== counters =====
+    SET HEADING OFF
+    SELECT 'PRE_INVALID_COUNT=' || COUNT(*) FROM dba_invalid_objects;
+    SELECT 'PRE_REGISTRY_NOT_VALID=' || COUNT(*) FROM dba_registry WHERE status <> 'VALID';
+    EXIT
+    SQL
+  args:
+    executable: /bin/bash
+  register: oem_invalid_pre
+  changed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Show the pre-patch baseline
+  debug:
+    var: oem_invalid_pre.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+- name: Record the pre-patch counters
+  # `always`: the verification step compares against these, and a partial run
+  # that skipped them would silently compare against nothing.
+  set_fact:
+    # regex_findall + a ['0'] fallback appended to the list, so `first` can never
+    # be called on an empty result. The previous `regex_search(...) | first |
+    # default(0)` form raises before `default` is reached when there is no match —
+    # that is the "Unknown argument" failure the free-space check hit.
+    oem_invalid_pre_count: "{{ (oem_invalid_pre.stdout | regex_findall('PRE_INVALID_COUNT=(\\d+)') + ['0']) | first }}"
+    oem_registry_pre_bad: "{{ (oem_invalid_pre.stdout | regex_findall('PRE_REGISTRY_NOT_VALID=(\\d+)') + ['0']) | first }}"
+  # Same reason as the SID fact above — the baseline task is preflight-tagged.
+  when: oem_invalid_pre is defined
+  tags: [always]
+
+- name: Report preflight summary
+  debug:
+    msg:
+      - "SID              : {{ oem_repo_sid }}"
+      - "ORACLE_HOME      : {{ oem_repo_oracle_home }}"
+      - "Invalid (pre)    : {{ oem_invalid_pre_count }}"
+      - "Expected targets : {{ oem_repo_expected_targets }}"
+      - "Log              : {{ oem_repo_log }}"
+  tags: [oem_repo_patch, oem_repo_patch_preflight]
+
+# =============================================================================
+# 1. Staging and OPatch
+# =============================================================================
+
+- name: Check whether the RU zip is already on this host
+  stat:
+    path: "{{ oem_repo_ru_zip }}"
+  register: oem_ru_zip_stat
+  tags: [oem_repo_patch, oem_repo_patch_preflight, oem_repo_patch_stage]
+
+- name: Confirm the source zip exists on the RAC node
+  # The combo RU was downloaded once for the GI build and lives on
+  # oradbserv05. Nothing here fetches from MOS: credentials and licensing make
+  # that a manual, out-of-band step, same stance as patch_before_config.
+  stat:
+    path: "{{ staging_dir }}/patches/{{ oem_repo_ru_zip | basename }}"
+  register: oem_ru_zip_src
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  when: not oem_ru_zip_stat.stat.exists
+  tags: [oem_repo_patch, oem_repo_patch_preflight, oem_repo_patch_stage]
+
+- name: Fail if the zip is on neither host
+  fail:
+    msg: >
+      {{ oem_repo_ru_zip | basename }} not found on {{ inventory_hostname }} or on
+      {{ groups['rac_node1'][0] }} at {{ staging_dir }}/patches/. This is the same
+      combo RU used for the GI build (see docs/patching-strategy.md). Download it
+      from My Oracle Support onto {{ groups['rac_node1'][0] }} first.
+  when:
+    - not oem_ru_zip_stat.stat.exists
+    - not (oem_ru_zip_src.stat.exists | default(false))
+  tags: [oem_repo_patch, oem_repo_patch_preflight, oem_repo_patch_stage]
+
+- name: Copy the RU zip from the RAC node to oemserver01
+  # Direct rsync push, running ON oradbserv05. The oracle-user SSH trust this
+  # depends on is established by the first play in oem-repo-patch.yml, which
+  # calls the generalised ssh_equivalence role with ssh_equiv_sources/
+  # ssh_equiv_targets pointed at oradbserv05 -> oemserver01, one direction only.
+  # cross_cluster_ssh_trust is retired — see docs/known-risks.md #141.
+  #
+  # If this fails on authentication, the trust play did not run or did not
+  # succeed. Run it on its own and read its verification output:
+  #   ansible-playbook -i inventory/hosts.ini oem-repo-patch.yml \
+  #     -e oem_patch_confirm=yes --tags ssh_trust
+  # Invokes the real `rsync` binary through ansible-core's `command` module, NOT
+  # ansible.posix's `synchronize`. Two reasons, and this task used `synchronize`
+  # until 2026-08-31:
+  #
+  # 1. This project deliberately does not depend on the ansible.posix collection.
+  #    ssh_equivalence's own header says so, db19c_software_install's cross-cluster
+  #    copy says so — and then this task quietly took the dependency anyway.
+  #
+  # 2. `synchronize` and `become` interact badly. It decides the remote-side user
+  #    from the inventory host's connection user rather than from become_user, so
+  #    with the play now running as oracle it would still have tried
+  #    `ansible@oemserver01:` — against a trust that exists for oracle only.
+  #
+  # Explicit rsync makes the identity unambiguous: it runs as oracle on
+  # oradbserv05, and SSHes as oracle to oemserver01, which is exactly the trust
+  # the first play verified. Same form db19c_software_install uses for its own
+  # cross-cluster push, confirmed working on these hosts 2026-08-21.
+  become: true
+  become_user: "{{ oracle_user }}"
+  command: >
+    rsync -avh --progress -e 'ssh -o BatchMode=yes -o ConnectTimeout=5'
+    {{ staging_dir }}/patches/{{ oem_repo_ru_zip | basename }}
+    {{ groups['observer_nodes'][0] }}:{{ oem_repo_staging_dir }}/patches/
+  register: oem_ru_zip_rsync
+  changed_when: oem_ru_zip_rsync.rc == 0
+  delegate_to: "{{ groups['rac_node1'][0] }}"
+  when: not oem_ru_zip_stat.stat.exists
+  tags: [oem_repo_patch, oem_repo_patch_stage]
+
+- name: Show the RU zip copy result
+  # No silent copies. Deliberately NOT failed_when: false the way
+  # db19c_software_install's equivalent is — that role has a controller-routed
+  # fallback to fall back TO, and this one does not. Here a failed copy must stop
+  # the run, so the task's own non-zero rc is left to do it.
+  debug:
+    msg:
+      - "On {{ groups['rac_node1'][0] }}: rsync -> {{ groups['observer_nodes'][0] }}:{{ oem_repo_staging_dir }}/patches/"
+      - "rc     : {{ oem_ru_zip_rsync.rc | default('(skipped)') }}"
+      - "stdout : {{ oem_ru_zip_rsync.stdout_lines | default([]) }}"
+      - "stderr : {{ oem_ru_zip_rsync.stderr_lines | default([]) }}"
+  when: not oem_ru_zip_stat.stat.exists
+  tags: [oem_repo_patch, oem_repo_patch_stage]
+
+- name: Confirm the zip is now present on oemserver01
+  stat:
+    path: "{{ oem_repo_ru_zip }}"
+  register: oem_ru_zip_final
+  failed_when: not oem_ru_zip_final.stat.exists
+  tags: [oem_repo_patch, oem_repo_patch_stage]
+
+- name: Copy the OPatch zip across if it isn't here already
+  # Same trust, same mechanism. Skipped entirely when oem_repo_update_opatch is
+  # false.
+  block:
+    - name: Check for the OPatch zip on this host
+      stat:
+        path: "{{ oem_repo_opatch_zip }}"
+      register: oem_opatch_zip_stat
+
+    - name: Copy the OPatch zip from the RAC node
+      # Same explicit-rsync reasoning as the RU zip copy above.
+      become: true
+      become_user: "{{ oracle_user }}"
+      command: >
+        rsync -avh --progress -e 'ssh -o BatchMode=yes -o ConnectTimeout=5'
+        {{ oem_repo_opatch_zip }}
+        {{ groups['observer_nodes'][0] }}:{{ oem_repo_opatch_zip | dirname }}/
+      register: oem_opatch_zip_rsync
+      changed_when: oem_opatch_zip_rsync.rc == 0
+      delegate_to: "{{ groups['rac_node1'][0] }}"
+      when: not oem_opatch_zip_stat.stat.exists
+
+    - name: Show the OPatch zip copy result
+      debug:
+        msg:
+          - "rc     : {{ oem_opatch_zip_rsync.rc | default('(skipped)') }}"
+          - "stderr : {{ oem_opatch_zip_rsync.stderr_lines | default([]) }}"
+      when: not oem_opatch_zip_stat.stat.exists
+  when: oem_repo_update_opatch | bool
+  tags: [oem_repo_patch, oem_repo_patch_stage]
+
+- name: Check whether both combo components are already extracted
+  # Runs BEFORE the unzip and drives it. Per docs/known-risks.md #154, a looped
+  # task carries no real failed_when — the verdict is evaluated separately.
+  stat:
+    path: "{{ item }}"
+  register: oem_combo_pre
+  changed_when: false
+  failed_when: false
+  loop:
+    - "{{ oem_repo_ru_patch_path }}"
+    - "{{ oem_repo_ojvm_patch_path }}"
+  loop_control:
+    label: "{{ item | basename }}"
+  tags: [oem_repo_patch, oem_repo_patch_stage]
+
+- name: Unzip the combo RU into the patches staging directory
+  # dest is the PARENT patches/ dir. Oracle's zip already contains its own
+  # top-level folder; naming the patch in dest double-nests it. Same trap
+  # documented in patch_before_config, repeated because it is easy to reintroduce.
+  #
+  # GATED ON BOTH COMPONENTS, NOT ON `creates:`. This used to carry
+  # `creates: .../patches/39618649` — the PARENT directory. That is too coarse:
+  # deleting one component to test the re-extract path (say
+  # `rm -rf 39618649/39222882`) leaves the parent in place, so `creates:` matched,
+  # the unzip was skipped, and the verification below failed with no way to
+  # recover except deleting the parent by hand.
+  #
+  # Keying on the actual components means the role self-heals from a partial
+  # removal, which is exactly the state a re-extract test produces. Still cheap on
+  # the happy path: both present, the whole 2.5 GB unarchive is skipped.
+  unarchive:
+    src: "{{ oem_repo_ru_zip }}"
+    dest: "{{ oem_repo_staging_dir }}/patches"
+    remote_src: true
+    owner: "{{ oracle_user }}"
+    group: oinstall
+  when: >
+    (oem_combo_pre.results
+     | map(attribute='stat.isdir', default=false)
+     | select() | list | length) < 2
+  tags: [oem_repo_patch, oem_repo_patch_stage]
+
+- name: Confirm both combo components exist
+  # Combo 39618649 unzips into exactly two directories, and BOTH are applied to
+  # this home:
+  #   39472050  Database Release Update
+  #   39222882  OJVM Component Release Update
+  # Unlike the old GI combo, there is nothing here that belongs to a Grid home,
+  # so nothing is skipped.
+  #
+  # NO `failed_when` ON THIS TASK. Two attempts at one both failed against
+  # directories that demonstrably existed:
+  #
+  #   failed_when: not (oem_combo_components.stat.isdir | default(false))
+  #       -> the register is not assigned until the whole loop finishes, so this
+  #          resolved to false every iteration and `not false` failed the task.
+  #   failed_when: not (stat.isdir | default(false))
+  #       -> also failed, with `stat.isdir: true` plainly in the result output.
+  #
+  # Rather than keep guessing at what is in scope inside a loop-scoped
+  # conditional, the check moved to a separate task below, which runs AFTER the
+  # loop where `oem_combo_components.results` is unambiguously defined. That is
+  # the general fix for this whole family of bugs: stop evaluating conditions in
+  # a context whose variable scope is uncertain, and evaluate them somewhere the
+  # data definitely exists.
+  stat:
+    path: "{{ item }}"
+  register: oem_combo_components
+  loop:
+    - "{{ oem_repo_ru_patch_path }}"
+    - "{{ oem_repo_ojvm_patch_path }}"
+  tags: [oem_repo_patch, oem_repo_patch_stage]
+
+- name: Report the combo component directories
+  debug:
+    msg: >-
+      {{ item.item }} —
+      {{ 'present' if (item.stat.isdir | default(false)) else 'MISSING' }}
+  loop: "{{ oem_combo_components.results }}"
+  loop_control:
+    label: "{{ item.item | basename }}"
+  tags: [oem_repo_patch, oem_repo_patch_stage]
+
+- name: Fail if either combo component directory is missing
+  # Evaluated after the loop, against `.results`, which is the one place this data
+  # is reliably available. `map(attribute=..., default=false)` tolerates the
+  # not-found case, where `stat` has `exists: false` and carries no `isdir` key at
+  # all — without the default that lookup raises instead of returning false.
+  fail:
+    msg: >
+      Expected both combo components under
+      {{ oem_repo_staging_dir }}/patches/{{ oem_repo_combo_patch_id }}/ after the
+      unzip: {{ oem_repo_ru_patch_id }} (Database RU) and
+      {{ oem_repo_ojvm_patch_id }} (OJVM). At least one is missing — see the
+      report above. Check the zip is the OJVM+DBRU combo and not a
+      single-component patch.
+  when: >
+    (oem_combo_components.results
+     | map(attribute='stat.isdir', default=false)
+     | select() | list | length) < 2
+  tags: [oem_repo_patch, oem_repo_patch_stage]
+
+- name: Update OPatch in the target home
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] OPatch update ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    $ORACLE_HOME/OPatch/opatch version
+    if [ ! -d $ORACLE_HOME/OPatch.pre_{{ oem_repo_ru_patch_id }} ]; then
+      mv $ORACLE_HOME/OPatch $ORACLE_HOME/OPatch.pre_{{ oem_repo_ru_patch_id }}
+      unzip -q -o {{ oem_repo_opatch_zip }} -d $ORACLE_HOME
+    fi
+    $ORACLE_HOME/OPatch/opatch version
+  args:
+    executable: /bin/bash
+    creates: "{{ oem_repo_oracle_home }}/OPatch.pre_{{ oem_repo_ru_patch_id }}"
+  when: oem_repo_update_opatch | bool
+  register: oem_opatch_update
+  tags: [oem_repo_patch, oem_repo_patch_opatch]
+
+- name: Show OPatch update output
+  debug:
+    var: oem_opatch_update.stdout_lines
+  when: oem_repo_update_opatch | bool
+  tags: [oem_repo_patch, oem_repo_patch_opatch]
+
+- name: Record the pre-patch OPatch inventory
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] pre-patch inventory ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    $ORACLE_HOME/OPatch/opatch lsinventory -detail \
+      > {{ oem_repo_log_dir }}/lsinventory_pre_{{ oem_run_ts }}.txt
+    $ORACLE_HOME/OPatch/opatch lspatches
+  args:
+    executable: /bin/bash
+  register: oem_lsinventory_pre
+  changed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_opatch]
+
+- name: Show the pre-patch patch list
+  debug:
+    var: oem_lsinventory_pre.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_opatch]
+
+- name: Check OPatch meets the patch's own minimum version
+  # Oracle's README for 39472050, §3.1.3 step 3. Worth noting what that README
+  # does NOT say: it names no minimum OPatch version number at all — the check is
+  # programmatic. That resolves the open question left in group_vars/all.yml next
+  # to oem_repo_opatch_zip ("check 39472050's own README for the minimum OPatch
+  # version"). There is nothing to look up; you run this and read the result.
+  #
+  # Governed by return code rather than by string-matching OPatch's output. This
+  # project does not have a confirmed capture of that output's exact wording for
+  # this OPatch version, and inventing one that silently never matches is worse
+  # than no check at all.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] CheckMinimumOPatchVersion ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    cd {{ oem_repo_ru_patch_path }}
+    $ORACLE_HOME/OPatch/opatch prereq CheckMinimumOPatchVersion \
+      -phBaseDir {{ oem_repo_ru_patch_path }}
+  args:
+    executable: /bin/bash
+  register: oem_opatch_min
+  changed_when: false
+  failed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_opatch]
+
+- name: Show the minimum-OPatch-version result
+  debug:
+    var: oem_opatch_min.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_opatch]
+
+- name: Fail if OPatch is older than this patch requires
+  fail:
+    msg: >
+      CheckMinimumOPatchVersion returned {{ oem_opatch_min.rc }} against
+      {{ oem_repo_ru_patch_path }}. Update OPatch in {{ oem_repo_oracle_home }}
+      before applying — set oem_repo_update_opatch: true, or stage a newer
+      OPatch zip at {{ oem_repo_opatch_zip }}. See {{ oem_repo_log }}.
+  when: oem_opatch_min.rc != 0
+  tags: [oem_repo_patch, oem_repo_patch_opatch]
+
+- name: Run the interim-patch conflict check
+  # Oracle's README §3.1.3 step 4, verbatim in form:
+  #
+  #   $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail \
+  #     -phBaseDir <UNZIPPED_PATCH_LOCATION>/39472050/
+  #
+  # TWO CORRECTIONS TO WHAT THIS TASK USED TO DO, both from reading that README
+  # rather than reasoning from this project's earlier notes:
+  #
+  # 1. The flag is -phBaseDir, not -ph. This task previously used -ph. They are
+  #    not synonyms, and the documented one is -phBaseDir.
+  #
+  # 2. It is no longer swallowed with `|| true`. The old comment justified that
+  #    with "Release Updates are System Patches, and OPatch refuses plain
+  #    prereq/apply against them." That is true of the GI combo 39467003, which
+  #    IS a system patch — it is NOT true of 39472050, the Database RU component
+  #    inside it, which is what this role actually applies. Oracle's README for
+  #    39472050 documents plain `opatch prereq` and plain `opatch apply` for it
+  #    directly. A conflict check that cannot fail is decoration, and this one had
+  #    been reasoned into being decoration on the strength of a note about a
+  #    different patch.
+  #
+  # The report names conflicting patches and superset patches. A superset is not a
+  # blocker; a genuine conflict needs a resolution patch from My Oracle Support
+  # (Oracle's README points at KB145571) before this run should continue. That
+  # judgement is a human's, hence the override rather than an automatic bypass.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] CheckConflictAgainstOHWithDetail ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+
+    echo "=== Database RU {{ oem_repo_ru_patch_id }} ==="
+    $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail \
+      -phBaseDir {{ oem_repo_ru_patch_path }}
+    {% if oem_repo_apply_ojvm | bool %}
+
+    echo "=== OJVM {{ oem_repo_ojvm_patch_id }} ==="
+    $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail \
+      -phBaseDir {{ oem_repo_ojvm_patch_path }}
+    {% endif %}
+  args:
+    executable: /bin/bash
+  register: oem_conflict_check
+  changed_when: false
+  failed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_opatch]
+
+- name: Show conflict check output
+  debug:
+    var: oem_conflict_check.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_opatch]
+
+- name: Fail if the conflict check did not pass
+  fail:
+    msg: |
+      `Prereq "checkConflictAgainstOHWithDetail" failed` — the full report is in
+      the task output above and in {{ oem_repo_log }}.
+
+      Note the exit code was {{ oem_conflict_check.rc }} and OPatch still printed
+      "OPatch succeeded". That refers to the OPatch RUN, not the prereq verdict.
+      The two are independent; this gate reads the verdict.
+
+      {% if 'ZOP-47' in (oem_conflict_check.stdout | default('')) %}
+      This is ZOP-47 — a SUPERSET finding, not a head-on conflict. The RU
+      supersedes the installed RU cleanly, but one-off patches layered on the
+      OLD RU are not carried forward: applying this RU will ROLL THEM BACK.
+
+      That is normal, common, and frequently the right outcome — a newer RU has
+      usually absorbed those fixes. But OPatch cannot determine whether it has,
+      so it stops and asks. Only you can answer it.
+
+      Decide by checking each one-off named above against this RU's bug list, or
+      via My Oracle Support (KB145571). Then either request merge patches for
+      the new RU, or accept losing them knowingly.
+      {% else %}
+      This is a head-on CONFLICT, not a superset. It needs a conflict-resolution
+      patch from My Oracle Support before this RU can be applied — Oracle's
+      README §3.1.3 points at KB145571 for whether one already exists, must be
+      requested, or the conflict can be ignored.
+      {% endif %}
+
+      Having decided deliberately, proceed with:
+
+        -e oem_repo_conflict_check_fatal=false
+
+      and record the decision and its reasoning in
+      monitoring/phase-7a-repository-db-ru32.md. A skipped conflict check that
+      nobody wrote down is indistinguishable from one nobody ran.
+  # GATE ON THE OUTPUT, NOT THE RETURN CODE.
+  #
+  # `opatch prereq` exits 0 even when the prereq FAILS. Confirmed on the real
+  # host: the report said
+  #
+  #   ZOP-47: The patch(es) has supersets with other patches ...
+  #   Prereq "checkConflictAgainstOHWithDetail" failed.
+  #   OPatch succeeded.
+  #
+  # and returned 0, so an rc-based gate skipped and the run walked straight past a
+  # genuine conflict. "OPatch succeeded" means the OPatch RUN succeeded, not that
+  # the prereq passed — two different things sharing one exit code.
+  #
+  # This is the same lesson as docs/known-risks.md #109, twice over: check a
+  # positive success marker, and make sure the thing being checked is actually
+  # capable of reporting failure. Two turns ago this task was rc-gated and I
+  # called that the fix for the `|| true` bug. It was not — it was the same bug
+  # with an extra step. See #150.
+  when:
+    - oem_repo_conflict_check_fatal | bool
+    # TWO checks now run in one task (DB RU and OJVM), so their verdicts share one
+    # stdout. Gating only on the presence of "passed" would let a FAILED DB RU
+    # check through whenever the OJVM check passed — the string would be there,
+    # just from the wrong verdict.
+    #
+    # So: fail if ANY verdict says failed, and also fail if NO verdict appears at
+    # all (which would mean the check did not really run — the empty-output case
+    # that gating purely on absence of "failed" would wave through).
+    - >-
+      'Prereq "checkConflictAgainstOHWithDetail" failed'
+      in (oem_conflict_check.stdout | default(''))
+      or 'Prereq "checkConflictAgainstOHWithDetail" passed'
+      not in (oem_conflict_check.stdout | default(''))
+  tags: [oem_repo_patch, oem_repo_patch_opatch]
+
+- name: Warn that a failed conflict check is being overridden
+  debug:
+    msg: >-
+      OVERRIDE: CheckConflictAgainstOHWithDetail returned
+      {{ oem_conflict_check.rc }} and oem_repo_conflict_check_fatal is false.
+      Proceeding deliberately. This must be written up.
+  when:
+    - not (oem_repo_conflict_check_fatal | bool)
+    # TWO checks now run in one task (DB RU and OJVM), so their verdicts share one
+    # stdout. Gating only on the presence of "passed" would let a FAILED DB RU
+    # check through whenever the OJVM check passed — the string would be there,
+    # just from the wrong verdict.
+    #
+    # So: fail if ANY verdict says failed, and also fail if NO verdict appears at
+    # all (which would mean the check did not really run — the empty-output case
+    # that gating purely on absence of "failed" would wave through).
+    - >-
+      'Prereq "checkConflictAgainstOHWithDetail" failed'
+      in (oem_conflict_check.stdout | default(''))
+      or 'Prereq "checkConflictAgainstOHWithDetail" passed'
+      not in (oem_conflict_check.stdout | default(''))
+  tags: [oem_repo_patch, oem_repo_patch_opatch]
+
+# =============================================================================
+# 2. Blackout (MANUAL), then ordered shutdown
+#
+# THE BLACKOUT IS CREATED BY HAND, NOT BY THIS ROLE. James's call, and correct:
+#
+#   "I create the blackout manually and when I confirm then ansible can continue
+#    with shutting down oem/agent/backup etc. Creating of the blackout would
+#    require emcli and sysman login credentials."
+#
+# Two reasons that is the right split:
+#
+#   1. Credentials. A proper blackout across the monitored targets goes through
+#      emcli, which needs a SYSMAN login. Those credentials do not belong in this
+#      repository, in group_vars, or on an Ansible command line.
+#   2. The automated attempt was silently broken, which is worse than absent.
+#      It sourced oms_env and ran `emctl start blackout` from the OMS home. That
+#      binary has no `start blackout` verb — blackouts are an AGENT emctl command
+#      — so it printed its own usage text, exited 0, and the task reported
+#      `changed: [oemserver01]`. Combined with `failed_when: false` it declared
+#      success having created nothing. See docs/known-risks.md #150.
+#
+# WHY THE BLACKOUT MUST EXIST BEFORE THE OMS GOES DOWN, not after:
+#
+#   1. Creating one talks to the OMS. Once the OMS is stopped there is no
+#      "later" — the window cannot be marked planned retroactively.
+#   2. When the stack returns, the agent uploads backlogged availability data
+#      covering the outage. Without a blackout that lands in the target's
+#      availability history as an UNPLANNED outage, with the notifications that
+#      come with it.
+# =============================================================================
+
+- name: PAUSE — create the blackout by hand, then confirm
+  # This is the hard stop. Nothing has been shut down at this point: the OMS,
+  # the agent, the listener and the database are all still up, and the Oracle
+  # home is untouched. Everything after this is destructive.
+  pause:
+    prompt: |
+
+      ============================================================
+       BLACKOUT CHECKPOINT — nothing has been shut down yet
+      ============================================================
+       Host : {{ inventory_hostname }}
+       SID  : {{ oem_repo_sid }}
+       Log  : {{ oem_repo_log }}
+
+       CREATE THE BLACKOUT NOW, then press Enter.
+
+       Console:
+         Enterprise > Monitoring > Blackouts and Brownouts > Create
+
+       Or emcli (needs a SYSMAN login — deliberately not automated):
+         emcli login -username=sysman
+         emcli create_blackout -name="{{ oem_repo_blackout_name }}" \
+           -add_targets="{{ inventory_hostname }}.{{ domain }}:host" \
+           -reason="19c RU32 repository patch" -schedule="duration:04:00"
+
+       Agent-side alternative, run AS oracle ON {{ inventory_hostname }}:
+         . {{ oem_repo_agent_env }}
+         emctl start blackout {{ oem_repo_blackout_name }} -nodeLevel
+         emctl status blackout
+
+       NOTE: that is the AGENT emctl, sourced from agent_env. The OMS
+       emctl has no blackout verb and will just print its usage text.
+
+       Verify before continuing, in another session:
+         . {{ oem_repo_agent_env }} && emctl status blackout
+
+       Pressing Enter will stop the agent, stop the OMS, back up and
+       shut down the database, and patch {{ oem_repo_oracle_home }}.
+
+       Ctrl-C then A to abort.
+      ============================================================
+
+  when: oem_repo_pause_after_blackout | bool
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+- name: Confirm a blackout is actually active before shutting anything down
+  # Independent verification of what you just did by hand — asks the AGENT, which
+  # is the component that owns blackout state. Runs before the agent is stopped,
+  # because after that this cannot be asked at all.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] verify blackout ---"
+    set -x
+    . {{ oem_repo_agent_env }}
+    emctl status blackout
+  args:
+    executable: /bin/bash
+  register: oem_blackout_status
+  changed_when: false
+  failed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+- name: Show the blackout status
+  debug:
+    var: oem_blackout_status.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+- name: Stop if no blackout appears to be active
+  # Deliberately a real gate, not a warning. The whole point of the checkpoint
+  # above is that this is the last moment a blackout can be created — proceeding
+  # without one means the outage is recorded as unplanned and cannot be corrected
+  # afterwards.
+  #
+  # Override with -e oem_repo_require_blackout=false if you have deliberately
+  # decided to take the unplanned-outage record, or if the agent reports blackout
+  # state in a form this check does not recognise — read the output above first.
+  # MATCHED AGAINST REAL OUTPUT, not a guessed string. The agent prints:
+  #
+  #   Blackoutname = Patch Maint Blackout-Sep 1 2026 7:10:58 AM
+  #   Targets = (oemserver01.usat.com:host,)
+  #   Time = ({2026-09-01|07:14:20,|} )
+  #   Expired = False
+  #
+  # "Blackoutname" is ONE WORD. This check previously looked for "Blackout Name"
+  # with a space, invented rather than verified, so a genuine active blackout
+  # failed the gate. See docs/known-risks.md #151 — and note the irony: the
+  # comment on the CheckMinimumOPatchVersion task in this same file says not to
+  # invent success strings, for exactly this reason.
+  #
+  # Both conditions matter. A blackout that exists but has expired protects
+  # nothing, so `Expired = False` has to be present too — an expired one would
+  # still match on the name alone.
+  fail:
+    msg: >
+      No ACTIVE blackout found in `emctl status blackout` on {{ inventory_hostname }}.
+      Looking for a "Blackoutname =" line together with "Expired = False".
+      Nothing has been shut down. Create the blackout and re-run, or re-run with
+      -e oem_repo_require_blackout=false if you have decided to proceed without one.
+      Output is above and in {{ oem_repo_log }}.
+  when:
+    - oem_repo_require_blackout | bool
+    - >-
+      'Blackoutname' not in (oem_blackout_status.stdout | default(''))
+      or 'Expired = False' not in (oem_blackout_status.stdout | default(''))
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+- name: Stop the agent
+  # Stopped, and stopped BEFORE the OMS. Its home is separate so it holds no lock
+  # on the database home, but leaving it up means it spends the window failing to
+  # reach a dead OMS and collecting availability data for a target you have just
+  # declared blacked out.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] stop agent ---"
+    set -x
+    . {{ oem_repo_agent_env }}
+    emctl stop agent
+    emctl status agent || true
+  args:
+    executable: /bin/bash
+  register: oem_agent_stop
+  changed_when: true
+  failed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+- name: Stop the OMS, including WebTier and admin server
+  # -all, not plain `emctl stop oms`: the plain form leaves the WebLogic admin
+  # server running, which keeps a lock on the home.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] stop OMS ---"
+    set -x
+    . {{ oem_repo_oms_env }}
+    emctl stop oms -all
+    emctl status oms || true
+  args:
+    executable: /bin/bash
+  register: oem_oms_stop
+  changed_when: true
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+- name: Show OMS stop output
+  debug:
+    var: oem_oms_stop.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+# =============================================================================
+# 3. Backup before the patch
+# =============================================================================
+
+- name: Create the backup destination directory
+  # {{ oem_repo_backup_base }}/<SID>/<run timestamp> — one directory per run, so
+  # backups from separate windows never interleave and an old set can be removed
+  # by deleting a single dated directory.
+  file:
+    path: "{{ oem_repo_backup_dir }}"
+    state: directory
+    owner: "{{ oracle_user }}"
+    group: oinstall
+    mode: "0750"
+  when: oem_repo_take_rman_backup | bool
+  tags: [oem_repo_patch, oem_repo_patch_backup]
+
+- name: Confirm there is space on the backup mount
+  # The preflight free-space check looks at the Oracle home's mount. The backup
+  # goes somewhere else entirely, so it needs its own check — running out of space
+  # part-way through is a failed backup discovered at the worst moment, with the
+  # OMS already down.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] backup destination space ---"
+    set -x
+    df -h {{ oem_repo_backup_dir }}
+    echo "DB size (used, GB):"
+    du -sh {{ oem_repo_backup_dir }} 2>/dev/null || true
+  args:
+    executable: /bin/bash
+  register: oem_backup_space
+  changed_when: false
+  when: oem_repo_take_rman_backup | bool
+  tags: [oem_repo_patch, oem_repo_patch_backup]
+
+- name: Show backup destination space
+  debug:
+    var: oem_backup_space.stdout_lines
+  when: oem_repo_take_rman_backup | bool
+  tags: [oem_repo_patch, oem_repo_patch_backup]
+
+- name: Take an RMAN backup of the repository database
+  # A Release Update is reversible via opatch rollback and datapatch -rollback.
+  # Neither covers a mistake that damages the repository, which holds the entire
+  # monitoring history for 43 targets. Take a real backup.
+  #
+  # EXPLICIT FORMAT, to {{ oem_repo_backup_dir }}. Without a FORMAT clause RMAN
+  # writes to the fast recovery area or the default disk location — fine in
+  # principle, but it puts the pre-patch backup wherever the FRA happens to point,
+  # which on a repository host is usually the same storage as the database. A
+  # dated directory on separate storage is what makes this a restorable backup
+  # rather than a copy sitting next to the original.
+  #
+  # SET CONTROLFILE AUTOBACKUP FORMAT, not CONFIGURE. `SET` inside RUN is scoped
+  # to this session; `CONFIGURE` would permanently repoint the database's
+  # autobackup location at a dated directory that will not exist next time.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] RMAN backup -> {{ oem_repo_backup_dir }} ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    rman target / <<'RMAN'
+    SHOW ALL;
+    CONFIGURE CONTROLFILE AUTOBACKUP ON;
+    RUN {
+      ALLOCATE CHANNEL c1 DEVICE TYPE DISK;
+      ALLOCATE CHANNEL c2 DEVICE TYPE DISK;
+      SET CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE DISK
+        TO '{{ oem_repo_backup_dir }}/cf_%F';
+      BACKUP AS COMPRESSED BACKUPSET DATABASE
+        TAG '{{ oem_repo_backup_tag }}'
+        FORMAT '{{ oem_repo_backup_dir }}/db_%d_%T_%U.bkp'
+        PLUS ARCHIVELOG
+        TAG '{{ oem_repo_backup_tag }}_ARC'
+        FORMAT '{{ oem_repo_backup_dir }}/arc_%d_%T_%U.bkp';
+      BACKUP CURRENT CONTROLFILE
+        TAG '{{ oem_repo_backup_tag }}_CF'
+        FORMAT '{{ oem_repo_backup_dir }}/ctl_%d_%T_%U.bkp';
+    }
+    LIST BACKUP SUMMARY;
+    RMAN
+    echo "--- files written ---"
+    ls -lh {{ oem_repo_backup_dir }}
+  args:
+    executable: /bin/bash
+  register: oem_rman_backup
+  changed_when: true
+  when: oem_repo_take_rman_backup | bool
+  tags: [oem_repo_patch, oem_repo_patch_backup]
+
+- name: Show RMAN backup output
+  debug:
+    var: oem_rman_backup.stdout_lines
+  when: oem_repo_take_rman_backup | bool
+  tags: [oem_repo_patch, oem_repo_patch_backup]
+
+- name: Fail if the RMAN backup did not complete
+  fail:
+    msg: >
+      RMAN did not report completion. Do not patch without a backup of a
+      repository holding {{ oem_repo_expected_targets }} targets' history.
+      See {{ oem_repo_log }}.
+  # CHECK A POSITIVE SUCCESS MARKER, not the mere presence of "RMAN-".
+  #
+  # This condition used to be `'RMAN-' in stdout`, which would have failed a
+  # perfectly good backup: RMAN emits informational RMAN-08xxx messages during
+  # normal operation, so the substring "RMAN-" appears in successful output all
+  # the time. A backup that worked would have aborted the window here.
+  #
+  # Same lesson as docs/known-risks.md #109, where a fully successful DUPLICATE
+  # was reported FAILED because the check looked for the wrong thing in the wrong
+  # stream. The two halves below are what that entry argues for: require the
+  # positive completion marker, and treat only RMAN-00569 — the header of RMAN's
+  # actual error stack — as evidence of failure.
+  #
+  # The marker can genuinely reach stdout here because this task uses a heredoc.
+  # #109's real trap was `rman cmdfile=... log=...`, which sends everything to the
+  # log file and leaves stdout with nothing to match. Do not add `log=` to the
+  # RMAN invocation above without also rewriting this condition to read the file.
+  when:
+    - oem_repo_take_rman_backup | bool
+    - >-
+      'Recovery Manager complete.' not in (oem_rman_backup.stdout | default(''))
+      or 'RMAN-00569' in (oem_rman_backup.stdout | default(''))
+  tags: [oem_repo_patch, oem_repo_patch_backup]
+
+- name: Create a guaranteed restore point
+  # Second line of defence, and much faster to use than a restore. Requires
+  # ARCHIVELOG mode and a configured fast recovery area — non-fatal if the
+  # database is not configured for it, but then say so plainly in the write-up,
+  # because the rollback path becomes opatch/datapatch only.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] guaranteed restore point ---"
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus / as sysdba <<'SQL'
+    SET TAB OFF TRIMSPOOL ON PAGESIZE 200 LINESIZE 200 FEEDBACK ON
+    COLUMN name FORMAT A30
+    SELECT log_mode, flashback_on FROM v$database;
+    CREATE RESTORE POINT {{ oem_repo_restore_point }} GUARANTEE FLASHBACK DATABASE;
+    SELECT name, guarantee_flashback_database, time FROM v$restore_point;
+    EXIT
+    SQL
+  args:
+    executable: /bin/bash
+  register: oem_restore_point
+  changed_when: true
+  failed_when: false
+  when: oem_repo_create_restore_point | bool
+  tags: [oem_repo_patch, oem_repo_patch_backup]
+
+- name: Show restore point result
+  debug:
+    var: oem_restore_point.stdout_lines
+  when: oem_repo_create_restore_point | bool
+  tags: [oem_repo_patch, oem_repo_patch_backup]
+
+# =============================================================================
+# 4. Stop everything using the home, and prove it
+# =============================================================================
+
+- name: Shut down the database and every listener running from this home
+  # STOPS LISTENERS BY NAME, DISCOVERED FROM ps — not `lsnrctl stop`.
+  #
+  # Bare `lsnrctl stop` stops the listener called LISTENER. This host's is called
+  # `oemserver01_listener`, so the bare form found nothing, and the trailing
+  # `|| true` swallowed the failure. The listener stayed up, running from the very
+  # Oracle home about to be patched:
+  #
+  #   oracle 3245 1 0 03:48 ? /u01/app/oracle/product/19.3.0/db_1/bin/tnslsnr \
+  #     oemserver01_listener -inherit
+  #
+  # Patching a home with live processes against it is how homes get corrupted.
+  # See docs/known-risks.md #152.
+  #
+  # Discovery is filtered to listeners whose binary path is inside the TARGET
+  # home, so a listener belonging to some other home on this host is left alone.
+  # The awk walks fields to find the argument after the tnslsnr binary rather than
+  # assuming a fixed column, since ps field positions shift with the UID width.
+  #
+  # No `|| true`. A failure to stop must be visible; the residual-process check
+  # immediately below is the backstop, and it is a hard gate.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] shutdown database and listeners ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    echo "--- listeners currently running from ${ORACLE_HOME} ---"
+    ps -eo args= | awk -v h="${ORACLE_HOME}/bin/tnslsnr" '$1 == h' || echo "(none found)"
+
+    LSNRS=$(ps -eo args= | awk -v h="${ORACLE_HOME}/bin/tnslsnr" '$1 == h { print $2 }')
+
+    if [ -z "${LSNRS}" ]; then
+      echo "No listener running from ${ORACLE_HOME} — nothing to stop."
+    else
+      for L in ${LSNRS}; do
+        echo "--- stopping listener: ${L} ---"
+        lsnrctl stop "${L}"
+      done
+    fi
+
+    echo "--- shutting down ${ORACLE_SID} ---"
+    sqlplus / as sysdba <<'SQL'
+    SET TAB OFF FEEDBACK ON
+    SHUTDOWN IMMEDIATE
+    EXIT
+    SQL
+  args:
+    executable: /bin/bash
+  register: oem_shutdown
+  changed_when: true
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+- name: Show shutdown output
+  debug:
+    var: oem_shutdown.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+- name: Find any remaining process running from the target home
+  # Resolves each process EXECUTABLE via /proc/<pid>/exe and asks whether it lives
+  # inside this ORACLE_HOME. Patching a home with live processes against it is how
+  # homes get corrupted, so this is the last gate before opatch runs.
+  #
+  # WHY NOT `ps -ef | grep -F <home>`, which is what this used to do: the bash
+  # process running THIS SCRIPT has the home path in its own command line, so the
+  # grep always matched itself. RESIDUAL_COUNT could never reach 0 and this gate
+  # would have blocked the patch permanently once the database was already down —
+  # the worst possible moment to discover it. Same self-match that produced
+  # SID="$" and SID="-1"; see docs/known-risks.md #153.
+  #
+  # /proc/<pid>/exe is immune to it: this script executes /bin/bash, so it cannot
+  # match a check that asks what binary a process is actually running. It is also
+  # more accurate than a cmdline grep, which would miss a process whose arguments
+  # never mention the home.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] residual processes on the home ---"
+
+    RESIDUAL=0
+    for procdir in /proc/[0-9]*; do
+      pid=${procdir#/proc/}
+      [ "$pid" = "$$" ] && continue
+      exe=$(readlink -f "$procdir/exe" 2>/dev/null) || continue
+      [ -z "$exe" ] && continue
+      case "$exe" in
+        {{ oem_repo_oracle_home }}/*)
+          echo "STILL RUNNING: pid=$pid exe=$exe"
+          echo "               args=$(tr '\0' ' ' < "$procdir/cmdline" 2>/dev/null)"
+          RESIDUAL=$((RESIDUAL + 1))
+          ;;
+      esac
+    done
+
+    if [ "$RESIDUAL" -eq 0 ]; then
+      echo "No process is running any binary from {{ oem_repo_oracle_home }}."
+    fi
+    echo "RESIDUAL_COUNT=${RESIDUAL}"
+  args:
+    executable: /bin/bash
+  register: oem_residual
+  changed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+- name: Show residual process check
+  debug:
+    var: oem_residual.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+- name: Fail if anything is still running against the home
+  fail:
+    msg: >
+      Processes still running against {{ oem_repo_oracle_home }} after shutdown.
+      See {{ oem_repo_log }}. Investigate rather than patching over them.
+  # Plain string containment, no regex and no numeric parse. The script always
+  # prints exactly one RESIDUAL_COUNT= line; if it is not zero, stop.
+  when: "'RESIDUAL_COUNT=0' not in (oem_residual.stdout | default(''))"
+  tags: [oem_repo_patch, oem_repo_patch_shutdown]
+
+# =============================================================================
+# 4a. Roll back the conflicting one-off patches, then re-check for conflicts
+#
+# Runs with the database DOWN — §4 has just shut it down and proved nothing is
+# holding the home. The sequence below is James's, confirmed by hand:
+#
+#   opatch rollback -id 29213893
+#   opatch rollback -id 35074478
+#   startup ; ./datapatch ; shutdown immediate
+#
+# Both halves are needed. `opatch rollback` removes the BINARIES; datapatch
+# removes the matching SQL registry entry. Skipping datapatch leaves
+# dba_registry_sqlpatch claiming a patch that is no longer in the home, which is
+# the mirror image of the "patched binaries, unpatched dictionary" state §6
+# exists to prevent.
+#
+# The database is deliberately shut down again at the end: §5 applies the combo,
+# and that needs the home quiet.
+# =============================================================================
+
+- name: Roll back the conflicting one-off patches
+  # -silent because `opatch rollback` is interactive. 35074478 prompts
+  # "Please shutdown Oracle instances ... Is the local system ready for
+  # patching? [y|n]" and would hang forever without a PTY — the same class of
+  # silent hang as docs/known-risks.md #6.
+  #
+  # One shell block with `set -e` rather than an Ansible loop, deliberately: the
+  # order is proven and must hold, and `set -e` guarantees the second rollback
+  # never runs if the first fails. A loop would keep going and report afterwards.
+  shell: |
+    set -e
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] rollback one-off patches ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export PATH=$ORACLE_HOME/OPatch:/usr/bin:/bin:$PATH
+    {% for pid in oem_repo_rollback_patch_ids %}
+    echo "=== rolling back {{ pid }} ==="
+    $ORACLE_HOME/OPatch/opatch rollback -id {{ pid }} -silent
+    {% endfor %}
+    echo "--- inventory after rollback ---"
+    $ORACLE_HOME/OPatch/opatch lspatches
+  args:
+    executable: /bin/bash
+  register: oem_rollback_binaries
+  when: (oem_repo_rollback_patch_ids | default([]) | length) > 0
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Show the binary rollback output
+  debug:
+    var: oem_rollback_binaries.stdout_lines
+  when: (oem_repo_rollback_patch_ids | default([]) | length) > 0
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Start the database and roll the SQL side back with datapatch
+  # datapatch decides for itself what to undo by comparing the binary registry
+  # against the SQL registry, so it needs no -rollback flag — with the binaries
+  # already gone it works out that the SQL entries must go too. That is exactly
+  # what James's manual run showed:
+  #   Interim patch 29213893: Binary registry: Not installed
+  #                           SQL registry: Applied successfully
+  #   The following interim patches will be rolled back: 29213893
+  shell: |
+    set -e
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] startup + datapatch (rollback) ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+
+    sqlplus / as sysdba <<'SQL'
+    SET TAB OFF TRIMSPOOL ON FEEDBACK ON
+    STARTUP
+    SELECT status FROM v$instance;
+    EXIT
+    SQL
+
+    cd $ORACLE_HOME/OPatch
+    ./datapatch -verbose
+  args:
+    executable: /bin/bash
+  register: oem_rollback_datapatch
+  when: (oem_repo_rollback_patch_ids | default([]) | length) > 0
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Show the datapatch rollback output
+  debug:
+    var: oem_rollback_datapatch.stdout_lines
+  when: (oem_repo_rollback_patch_ids | default([]) | length) > 0
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Confirm each rolled-back patch registered as ROLLBACK SUCCESS
+  # Checks the dictionary, not datapatch's own summary line — same discipline as
+  # every other verification here. A patch whose binaries are gone but whose SQL
+  # registry still says APPLY is a real, silent inconsistency.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] verify rollback in dba_registry_sqlpatch ---"
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus / as sysdba <<'SQL'
+    SET TAB OFF TRIMSPOOL ON PAGESIZE 200 LINESIZE 300 FEEDBACK OFF
+    COLUMN action_time FORMAT A30
+    COLUMN status FORMAT A12
+    SELECT install_id, patch_id, patch_uid, patch_type, action, status, action_time
+      FROM dba_registry_sqlpatch
+     ORDER BY action_time;
+    SET HEADING OFF
+    {% for pid in oem_repo_rollback_patch_ids %}
+    SELECT 'ROLLBACK_{{ pid }}=' || NVL(MAX(status), 'NO_ROW')
+      FROM dba_registry_sqlpatch
+     WHERE patch_id = {{ pid }} AND action = 'ROLLBACK';
+    {% endfor %}
+    EXIT
+    SQL
+  args:
+    executable: /bin/bash
+  register: oem_rollback_verify
+  changed_when: false
+  when: (oem_repo_rollback_patch_ids | default([]) | length) > 0
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Show the rollback verification
+  debug:
+    var: oem_rollback_verify.stdout_lines
+  when: (oem_repo_rollback_patch_ids | default([]) | length) > 0
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Fail if any patch did not register as ROLLBACK SUCCESS
+  # NOTE: a patch that only ever touched the binaries has no SQL registry entry
+  # and so produces NO_ROW rather than SUCCESS. 35074478 (rdbms/rsf) is expected
+  # to behave that way; 29213893 (dbscripts) had a SQL entry and must show
+  # SUCCESS. Both outcomes are accepted, and anything else is not.
+  fail:
+    msg: >
+      {{ item }} shows neither ROLLBACK/SUCCESS nor NO_ROW in
+      dba_registry_sqlpatch after datapatch. The binaries were removed but the
+      dictionary does not agree. Do NOT apply the combo on top of this — see
+      {{ oem_repo_log }} and the rollback log under
+      {{ oem_repo_oracle_base }}/cfgtoollogs/sqlpatch/{{ item }}/.
+  loop: "{{ oem_repo_rollback_patch_ids | default([]) }}"
+  when: >
+    ('ROLLBACK_' ~ item ~ '=SUCCESS') not in (oem_rollback_verify.stdout | default(''))
+    and ('ROLLBACK_' ~ item ~ '=NO_ROW') not in (oem_rollback_verify.stdout | default(''))
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Shut the database down again before applying the combo
+  shell: |
+    set -e
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] shutdown after rollback ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus / as sysdba <<'SQL'
+    SET TAB OFF FEEDBACK ON
+    SHUTDOWN IMMEDIATE
+    EXIT
+    SQL
+  args:
+    executable: /bin/bash
+  register: oem_rollback_shutdown
+  when: (oem_repo_rollback_patch_ids | default([]) | length) > 0
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Confirm the home is quiet again after the rollback
+  # The §4 residual check ran before the rollback. The database has been up and
+  # down again since, so it is re-checked here rather than assumed — same
+  # /proc/<pid>/exe method, immune to matching this script.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] residual processes after rollback ---"
+    RESIDUAL=0
+    for procdir in /proc/[0-9]*; do
+      pid=${procdir#/proc/}
+      [ "$pid" = "$$" ] && continue
+      exe=$(readlink -f "$procdir/exe" 2>/dev/null) || continue
+      [ -z "$exe" ] && continue
+      case "$exe" in
+        {{ oem_repo_oracle_home }}/*)
+          echo "STILL RUNNING: pid=$pid exe=$exe"
+          RESIDUAL=$((RESIDUAL + 1))
+          ;;
+      esac
+    done
+    echo "RESIDUAL_COUNT=${RESIDUAL}"
+  args:
+    executable: /bin/bash
+  register: oem_rollback_residual
+  changed_when: false
+  when: (oem_repo_rollback_patch_ids | default([]) | length) > 0
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Fail if anything is still running against the home after the rollback
+  fail:
+    msg: >
+      Processes still running against {{ oem_repo_oracle_home }} after the
+      post-rollback shutdown. See {{ oem_repo_log }}.
+  when:
+    - (oem_repo_rollback_patch_ids | default([]) | length) > 0
+    - "'RESIDUAL_COUNT=0' not in (oem_rollback_residual.stdout | default(''))"
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Re-check for conflicts now that the one-offs are gone
+  # THIS is the conflict check that matters. The one in the opatch phase runs
+  # before the rollback, so it necessarily still reports ZOP-47 against the
+  # one-offs — it cannot be the gate, which is why that run needs
+  # -e oem_repo_conflict_check_fatal=false. This one runs against the home
+  # exactly as it will be at apply time.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] conflict re-check after rollback ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+
+    echo "=== Database RU {{ oem_repo_ru_patch_id }} ==="
+    $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail \
+      -phBaseDir {{ oem_repo_ru_patch_path }}
+    {% if oem_repo_apply_ojvm | bool %}
+
+    echo "=== OJVM {{ oem_repo_ojvm_patch_id }} ==="
+    $ORACLE_HOME/OPatch/opatch prereq CheckConflictAgainstOHWithDetail \
+      -phBaseDir {{ oem_repo_ojvm_patch_path }}
+    {% endif %}
+  args:
+    executable: /bin/bash
+  register: oem_conflict_recheck
+  changed_when: false
+  failed_when: false
+  when:
+    - (oem_repo_rollback_patch_ids | default([]) | length) > 0
+    - oem_repo_recheck_conflict_after_rollback | bool
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Show the post-rollback conflict re-check
+  debug:
+    var: oem_conflict_recheck.stdout_lines
+  when:
+    - (oem_repo_rollback_patch_ids | default([]) | length) > 0
+    - oem_repo_recheck_conflict_after_rollback | bool
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+- name: Fail if conflicts remain after the rollback
+  # Gated the same way as the pre-window check: any "failed" verdict, or no
+  # verdict at all. Unlike that one, this is expected to PASS — if it does not,
+  # the assumption that the three remaining overlays would be auto-rolled back as
+  # subsets was wrong, and applying anyway risks losing fixes silently.
+  fail:
+    msg: >
+      Conflicts still reported after rolling back
+      {{ oem_repo_rollback_patch_ids | join(', ') }}. The one-offs removed were
+      not the only blockers. Read the report above before going further — the
+      remaining overlays may need merge patches from My Oracle Support rather
+      than being absorbed by the RU. Override with
+      -e oem_repo_recheck_conflict_after_rollback=false only with a written
+      reason.
+  when:
+    - (oem_repo_rollback_patch_ids | default([]) | length) > 0
+    - oem_repo_recheck_conflict_after_rollback | bool
+    - >-
+      'Prereq "checkConflictAgainstOHWithDetail" failed'
+      in (oem_conflict_recheck.stdout | default(''))
+      or 'Prereq "checkConflictAgainstOHWithDetail" passed'
+      not in (oem_conflict_recheck.stdout | default(''))
+  tags: [oem_repo_patch, oem_repo_patch_rollback, oem_repo_patch_apply]
+
+# =============================================================================
+# 5. Apply
+# =============================================================================
+
+- name: Apply the Database Release Update via opatch
+  # ORDER MATTERS: Database RU first, OJVM second. Both READMEs describe a plain
+  # `cd <patch dir>` then `opatch apply` for a non-RAC home, and neither asks for
+  # a datapatch run between the two — one datapatch after both applies covers
+  # them together, which is the whole point of shipping them as a combo.
+  #
+  # `make`, `ar`, `ld` and `nm` must be on PATH: OJVM relinks, and its README
+  # §1.2 lists them as a prerequisite. They live in /usr/bin on OL7/OL9, which is
+  # already on the default PATH, but it is stated here so a future PATH change
+  # that breaks the OJVM apply has an obvious cause.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] opatch apply — DB RU {{ oem_repo_ru_patch_id }} ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export PATH=$ORACLE_HOME/OPatch:/usr/bin:/bin:$PATH
+    cd {{ oem_repo_ru_patch_path }}
+    $ORACLE_HOME/OPatch/opatch apply -silent
+  args:
+    executable: /bin/bash
+  register: oem_apply_opatch
+  when: oem_repo_apply_mechanism == 'opatch'
+  tags: [oem_repo_patch, oem_repo_patch_apply]
+
+- name: Show DB RU apply output
+  debug:
+    var: oem_apply_opatch.stdout_lines
+  when: oem_repo_apply_mechanism == 'opatch'
+  tags: [oem_repo_patch, oem_repo_patch_apply]
+
+- name: Apply the OJVM Release Update via opatch
+  # Separate task, separate register, run only after the DB RU has succeeded —
+  # `oem_apply_opatch` failing aborts the play before this point, which is the
+  # behaviour we want. Do not merge these into one shell block: a failure in the
+  # first apply would then be invisible behind the second.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] opatch apply — OJVM {{ oem_repo_ojvm_patch_id }} ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export PATH=$ORACLE_HOME/OPatch:/usr/bin:/bin:$PATH
+    which make ar ld nm
+    cd {{ oem_repo_ojvm_patch_path }}
+    $ORACLE_HOME/OPatch/opatch apply -silent
+  args:
+    executable: /bin/bash
+  register: oem_apply_ojvm
+  when:
+    - oem_repo_apply_mechanism == 'opatch'
+    - oem_repo_apply_ojvm | bool
+  tags: [oem_repo_patch, oem_repo_patch_apply]
+
+- name: Show OJVM apply output
+  debug:
+    var: oem_apply_ojvm.stdout_lines
+  when:
+    - oem_repo_apply_mechanism == 'opatch'
+    - oem_repo_apply_ojvm | bool
+  tags: [oem_repo_patch, oem_repo_patch_apply]
+
+- name: Apply the Release Update via opatchauto
+  # Requires root. Invoked from the OPatch of the home named by -oh, matching the
+  # form the 12.2 build used.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] opatchauto apply ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    cd $ORACLE_HOME/OPatch
+    ./opatchauto apply {{ oem_repo_ru_patch_path }} -oh $ORACLE_HOME
+  args:
+    executable: /bin/bash
+  # become_user: root is EXPLICIT and required. The play sets become_user: oracle,
+  # so a bare `become: true` here would mean "become oracle" and opatchauto would
+  # fail on privilege rather than on anything informative.
+  become: true
+  become_user: root
+  register: oem_apply_opatchauto
+  when: oem_repo_apply_mechanism == 'opatchauto'
+  tags: [oem_repo_patch, oem_repo_patch_apply]
+
+- name: Show opatchauto apply output
+  # Only relevant on the opatchauto path. The opatch path prints its own output
+  # per-patch immediately after each apply, above.
+  debug:
+    var: oem_apply_opatchauto.stdout_lines | default(['(not used)'])
+  when: oem_repo_apply_mechanism == 'opatchauto'
+  tags: [oem_repo_patch, oem_repo_patch_apply]
+
+- name: Confirm the binary patch is present
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] post-apply inventory ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    $ORACLE_HOME/OPatch/opatch lspatches
+    $ORACLE_HOME/OPatch/opatch lsinventory -detail \
+      > {{ oem_repo_log_dir }}/lsinventory_post_{{ oem_run_ts }}.txt
+  args:
+    executable: /bin/bash
+  register: oem_lspatches
+  changed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_apply]
+
+- name: Show post-apply patch list
+  debug:
+    var: oem_lspatches.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_apply]
+
+- name: Fail if the Database RU is not in the inventory
+  fail:
+    msg: >
+      {{ oem_repo_ru_patch_id }} not listed after apply. Do not proceed to
+      datapatch — the binaries are not patched. See {{ oem_repo_log }}.
+  when: oem_repo_ru_patch_id not in oem_lspatches.stdout
+  tags: [oem_repo_patch, oem_repo_patch_apply]
+
+- name: Fail if the OJVM RU is not in the inventory
+  # Checked separately from the DB RU. A combo where only one half landed is a
+  # worse state than neither landing, and it is silent — datapatch would report
+  # SUCCESS for the component that is actually there.
+  fail:
+    msg: >
+      {{ oem_repo_ojvm_patch_id }} (OJVM) not listed after apply, although the
+      Database RU is. Do not proceed to datapatch. Read the OJVM apply output
+      above — if it failed on make target `jox_refresh_knlopt`, that is Issue 1
+      in the OJVM README's Known Issues. See {{ oem_repo_log }}.
+  when:
+    - oem_repo_apply_ojvm | bool
+    - oem_repo_ojvm_patch_id not in oem_lspatches.stdout
+  tags: [oem_repo_patch, oem_repo_patch_apply]
+
+# =============================================================================
+# 6. Datapatch, then utlrp, then compare invalid objects against the baseline
+# =============================================================================
+
+- name: Refuse to proceed without the preflight facts
+  # ONE gate for every task from here on, rather than a guard per fact.
+  #
+  # The three facts below — SID, CDB determination, invalid-object baseline — are
+  # all derived from preflight-tagged tasks. Their set_facts are now guarded with
+  # `when: <source> is defined`, so a narrow --tags run no longer crashes on an
+  # undefined register; instead the facts are simply absent, and this gate turns
+  # that absence into a clear message.
+  #
+  # Each one matters for a different reason, which is why all three are checked:
+  #   oem_repo_sid        every sqlplus/rman/shutdown task needs the instance name
+  #   oem_repo_is_cdb     absent, it defaults to a plausible-looking false, and
+  #                       datapatch would patch only CDB$ROOT on a real CDB
+  #   oem_invalid_pre_*   the post-patch comparison is meaningless without a
+  #                       baseline to compare against
+  #
+  # Deliberately NOT tagged for _stage or _opatch: staging and the OPatch update
+  # need none of these, and requiring preflight for a file copy would be friction
+  # with no safety value.
+  fail:
+    msg: >
+      Preflight has not run in this invocation, so the facts the remaining tasks
+      depend on are missing
+      (sid={{ oem_repo_sid is defined }},
+       cdb={{ oem_repo_is_cdb is defined }},
+       baseline={{ oem_invalid_pre_count is defined }}).
+      Run --tags oem_repo_patch_preflight first, or run the full playbook without
+      a --tags filter. Do not work around this by hardcoding the SID: the CDB
+      determination and the invalid-object baseline are not guessable, and the
+      post-patch verification is worthless without them.
+  when: >
+    oem_repo_sid is not defined
+    or oem_repo_is_cdb is not defined
+    or oem_invalid_pre_count is not defined
+  tags:
+    - oem_repo_patch
+    - oem_repo_patch_backup
+    - oem_repo_patch_shutdown
+    - oem_repo_patch_apply
+    - oem_repo_patch_datapatch
+    - oem_repo_patch_verify
+    - oem_repo_patch_restart
+
+- name: Start the database, opening all PDBs if this is a CDB
+  # Oracle's README §3.3.2, Table 2. The CDB column has one step the non-CDB
+  # column does not: `alter pluggable database all open` BEFORE datapatch. Left
+  # out, datapatch patches CDB$ROOT and whatever PDBs are already open, and any
+  # closed PDB keeps an unpatched dictionary that nothing warns you about until
+  # it is opened or unplugged later.
+  #
+  # Oracle's own footnote allows opening named PDBs instead of all, and says the
+  # post-install step is then only run against those. This role opens all: on a
+  # repository database there is no PDB you would deliberately leave behind, and
+  # a partial patch here is a trap for whoever runs Phase 7d.
+  #
+  # The Jinja if/endif below is indented to line up with the rest of the shell
+  # body, and MUST be. A YAML block scalar's indentation is set by its first
+  # non-empty line, and any line at a shallower indent ENDS the block — so a
+  # `{%` written at column 0 here is not "outside the SQL", it is outside the
+  # string entirely, and YAML then reads `{` as the start of a flow mapping:
+  #
+  #   found character that cannot start any token
+  #
+  # Indented correctly, this works out cleanly on both passes. YAML strips the
+  # common four-space indent, so Jinja sees the tag at the start of its own line;
+  # Ansible templates with trim_blocks on (docs/known-risks.md #70 is the response
+  # file that setting mangled), so the newline after `%}` is eaten and the tag
+  # line disappears rather than leaving a blank.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] startup (CDB={{ oem_repo_is_cdb }}) ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus / as sysdba <<'SQL'
+    SET TAB OFF TRIMSPOOL ON FEEDBACK ON LINESIZE 200 PAGESIZE 200
+    STARTUP
+    {% if oem_repo_is_cdb | bool %}
+    ALTER PLUGGABLE DATABASE ALL OPEN;
+    COLUMN name FORMAT A30
+    SELECT name, open_mode, restricted FROM v$pdbs ORDER BY name;
+    {% endif %}
+    SELECT status FROM v$instance;
+    EXIT
+    SQL
+  args:
+    executable: /bin/bash
+  register: oem_startup
+  changed_when: true
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Show startup output
+  debug:
+    var: oem_startup.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Run datapatch sanity checks
+  # `datapatch -sanity_checks` runs environment and database checks that report
+  # whether conditions are right for patching, with a severity per finding.
+  # Oracle's README calls it optional and then says, in the same section, "Oracle
+  # highly recommends that you perform this step" — so it is run, and run BEFORE
+  # -verbose, which is the only ordering where its findings are still actionable.
+  #
+  # Non-fatal on return code: it is a report, and its severities are graded rather
+  # than pass/fail. The output is teed into the run log to be read.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] datapatch -sanity_checks ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    cd $ORACLE_HOME/OPatch
+    ./datapatch -sanity_checks
+  args:
+    executable: /bin/bash
+  register: oem_datapatch_sanity
+  changed_when: false
+  failed_when: false
+  when: oem_repo_datapatch_sanity_checks | bool
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Show datapatch sanity check output
+  debug:
+    var: oem_datapatch_sanity.stdout_lines
+  when: oem_repo_datapatch_sanity_checks | bool
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Run datapatch
+  # opatch apply patches binaries. datapatch patches the dictionary. Skipping it
+  # leaves patched binaries running against an unpatched dictionary, which is a
+  # bad state and not always loud about itself.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] datapatch -verbose ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    cd $ORACLE_HOME/OPatch
+    ./datapatch -verbose
+  args:
+    executable: /bin/bash
+  register: oem_datapatch
+  changed_when: true
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Show datapatch output
+  debug:
+    var: oem_datapatch.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Locate the datapatch apply logs
+  # Oracle README §3.3.2 names the exact path to check for errors:
+  #   $ORACLE_BASE/cfgtoollogs/sqlpatch/39472050/<unique patch ID>/
+  #     39472050_apply_<SID>_<CDB name>_<timestamp>.log
+  # The <unique patch ID> component is not predictable from the patch number, so
+  # this globs rather than constructing the path. It reports WHERE the logs are
+  # and stops there.
+  #
+  # DELIBERATELY NOT a raw grep for ORA- in those logs. The first real run
+  # produced ~300 matches and every one was noise: Oracle ships the RU scripts
+  # with literal "IGNORABLE ERRORS: ORA-00955" declarations, ORA- codes quoted in
+  # comments, and ORA-00955 "name is already used" raised and swallowed by design
+  # whenever an object already exists. A check that cries wolf 300 times is worse
+  # than no check, because the reader learns to scroll past the block where a
+  # real finding would one day appear. See docs/known-risks.md #155.
+  #
+  # The authoritative verdict comes from datapatch itself, which validates its own
+  # logfiles and prints "(no errors)" per patch, or names the failure. That is in
+  # the datapatch output from the previous task. This one exists so a human has
+  # the paths in hand on the runs where datapatch says something is wrong.
+  #
+  # NOTE FOR EDITORS: this prose lives in a task-level YAML comment, not inside
+  # the shell block below, and that is deliberate. Free-form module text goes
+  # through split_args, which counts quote characters, so a single apostrophe in
+  # a comment INSIDE the block unbalances the whole task and it fails to parse.
+  # It happened here (the word was "datapatch's") and syntax-check.sh check 9
+  # caught it. Task-level comments are stripped before templating and are safe.
+  # See docs/known-risks.md #144 and #153.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] datapatch apply logs ---"
+    set -x
+    for pid in {{ oem_repo_ru_patch_id }} {{ oem_repo_ojvm_patch_id }}; do
+      LOGDIR={{ oem_repo_oracle_base }}/cfgtoollogs/sqlpatch/${pid}
+      echo "--- ${pid} ---"
+      ls -lR ${LOGDIR} 2>/dev/null || echo "no logs under ${LOGDIR}"
+    done
+    echo "--- datapatch validates these logs itself; see its verdict above ---"
+  args:
+    executable: /bin/bash
+  register: oem_datapatch_logs
+  changed_when: false
+  failed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Show where the datapatch logs are
+  debug:
+    var: oem_datapatch_logs.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Recompile invalid objects with catcon.pl utlrp
+  # Oracle's README §3.3.2 specifies catcon.pl, not a bare @?/rdbms/admin/utlrp:
+  #
+  #   $ORACLE_HOME/perl/bin/perl $ORACLE_HOME/rdbms/admin/catcon.pl \
+  #     -n 1 -e -b utlrp -d $ORACLE_HOME/rdbms/admin utlrp.sql
+  #
+  # This task previously ran the bare form. On a non-CDB the two are equivalent,
+  # so it would have "worked" — and then quietly stopped being equivalent the
+  # moment Phase 7d converts this database to a CDB, because the bare form
+  # recompiles only the container it is connected to. catcon.pl drives the script
+  # across the CDB and every open PDB. Using Oracle's documented form now means
+  # 7c does not silently invalidate this step.
+  #
+  # Flags, since they are easy to copy without reading:
+  #   -n 1                       one worker process, serial
+  #   -e                         echo the script's output
+  #   -b utlrp                   base name for the generated log files
+  #   -d .../rdbms/admin         directory holding the script
+  #
+  # Automated deliberately, unlike patching-strategy.md's manual equivalent. The
+  # difference is the baseline: with a PRE count captured in §0, utlrp becomes a
+  # deterministic step whose effect can be measured, rather than a blind
+  # recompile of an unknown starting state. The judgement call moves to the
+  # comparison below, where it belongs.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] catcon.pl utlrp ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$PATH:$ORACLE_HOME/bin
+    cd $ORACLE_HOME/rdbms/admin
+    $ORACLE_HOME/perl/bin/perl $ORACLE_HOME/rdbms/admin/catcon.pl \
+      -n 1 -e -b utlrp -d $ORACLE_HOME/rdbms/admin utlrp.sql
+  args:
+    executable: /bin/bash
+  register: oem_utlrp
+  changed_when: true
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Show utlrp output
+  debug:
+    var: oem_utlrp.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Restore extjob ownership and permissions
+  # Oracle's README §3.3.5, and easy to dismiss as trivia. Applying a Release
+  # Update relinks libraries and executables, and relinking can reset the
+  # ownership and setuid bit on $ORACLE_HOME/bin/extjob. extjob is what DBMS_
+  # SCHEDULER uses to run external OS jobs; left owned by oracle without the
+  # setuid bit, external jobs fail at runtime rather than at patch time, which is
+  # a long way from the change that caused it.
+  #
+  #   # chown root $ORACLE_HOME/bin/extjob
+  #   # chmod 4750 $ORACLE_HOME/bin/extjob
+  #
+  # 4750 = setuid, rwx owner (root), r-x group, nothing for others.
+  #
+  # Requires root, hence become. Uses the file module rather than shelling out so
+  # it is idempotent and reports changed only when it actually changed something.
+  #
+  # become_user: root is EXPLICIT and required — the play sets become_user: oracle,
+  # so a bare `become: true` here would mean "become oracle", and oracle cannot
+  # chown a file to root. It would fail, and `failed_when: false` below would then
+  # swallow that failure silently, leaving extjob wrong in exactly the way this
+  # task exists to prevent.
+  become: true
+  become_user: root
+  file:
+    path: "{{ oem_repo_oracle_home }}/bin/extjob"
+    owner: root
+    mode: "4750"
+  register: oem_extjob
+  failed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Report the extjob permission fix
+  debug:
+    msg: >-
+      {{ 'FAILED — fix by hand as root: chown root ' ~ oem_repo_oracle_home ~ '/bin/extjob && chmod 4750 ' ~ oem_repo_oracle_home ~ '/bin/extjob  ||  reason: ' ~ (oem_extjob.msg | default('no message'))
+         if (oem_extjob.failed | default(false))
+         else (oem_repo_oracle_home ~ '/bin/extjob — ' ~ ('ownership/permissions reasserted (root:4750)' if (oem_extjob.changed | default(false)) else 'already root:4750, no change')) }}
+  tags: [oem_repo_patch, oem_repo_patch_datapatch]
+
+- name: Verify the registry and capture the POST-patch invalid objects
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] verification ---"
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export ORACLE_SID={{ oem_repo_sid }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    sqlplus / as sysdba <<'SQL' | tee {{ oem_repo_log_dir }}/baseline_post_{{ oem_run_ts }}.txt
+    SET TAB OFF TRIMSPOOL ON PAGESIZE 500 LINESIZE 300 FEEDBACK OFF ECHO OFF
+
+    PROMPT ===== version =====
+    SELECT banner_full FROM v$version WHERE ROWNUM = 1;
+
+    PROMPT ===== dba_invalid_objects =====
+    COLUMN owner FORMAT A30
+    COLUMN object_name FORMAT A40
+    COLUMN object_type FORMAT A25
+    SELECT owner, object_name, object_type
+      FROM dba_invalid_objects
+     ORDER BY owner, object_type, object_name;
+
+    PROMPT ===== dba_registry (component status) =====
+    COLUMN comp_name FORMAT A40
+    COLUMN comp_id FORMAT A10
+    COLUMN version FORMAT A12
+    COLUMN status FORMAT A12
+    SELECT SUBSTR(comp_name,1,40) comp_name,
+           SUBSTR(comp_id,1,10)   comp_id,
+           SUBSTR(version,1,12)   version,
+           status
+      FROM dba_registry
+     ORDER BY comp_name;
+
+    PROMPT ===== dba_registry_sqlpatch =====
+    -- patch_type, NOT version. dba_registry_sqlpatch has no `version` column and
+    -- the first real run proved it: ORA-00904: "VERSION": invalid identifier.
+    -- (There are ru_version and source_version columns, but the one that belongs
+    -- in this summary is patch_type — INTERIM vs RU.)
+    SET LINESIZE 300
+    COLUMN action_time FORMAT A30
+    COLUMN status FORMAT A12
+    SELECT install_id, patch_id, patch_uid, patch_type, action, status, flags, action_time
+      FROM dba_registry_sqlpatch
+     ORDER BY action_time;
+
+    PROMPT ===== counters =====
+    SET HEADING OFF
+    SELECT 'PATCH_STATUS=' || status FROM dba_registry_sqlpatch
+     WHERE patch_id = {{ oem_repo_ru_patch_id }}
+       AND action = 'APPLY';
+    SELECT 'OJVM_STATUS=' || status FROM dba_registry_sqlpatch
+     WHERE patch_id = {{ oem_repo_ojvm_patch_id }}
+       AND action = 'APPLY';
+    SELECT 'POST_INVALID_COUNT=' || COUNT(*) FROM dba_invalid_objects;
+    SELECT 'POST_REGISTRY_NOT_VALID=' || COUNT(*) FROM dba_registry WHERE status <> 'VALID';
+    EXIT
+    SQL
+  args:
+    executable: /bin/bash
+  register: oem_verify
+  changed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_verify]
+
+- name: Show verification output
+  debug:
+    var: oem_verify.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_verify]
+
+- name: Record the post-patch counters
+  set_fact:
+    # Same fallback-list form as the pre-patch counters — see the comment there.
+    oem_invalid_post_count: "{{ (oem_verify.stdout | regex_findall('POST_INVALID_COUNT=(\\d+)') + ['0']) | first }}"
+    oem_registry_post_bad: "{{ (oem_verify.stdout | regex_findall('POST_REGISTRY_NOT_VALID=(\\d+)') + ['0']) | first }}"
+  tags: [oem_repo_patch, oem_repo_patch_verify]
+
+- name: Fail if any dba_registry component regressed
+  # Separate from the object-level check, and not derivable from it. A component
+  # left INVALID or parked at UPGRADED is a different failure mode from a handful
+  # of invalid objects, and utlrp does not necessarily clear it. Compared against
+  # the pre-image rather than asserting everything must be VALID, because a
+  # component that was already not-VALID beforehand is not this patch's doing.
+  fail:
+    msg: >
+      dba_registry components not VALID rose from {{ oem_registry_pre_bad }} to
+      {{ oem_registry_post_bad }}. A component-level regression is more serious
+      than invalid objects and utlrp will not necessarily clear it. Diff
+      {{ oem_repo_log_dir }}/baseline_pre_{{ oem_run_ts }}.txt against
+      baseline_post_{{ oem_run_ts }}.txt to see which component changed.
+  when: (oem_registry_post_bad | int) > (oem_registry_pre_bad | int)
+  tags: [oem_repo_patch, oem_repo_patch_verify]
+
+- name: Fail if the dictionary patch did not register as SUCCESS
+  fail:
+    msg: >
+      {{ oem_repo_ru_patch_id }} is not SUCCESS in dba_registry_sqlpatch. The
+      binaries are patched but the dictionary is not. Do not start the OMS against
+      this repository. See {{ oem_repo_log }}.
+  when: "'PATCH_STATUS=SUCCESS' not in oem_verify.stdout"
+  tags: [oem_repo_patch, oem_repo_patch_verify]
+
+- name: Fail if the OJVM dictionary patch did not register as SUCCESS
+  fail:
+    msg: >
+      {{ oem_repo_ojvm_patch_id }} (OJVM) is not SUCCESS in dba_registry_sqlpatch.
+      The Database RU registered but OJVM did not, so the dictionary is half
+      patched. Do not start the OMS against this repository. See
+      {{ oem_repo_log }} and the datapatch log under
+      {{ oem_repo_oracle_base }}/cfgtoollogs/sqlpatch/{{ oem_repo_ojvm_patch_id }}/.
+      Note ORA-04068 in the alert log during datapatch is documented as benign
+      (OJVM README Known Issue 1) and is NOT this failure.
+  when:
+    - oem_repo_apply_ojvm | bool
+    - "'OJVM_STATUS=SUCCESS' not in oem_verify.stdout"
+  tags: [oem_repo_patch, oem_repo_patch_verify]
+
+- name: Fail if the patch created invalid objects that utlrp could not clear
+  # The comparison, not the raw number, is the signal. A count that came back to
+  # its pre-patch level is clean regardless of what it is. A count that rose and
+  # stayed risen after utlrp is the MDSYS seed-template signature documented in
+  # patching-strategy.md Mechanism 3, and needs looking at.
+  fail:
+    msg: >
+      Invalid objects rose from {{ oem_invalid_pre_count }} to
+      {{ oem_invalid_post_count }} and did not clear after utlrp. Check the
+      by-owner breakdown in {{ oem_repo_log }} — MDSYS-owned invalids
+      specifically are the seed-template signature in patching-strategy.md
+      Mechanism 3.
+  when: (oem_invalid_post_count | int) > (oem_invalid_pre_count | int)
+  tags: [oem_repo_patch, oem_repo_patch_verify]
+
+# =============================================================================
+# 7. Restart, clear the blackout, final state
+# =============================================================================
+
+- name: Start the listener, OMS and agent
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] restart stack ---"
+    set -x
+    export ORACLE_HOME={{ oem_repo_oracle_home }}
+    export PATH=$ORACLE_HOME/bin:$PATH
+    lsnrctl start || true
+    lsnrctl status || true
+    . {{ oem_repo_oms_env }}
+    emctl start oms
+    emctl status oms -details
+    . {{ oem_repo_agent_env }}
+    emctl start agent
+    emctl upload agent || true
+  args:
+    executable: /bin/bash
+  register: oem_restart
+  changed_when: true
+  tags: [oem_repo_patch, oem_repo_patch_restart]
+
+- name: Show restart output
+  debug:
+    var: oem_restart.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_restart]
+
+- name: Report the blackout state so it can be cleared by hand
+  # NOT stopped automatically, and the env is agent_env not oms_env.
+  #
+  # Two corrections in one task. The blackout is now created by hand (console or
+  # emcli, needing a SYSMAN login), so this role has no business guessing how to
+  # end it — a console/emcli blackout is not necessarily addressable by an
+  # agent-side `emctl stop blackout` of the same name. And the previous version
+  # sourced oms_env, whose emctl has no blackout verb at all: it printed usage
+  # text, exited 0, and `failed_when: false` reported success. See #150.
+  #
+  # So: report the state, name the command, and leave the decision with the human
+  # who created it. Clearing a blackout is not time-critical the way creating one
+  # is — it can be done at any point after the stack is verified healthy.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] blackout state (NOT cleared automatically) ---"
+    set -x
+    . {{ oem_repo_agent_env }}
+    emctl status blackout
+  args:
+    executable: /bin/bash
+  register: oem_blackout_stop
+  changed_when: false
+  failed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_restart]
+
+- name: Remind that the blackout is still yours to clear
+  debug:
+    msg:
+      - "The blackout was created by hand and is NOT cleared by this role."
+      - "Clear it once §7's verification checklist passes — not before."
+      - "Agent-side:  . {{ oem_repo_agent_env }} && emctl stop blackout {{ oem_repo_blackout_name }}"
+      - "Or in the console: Enterprise > Monitoring > Blackouts and Brownouts."
+      - "Current state:"
+      - "{{ oem_blackout_stop.stdout_lines | default(['(no output)']) }}"
+  tags: [oem_repo_patch, oem_repo_patch_restart]
+
+- name: Final agent status and target count
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "--- [$(date '+%H:%M:%S')] final state ---"
+    set -x
+    . {{ oem_repo_agent_env }}
+    emctl status agent
+  args:
+    executable: /bin/bash
+  register: oem_agent_final
+  changed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_verify]
+
+- name: Close the run log with a summary
+  # Target count is the check most likely to be skipped and most likely to
+  # matter. A count that dropped after a patch is a real problem wearing the
+  # disguise of a successful maintenance window.
+  #
+  # NO BACKSLASH-BEFORE-QUOTE ANYWHERE IN THIS BLOCK. The final diff line used to
+  # end with `.txt \\"` to print a shell line-continuation in the suggested
+  # command. Ansible's argument splitter treats a quote preceded by a backslash as
+  # escaped, so that `"` never closed its string and the whole PLAYBOOK failed to
+  # parse:
+  #
+  #   ERROR! failed at splitting arguments, either an unbalanced jinja2 block
+  #   or quotes
+  #
+  # Note the failure was reported against this task while pointing at the line
+  # above it, and only `ansible-playbook --syntax-check` caught it — plain YAML
+  # parsing passes, because it is valid YAML and invalid only to Ansible's own
+  # module-argument splitter. See docs/known-risks.md #144.
+  #
+  # The fix is to not need the escape: the diff suggestion is one long line now.
+  shell: |
+    exec > >(tee -a {{ oem_repo_log }}) 2>&1
+    echo "============================================================"
+    echo " SUMMARY"
+    echo " finished        : $(date '+%Y-%m-%d %H:%M:%S %Z')"
+    echo " patch           : {{ oem_repo_ru_patch_id }}"
+    echo " mechanism       : {{ oem_repo_apply_mechanism }}"
+    echo " invalid objects : {{ oem_invalid_pre_count }} -> {{ oem_invalid_post_count }}"
+    echo " registry !VALID : {{ oem_registry_pre_bad }} -> {{ oem_registry_post_bad }}"
+    echo " targets expected: {{ oem_repo_expected_targets }}"
+    echo " targets now     : $(. {{ oem_repo_agent_env }}; emctl status agent | grep 'Number of Targets' | awk -F: '{print $2}' | tr -d ' ')"
+    echo ""
+    echo " Artefacts to diff:"
+    echo "   {{ oem_repo_log_dir }}/baseline_pre_{{ oem_run_ts }}.txt"
+    echo "   {{ oem_repo_log_dir }}/baseline_post_{{ oem_run_ts }}.txt"
+    echo "   {{ oem_repo_log_dir }}/lsinventory_pre_{{ oem_run_ts }}.txt"
+    echo "   {{ oem_repo_log_dir }}/lsinventory_post_{{ oem_run_ts }}.txt"
+    echo ""
+    echo " diff -u {{ oem_repo_log_dir }}/baseline_pre_{{ oem_run_ts }}.txt {{ oem_repo_log_dir }}/baseline_post_{{ oem_run_ts }}.txt"
+    echo "============================================================"
+  args:
+    executable: /bin/bash
+  register: oem_summary
+  changed_when: false
+  tags: [oem_repo_patch, oem_repo_patch_verify]
+
+- name: Report summary
+  debug:
+    var: oem_summary.stdout_lines
+  tags: [oem_repo_patch, oem_repo_patch_verify]
+
+# --- Deliberately NOT automated ----------------------------------------------
+# 1. AHF compliance check, before and after. The value is in diffing two reports
+#    and reading them, not in a task's changed_when.
+#
+# 2. Dropping the guaranteed restore point. It holds flashback logs indefinitely
+#    and will fill the FRA, so it MUST be dropped — but only once a human agrees
+#    the patch is good:
+#      DROP RESTORE POINT {{ oem_repo_restore_point }};
+#
+# 3. RMAN recovery catalog upgrade — Oracle's README §3.3.3. If, and only if, a
+#    recovery catalog is in use, it must be upgraded after the patch, and the
+#    command is entered TWICE to confirm:
+#      $ rman catalog <user>/<password>@<alias>
+#      RMAN> UPGRADE CATALOG;
+#      RMAN> UPGRADE CATALOG;
+#      RMAN> EXIT;
+#    Not automated for two reasons. It needs catalog credentials, which do not
+#    belong in this repository or on a command line. And this project has not
+#    established that a recovery catalog exists at all — the RMAN backup above
+#    runs `rman target /` with no catalog. Confirm which is true before assuming
+#    this step is a no-op.
+#
+# 4. Re-enabling optimizer-affecting bug fixes — Oracle's README §3.3.4. A
+#    Release Update ships bug fixes that can change an existing execution plan in
+#    a DISABLED state by default. Fixes already enabled before the patch stay
+#    enabled; genuinely new ones do not switch themselves on. Enabling them is a
+#    deliberate act via DBMS_OPTIM_BUNDLE (Oracle points at KB148297 for the
+#    commands).
+#    Left manual on purpose: silently flipping optimizer behaviour on a
+#    repository database as a side effect of a patch run is the opposite of what
+#    this role is for. The default state is the safe one. If a plan regression
+#    shows up later, this is the knob — and knowing it was never touched here is
+#    part of being able to diagnose that.
+#
+# 5. Rollback. Oracle's README §4 documents it, and it is deliberately not a tag
+#    on this role — a rollback should be a decision, not a flag someone passes at
+#    2am. For a non-RAC home the shape is: stop instances and listeners, then
+#      $ORACLE_HOME/OPatch/opatch rollback -id {{ oem_repo_ru_patch_id }}
+#    then start the database (opening all PDBs if this is a CDB), run
+#    `./datapatch -verbose` again, confirm the ROLLBACK row is SUCCESS in
+#    dba_registry_sqlpatch, and recompile with the same catcon.pl utlrp call used
+#    above. See monitoring/phase-7a-repository-db-ru32.md for the full path
+#    alongside the flashback and RMAN options, which are usually faster.

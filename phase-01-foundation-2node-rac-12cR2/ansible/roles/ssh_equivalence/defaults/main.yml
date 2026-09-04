@@ -1,0 +1,77 @@
+---
+# Generalised 2026-08-31. This role now sets up passwordless SSH from a set of
+# SOURCE hosts to a set of TARGET hosts, for a set of users, optionally both
+# ways. It replaces cross_cluster_ssh_trust, which was the same thing hardcoded
+# to one pair.
+#
+# The defaults below reproduce the ORIGINAL behaviour exactly — the full
+# bidirectional grid+oracle mesh across `nodes`, self included — so existing
+# callers (site.yml's ssh_equivalence play, the standby equivalent) need no
+# changes.
+#
+# ---------------------------------------------------------------------------
+# Intra-cluster mesh (the GI/OUI prerequisite) — defaults, nothing to pass:
+#
+#   - role: ssh_equivalence
+#
+# One-directional, one user, host to host (what cross_cluster_ssh_trust did):
+#
+#   - role: ssh_equivalence
+#     vars:
+#       ssh_equiv_sources: ["{{ groups['rac_node1'][0] }}"]
+#       ssh_equiv_targets: ["{{ groups['observer_nodes'][0] }}"]
+#       ssh_equiv_users: ["{{ oracle_user }}"]
+#       ssh_equiv_bidirectional: false
+#       ssh_equiv_manage_system_config: false
+#
+# Both ways between two hosts:
+#
+#       ssh_equiv_bidirectional: true
+# ---------------------------------------------------------------------------
+
+# Hosts the SSH connection originates FROM. Defaults to the cluster's own node
+# list, redirected per group_vars/<group>.yml the same way dns_bind and
+# asmlib_disks do it — NOT a hardcoded groups['rac_nodes'], which is
+# inventory-global and would leak keys across clusters (docs/known-risks.md #59).
+ssh_equiv_sources: "{{ nodes | default([]) | map(attribute='name') | list }}"
+
+# Hosts the connection goes TO. Same list as sources for a mesh.
+ssh_equiv_targets: "{{ nodes | default([]) | map(attribute='name') | list }}"
+
+# true  — also authorise target -> source, giving a full mesh when sources and
+#         targets are the same list. Required for the GI prerequisite: OUI SSHes
+#         in both directions, and to a node's own hostname.
+# false — source -> target only. Correct for a one-way file push.
+ssh_equiv_bidirectional: true
+
+# grid AND oracle for the GI prerequisite. A single user for a file copy.
+ssh_equiv_users:
+  - "{{ grid_user }}"
+  - "{{ oracle_user }}"
+
+# Include each host's own name in the pair list, so a host can SSH to itself.
+# GI's tooling does exactly that. Meaningless for a point-to-point copy.
+ssh_equiv_include_self: true
+
+# Writes /etc/ssh/ssh_known_hosts and the CheckHostIP block in /etc/ssh/ssh_config
+# on every source host. Needed for the GI prerequisite (see main.yml for the full
+# reasoning and docs/known-risks.md #64). Set false for a point-to-point trust on
+# a host outside this project's build, where rewriting system SSH config is more
+# intrusive than the job warrants.
+ssh_equiv_manage_system_config: true
+
+# Named in the final failure message so it says what the trust was actually for.
+ssh_equiv_purpose: "the Grid Infrastructure / OUI SSH equivalence prerequisite"
+
+# Do the work once per play rather than once per host in the play.
+#
+# Leave this true. Every task in configure.yml/pair.yml is delegate_to-driven, so
+# nothing it does depends on which host the play is currently iterating. A play
+# across `rac_nodes` with this false builds the whole mesh twice in parallel, and
+# both forks run lineinfile against the SAME authorized_keys on the SAME target
+# concurrently — a read-modify-write race that can silently drop a key. See
+# tasks/main.yml's header and docs/known-risks.md #141.
+#
+# The only reason it is a variable at all is to leave an escape hatch if a future
+# caller genuinely needs per-host behaviour; nothing in this project does.
+ssh_equiv_run_once: true

@@ -1,0 +1,260 @@
+---
+# One directional trust: ssh_user@ssh_pair_source -> ssh_user@ssh_pair_target.
+#
+# ---------------------------------------------------------------------------
+# CHECK, THEN ACT, THEN VERIFY — in that order, per James's direct instruction:
+#
+#   1. Check first whether the trust is already there and working
+#   2. Only set it up if it is not
+#   3. Check again afterwards to prove it is
+#
+# Step 2 is skipped entirely on a working trust, so a re-run is a handful of
+# read-only SSH calls rather than a rebuild. That matters for more than speed —
+# see the ssh-keyscan note below for what the unconditional rebuild was actually
+# doing to known_hosts every time.
+#
+# The check is a real connection, not an inspection of files. Whether
+# authorized_keys contains the right line is a proxy; whether
+# `ssh oracle@target hostname` returns is the thing itself. Same test, same
+# command, at both step 1 and step 3.
+# ---------------------------------------------------------------------------
+#
+# Everything is delegate_to-driven rather than relying on the play's host loop
+# and hostvars. That is the change that lets one role serve both the
+# intra-cluster mesh and a point-to-point host trust: the old mesh implementation
+# depended on being a play across the group so that every host had already
+# published its public key as a fact before the authorise step ran, which meant
+# it could not express "oradbserv05 -> oemserver01" at all.
+
+# --- STEP 1: check ----------------------------------------------------------
+
+- name: "CHECK  {{ ssh_user }}@{{ ssh_pair_source }} -> {{ ssh_pair_target }}"
+  # This is deliberately the same one-liner a DBA types by hand:
+  #
+  #     ssh oracle@oemserver01 hostname
+  #
+  # written as user@host rather than relying on the fact that become_user has
+  # already made us that user, so the command in the log is copy-pasteable as-is.
+  # `hostname` rather than `date` only because it names WHICH host answered —
+  # useful when a stale known_hosts entry or a wrong alias sends you somewhere
+  # unexpected. `date` verifies exactly as well otherwise.
+  #
+  # The two -o flags are the only additions, and neither is decoration:
+  #
+  #   BatchMode=yes    refuses to prompt for a password or a host-key
+  #                    confirmation. Without it an unconfigured trust does not
+  #                    fail — it HANGS, because Ansible's command module
+  #                    allocates no PTY and the prompt waits forever for input
+  #                    that can never arrive. That is docs/known-risks.md #6, the
+  #                    same silent hang that stalls cluvfy and gridSetup.sh.
+  #   ConnectTimeout=5 bounds an unreachable host to five seconds instead of the
+  #                    default two-minute TCP wait.
+  #
+  # Interactively neither matters: a human sees the prompt and presses Ctrl-C.
+  become: true
+  become_user: "{{ ssh_user }}"
+  delegate_to: "{{ ssh_pair_source }}"
+  command: >
+    ssh -o BatchMode=yes -o ConnectTimeout=5
+    {{ ssh_user }}@{{ ssh_pair_target }} hostname
+  register: ssh_pair_precheck
+  changed_when: false
+  failed_when: false
+
+- name: "  -> {{ 'already configured, skipping setup' if ssh_pair_precheck.rc == 0 else 'NOT configured, will set up' }}"
+  # Classifies the failure rather than just printing it. The three common causes
+  # look similar in a wall of output and have completely different fixes, and
+  # knowing which one occurred is the difference between a five-minute check and
+  # an hour of guessing:
+  #
+  #   "Permission denied (publickey"   -> the KEY is the problem. The host key was
+  #                                       accepted, sshd rejected the identity.
+  #                                       Look at authorized_keys on the TARGET,
+  #                                       and at the permissions on the target's
+  #                                       home and .ssh (sshd silently ignores
+  #                                       authorized_keys if either is group- or
+  #                                       world-writable).
+  #   "Host key verification failed"   -> the HOST KEY is the problem, not the
+  #                                       identity. known_hosts on the SOURCE is
+  #                                       missing or stale. See #62/#64.
+  #   "Connection refused" / timeout   -> nothing to do with SSH trust at all —
+  #                                       host down, sshd down, or firewalled.
+  debug:
+    msg: >-
+      {{ ssh_user }}@{{ ssh_pair_source }} -> {{ ssh_pair_target }}:
+      {{ 'OK (' ~ ssh_pair_precheck.stdout ~ ') — nothing to do'
+         if ssh_pair_precheck.rc == 0
+         else 'rc=' ~ ssh_pair_precheck.rc ~ ' — ' ~ (ssh_pair_precheck.stderr | default('no stderr'))
+              ~ ' || DIAGNOSIS: '
+              ~ ('authorized_keys / target home-and-.ssh permissions on '
+                 ~ ssh_pair_target ~ ' — the host key was accepted, the IDENTITY was rejected'
+                 if 'Permission denied (publickey' in (ssh_pair_precheck.stderr | default(''))
+                 else 'known_hosts on ' ~ ssh_pair_source ~ ' is missing or stale (see #62/#64)'
+                 if 'Host key verification failed' in (ssh_pair_precheck.stderr | default(''))
+                 else ssh_pair_target ~ ' is not reachable on port 22 — not an SSH-trust problem at all'
+                 if ('Connection refused' in (ssh_pair_precheck.stderr | default('')))
+                    or ('timed out' in (ssh_pair_precheck.stderr | default('')))
+                 else 'unrecognised — read the stderr above') }}
+
+# --- STEP 2: configure, only if the check failed ----------------------------
+
+- name: "Set up the trust (skipped when the check above passed)"
+  when: ssh_pair_precheck.rc != 0
+  block:
+
+    - name: "[{{ ssh_pair_source }}] Ensure {{ ssh_user }}'s .ssh exists"
+      become: true
+      become_user: "{{ ssh_user }}"
+      delegate_to: "{{ ssh_pair_source }}"
+      file:
+        path: "/home/{{ ssh_user }}/.ssh"
+        state: directory
+        owner: "{{ ssh_user }}"
+        group: oinstall
+        mode: "0700"
+
+    - name: "[{{ ssh_pair_source }}] Generate an RSA/PEM keypair for {{ ssh_user }} if absent"
+      # RSA in legacy PEM encoding (-m PEM), NOT ed25519 and NOT the modern OpenSSH
+      # format ssh-keygen has defaulted to since OpenSSH 7.8. A confirmed requirement,
+      # not a style choice: gridSetup.sh's own bundled Java SSH client cannot parse
+      # anything else, and fails with [INS-06003]/PRCZ-2006/PRVG-11001 and a garbled
+      # "invalid privatekey: [B@<hash>" — a raw Java byte-array toString(). The system
+      # ssh/sshd does not care; this is Oracle's bundled client being stricter. See
+      # docs/known-risks.md #16.
+      become: true
+      become_user: "{{ ssh_user }}"
+      delegate_to: "{{ ssh_pair_source }}"
+      command: >
+        ssh-keygen -t rsa -b 2048 -m PEM -N '' -f /home/{{ ssh_user }}/.ssh/id_rsa
+        -C "{{ ssh_user }}@{{ ssh_pair_source }}"
+      args:
+        creates: "/home/{{ ssh_user }}/.ssh/id_rsa"
+
+    - name: "[{{ ssh_pair_source }}] Read {{ ssh_user }}'s public key"
+      delegate_to: "{{ ssh_pair_source }}"
+      slurp:
+        src: "/home/{{ ssh_user }}/.ssh/id_rsa.pub"
+      register: ssh_pair_pubkey
+
+    - name: "[{{ ssh_pair_source }}] Scan {{ ssh_pair_target }}'s host keys"
+      # NO -H. That flag hashes the hostname field with a random salt, so every run
+      # produces DIFFERENT text for the same host and key. lineinfile then never
+      # matches what is already there, appends again, and reports `changed` — which
+      # is why this task went yellow on every single run and known_hosts grew
+      # without bound. Unhashed entries are stable text, so lineinfile is genuinely
+      # idempotent. Hashing only obscures which hosts a user has connected to; on a
+      # lab where the inventory is in the repository it buys nothing.
+      #
+      # Short name and FQDN only, deliberately no IP. OpenSSH's CheckHostIP
+      # cross-checks a separately-keyed IP entry against the hostname entry, and a
+      # host offering RSA, ECDSA and ED25519 simultaneously (OL7 default) can
+      # negotiate a different algorithm per target string, producing a spurious
+      # mismatch warning. Not pre-seeding an IP entry sidesteps it; OpenSSH adds one
+      # itself on first real connection, self-consistent by construction. See
+      # docs/known-risks.md #62.
+      become: true
+      become_user: "{{ ssh_user }}"
+      delegate_to: "{{ ssh_pair_source }}"
+      command: "ssh-keyscan -T 5 {{ ssh_pair_target }} {{ ssh_pair_target }}.{{ domain }}"
+      register: ssh_pair_keyscan
+      changed_when: false
+      failed_when: false
+
+    - name: "[{{ ssh_pair_source }}] Append {{ ssh_pair_target }}'s host keys to {{ ssh_user }}'s known_hosts"
+      # lineinfile, NOT a wholesale copy. A wholesale write would silently wipe
+      # entries this role added on an earlier pair — the exact regression
+      # cross_cluster_ssh_trust's header called out. Additive is the only safe form
+      # once one role handles multiple pairs.
+      become: true
+      become_user: "{{ ssh_user }}"
+      delegate_to: "{{ ssh_pair_source }}"
+      lineinfile:
+        path: "/home/{{ ssh_user }}/.ssh/known_hosts"
+        line: "{{ known_hosts_line }}"
+        create: true
+        owner: "{{ ssh_user }}"
+        group: oinstall
+        mode: "0600"
+      loop: "{{ ssh_pair_keyscan.stdout_lines | default([]) }}"
+      loop_control:
+        # loop_var, not the default `item` — this file is reached via an
+        # include_tasks that loops, and its vars are lazy expressions over that
+        # loop's variable. A bare `item` here rebinds them mid-task and
+        # delegate_to ends up pointing at a fragment of a keyscan line. See
+        # docs/known-risks.md #147.
+        loop_var: known_hosts_line
+        label: "{{ known_hosts_line.split(' ')[0] if known_hosts_line else '(empty)' }}"
+
+    - name: "[{{ ssh_pair_target }}] Ensure {{ ssh_user }}'s .ssh exists"
+      become: true
+      become_user: "{{ ssh_user }}"
+      delegate_to: "{{ ssh_pair_target }}"
+      file:
+        path: "/home/{{ ssh_user }}/.ssh"
+        state: directory
+        owner: "{{ ssh_user }}"
+        group: oinstall
+        mode: "0700"
+
+    - name: "[{{ ssh_pair_target }}] Authorise {{ ssh_pair_source }}'s {{ ssh_user }} key"
+      become: true
+      become_user: "{{ ssh_user }}"
+      delegate_to: "{{ ssh_pair_target }}"
+      lineinfile:
+        path: "/home/{{ ssh_user }}/.ssh/authorized_keys"
+        line: "{{ ssh_pair_pubkey.content | b64decode | trim }}"
+        create: true
+        owner: "{{ ssh_user }}"
+        group: oinstall
+        mode: "0600"
+
+# --- Cleanup, deliberately NOT gated on the pre-check -----------------------
+
+- name: "[{{ ssh_pair_source }}] Remove any stale {{ ssh_user }}/.ssh/config"
+  # Ungated on purpose. A previous version of this role wrote a config with
+  # UserKnownHostsFile /dev/null, which discarded every known_hosts entry
+  # immediately — and a trust in that state still PASSES the pre-check, because
+  # StrictHostKeyChecking no plus /dev/null connects fine, just noisily and
+  # without ever persisting anything. So the pre-check cannot be trusted to
+  # detect this, and the cleanup has to run either way. It is idempotent and
+  # free when the file is absent. See docs/known-risks.md #63.
+  become: true
+  become_user: "{{ ssh_user }}"
+  delegate_to: "{{ ssh_pair_source }}"
+  file:
+    path: "/home/{{ ssh_user }}/.ssh/config"
+    state: absent
+
+# --- STEP 3: verify ---------------------------------------------------------
+
+- name: "VERIFY {{ ssh_user }}@{{ ssh_pair_source }} -> {{ ssh_pair_target }}"
+  # Byte-for-byte the same command as step 1, run again unconditionally. On the
+  # already-configured path this is a second confirmation; on the just-configured
+  # path it is the proof. Either way the run ends having actually opened the
+  # connection rather than having inferred success from a file write.
+  #
+  # Keep these two commands identical. If they ever drift, step 3 stops being a
+  # verification of step 1's own criterion and becomes a different test that
+  # happens to run afterwards.
+  become: true
+  become_user: "{{ ssh_user }}"
+  delegate_to: "{{ ssh_pair_source }}"
+  command: >
+    ssh -o BatchMode=yes -o ConnectTimeout=5
+    {{ ssh_user }}@{{ ssh_pair_target }} hostname
+  register: ssh_pair_check
+  changed_when: false
+  failed_when: false
+
+- name: "Record the result of this pair"
+  set_fact:
+    ssh_equiv_results: >-
+      {{ (ssh_equiv_results | default([])) + [{
+           'user': ssh_user,
+           'source': ssh_pair_source,
+           'target': ssh_pair_target,
+           'rc': ssh_pair_check.rc,
+           'was_already_configured': (ssh_pair_precheck.rc == 0),
+           'out': (ssh_pair_check.stdout if ssh_pair_check.rc == 0
+                   else ssh_pair_check.stderr)
+         }] }}

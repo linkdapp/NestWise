@@ -1,0 +1,218 @@
+---
+# The actual SSH-equivalence work. Called by main.yml exactly once per play run —
+# see main.yml's header for why that gate exists and what breaks without it.
+#
+# Defaults in defaults/main.yml reproduce the ORIGINAL mesh behaviour exactly:
+# bidirectional, grid and oracle, every host in `nodes`, self included.
+#
+# ---------------------------------------------------------------------------
+# THIS IS A LOAD-BEARING GRID INFRASTRUCTURE PREREQUISITE. Not a cluvfy nicety.
+# gridSetup.sh's "OUI copies GRID_HOME to every node over SSH equivalence"
+# behaviour needs this to already exist, and nothing in this project's
+# CRS_CONFIG response file sets it up the way `-setupSSH` with inline passwords
+# would.
+#
+# Symptom when it has not run: grid_install's cluvfy pre-check, or gridSetup.sh's
+# own -applyRU step, hangs indefinitely with NO output. Not slow — stuck.
+# Ansible's command module allocates no PTY, so an SSH password prompt from
+# cluvfy or gridSetup.sh reaching the peer node as grid/oracle blocks forever
+# waiting for input that can never arrive. Ctrl-C, run this role, re-run
+# grid_install.
+#
+# The mesh path was rewritten from a play-plus-hostvars implementation to
+# explicit delegation. RE-TEST IT BEFORE THE NEXT GI BUILD rather than assuming
+# it still behaves identically.
+# ---------------------------------------------------------------------------
+#
+# Uses only ansible-core modules (slurp, lineinfile, copy, command, file) —
+# deliberately no ansible.posix dependency, matching this project's preference
+# not to add collections without a reason.
+
+- name: Fail fast if no sources or targets resolved
+  fail:
+    msg: >
+      ssh_equiv_sources or ssh_equiv_targets is empty. With the defaults these
+      come from `nodes`, which is redirected per group_vars/<group>.yml — check
+      that the calling play targets a group that defines it, or pass the hosts
+      explicitly.
+  when: (ssh_equiv_sources | length) == 0 or (ssh_equiv_targets | length) == 0
+
+- name: Build the ordered list of directed pairs
+  # Cartesian product of sources and targets, plus the reverse when
+  # bidirectional, minus self-pairs when ssh_equiv_include_self is false.
+  # Deduplicated so a mesh where sources == targets does not do every pair twice.
+  set_fact:
+    ssh_equiv_pairs: >-
+      {{ (
+           ( ssh_equiv_sources | product(ssh_equiv_targets) | list )
+           +
+           ( ssh_equiv_targets | product(ssh_equiv_sources) | list
+             if ssh_equiv_bidirectional | bool else [] )
+         )
+         | unique
+         | rejectattr('0', 'equalto', none)
+         | selectattr('0')
+         | list }}
+
+# Self-pairs (host -> itself) are filtered at the include's `when:` rather than
+# here. Doing it in the pair list would need a custom filter plugin or an awkward
+# comprehension, and this project deliberately avoids adding plugins without a
+# reason.
+
+- name: Report what will be configured
+  debug:
+    msg:
+      - "Play host   : {{ inventory_hostname }} (work runs once per play, not per host)"
+      - "Users        : {{ ssh_equiv_users | join(', ') }}"
+      - "Sources      : {{ ssh_equiv_sources | join(', ') }}"
+      - "Targets      : {{ ssh_equiv_targets | join(', ') }}"
+      - "Bidirectional: {{ ssh_equiv_bidirectional }}"
+      - "Include self : {{ ssh_equiv_include_self }}"
+      - "Pairs        : {{ ssh_equiv_pairs | length }}"
+      - "Purpose      : {{ ssh_equiv_purpose }}"
+
+# --- System-wide SSH configuration on each source host -----------------------
+# Only for the GI prerequisite. Rewriting /etc/ssh on a host outside this
+# project's build (oemserver01, say) is more intrusive than a point-to-point
+# file-copy trust warrants, so callers doing that set
+# ssh_equiv_manage_system_config: false.
+
+- name: Scan all target host keys from each source, for the system-wide file
+  # Runs as root: the output is written to /etc/ssh/ssh_known_hosts, and
+  # ssh-keyscan needs no credentials of its own.
+  become: true
+  delegate_to: "{{ item }}"
+  command: >
+    ssh-keyscan -T 5 -H
+    {{ (ssh_equiv_targets + (ssh_equiv_targets | map('regex_replace', '^(.*)$', '\1.' ~ domain) | list)) | join(' ') }}
+  loop: "{{ ssh_equiv_sources }}"
+  register: ssh_equiv_syswide_scan
+  changed_when: false
+  failed_when: false
+  when: ssh_equiv_manage_system_config | bool
+
+- name: Write the system-wide known_hosts on each source
+  # Covers any OS user's manual `ssh grid@peer` test, not just the automation
+  # below. gridSetup.sh's bundled SSH client reads OS-level known_hosts the same
+  # way system ssh does.
+  become: true
+  delegate_to: "{{ item.item }}"
+  copy:
+    dest: /etc/ssh/ssh_known_hosts
+    content: "{{ item.stdout }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ ssh_equiv_syswide_scan.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('?') }}"
+  when:
+    - ssh_equiv_manage_system_config | bool
+    - item.stdout is defined
+    - item.stdout | length > 0
+
+- name: Disable CheckHostIP system-wide on each source
+  # CheckHostIP stores and cross-checks a SEPARATE known_hosts entry keyed by
+  # resolved IP, to catch DNS hijacking. It assumes a host presents exactly one
+  # key. sshd on these nodes offers RSA, ECDSA and ED25519 simultaneously (OL7
+  # default), and which one a connection negotiates depends on what the client
+  # already cached for that EXACT target string — so the short name, the FQDN and
+  # the dynamically-added IP entry can each hold a different algorithm for the
+  # literal same sshd, purely from negotiation order. CheckHostIP then compares
+  # across mismatched algorithms and warns, with nothing actually wrong.
+  # Confirmed live: oradbserv10's FQDN connection to oradbserv09 negotiated
+  # ED25519, its short-name connection seconds later negotiated ECDSA.
+  #
+  # StrictHostKeyChecking stays ON — see docs/known-risks.md #63, do not repeat
+  # that mistake. This disables only the secondary IP cross-check, which is
+  # fundamentally incompatible with a multi-algorithm host reachable under
+  # multiple names. See #64.
+  become: true
+  delegate_to: "{{ item }}"
+  blockinfile:
+    path: /etc/ssh/ssh_config
+    marker: "# {mark} ANSIBLE MANAGED BLOCK — CheckHostIP (see docs/known-risks.md #64)"
+    block: |
+      Host *
+          CheckHostIP no
+  loop: "{{ ssh_equiv_sources }}"
+  when: ssh_equiv_manage_system_config | bool
+
+# --- The pairs themselves ----------------------------------------------------
+
+- name: Configure each user across each directed pair
+  # loop_var: ssh_equiv_item IS LOAD-BEARING. Do not remove it, and do not rename
+  # it back to the default `item`.
+  #
+  # The three vars below are lazy Jinja expressions — they are re-evaluated inside
+  # pair.yml every time they are referenced, not captured once here. With the
+  # default loop variable they would read `{{ item.1.0 }}`, and any task in
+  # pair.yml that has a `loop:` of its own REBINDS `item` to ITS current element
+  # for the duration of that task.
+  #
+  # The known_hosts task in pair.yml loops over ssh-keyscan output lines. Under the
+  # default loop_var, `ssh_pair_source` was therefore re-evaluated as
+  # `<keyscan line>.1.0` — which Python happily resolves as the second character of
+  # the string, then that string's first character, giving "1". Ansible then took
+  # "1" as a hostname, resolved it to 0.0.0.1, and reported:
+  #
+  #   failed: [localhost -> 1] ... connect to host 0.0.0.1 port 22: Connection refused
+  #   fatal: [localhost -> {{ ssh_pair_source }}]: UNREACHABLE!
+  #
+  # Every earlier task in pair.yml succeeded because none of them has an inner
+  # loop, so `item` still held this loop's element. Ansible warns about the
+  # collision ("The loop variable 'item' is already in use") but only as a WARNING,
+  # after which it proceeds to do the wrong thing.
+  #
+  # This hazard did not exist in cross_cluster_ssh_trust: that role handled exactly
+  # one pair and one user, so it had no outer loop and nothing to collide with. It
+  # arrived with the generalisation. See docs/known-risks.md #147.
+  include_tasks: pair.yml
+  vars:
+    ssh_user: "{{ ssh_equiv_item.0 }}"
+    ssh_pair_source: "{{ ssh_equiv_item.1.0 }}"
+    ssh_pair_target: "{{ ssh_equiv_item.1.1 }}"
+  loop: "{{ ssh_equiv_users | product(ssh_equiv_pairs) | list }}"
+  loop_control:
+    loop_var: ssh_equiv_item
+    label: "{{ ssh_equiv_item.0 }}: {{ ssh_equiv_item.1.0 }} -> {{ ssh_equiv_item.1.1 }}"
+  when: >
+    (ssh_equiv_include_self | bool) or (ssh_equiv_item.1.0 != ssh_equiv_item.1.1)
+
+# --- Results -----------------------------------------------------------------
+
+- name: Show every verification result
+  debug:
+    msg: >-
+      {{ item.user }}@{{ item.source }} -> {{ item.target }}:
+      {{ 'OK — ' ~ item.out if item.rc == 0 else 'FAILED (rc=' ~ item.rc ~ ') — ' ~ item.out }}
+      [{{ 'already configured, setup skipped' if item.was_already_configured | default(false)
+          else 'newly configured this run' }}]
+  loop: "{{ ssh_equiv_results | default([]) }}"
+  loop_control:
+    label: "{{ item.user }}: {{ item.source }} -> {{ item.target }}"
+
+- name: Summarise what this run actually did
+  # A one-line answer to "did it rebuild everything again?". On a healthy estate
+  # every pair should report already-configured and the run should be read-only.
+  debug:
+    msg: >-
+      {{ ssh_equiv_results | default([]) | length }} pair(s) checked —
+      {{ ssh_equiv_results | default([]) | selectattr('was_already_configured', 'defined')
+         | selectattr('was_already_configured') | list | length }} already configured
+      (setup skipped),
+      {{ ssh_equiv_results | default([]) | rejectattr('was_already_configured', 'defined')
+         | list | length
+         + (ssh_equiv_results | default([]) | selectattr('was_already_configured', 'defined')
+            | rejectattr('was_already_configured') | list | length) }} built this run.
+
+- name: Fail if any pair could not connect
+  fail:
+    msg: >-
+      {{ ssh_equiv_results | rejectattr('rc', 'eq', 0) | list | length }} of
+      {{ ssh_equiv_results | length }} SSH pairs failed. This trust exists for
+      {{ ssh_equiv_purpose }}. Read the per-pair output above. If this is the
+      Grid Infrastructure prerequisite, do NOT run grid_install until every pair
+      reports OK — cluvfy and gridSetup.sh will hang with no output rather than
+      failing cleanly.
+  when: (ssh_equiv_results | default([]) | rejectattr('rc', 'eq', 0) | list | length) > 0

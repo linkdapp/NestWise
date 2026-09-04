@@ -1,0 +1,24 @@
+---
+# Source and target for the one-directional oracle-user SSH trust this role sets
+# up. Defaults reproduce the role's original hardcoded behaviour exactly
+# (oradbserv05 -> oradbserv09, for db19c_software_install's cross-cluster copy),
+# so existing callers that pass nothing are unaffected.
+#
+# Parameterised 2026-08-31 for Phase 7a: oem_repo_patch needs the same trust from
+# oradbserv05 to oemserver01 so the RU zip can be rsync'd directly rather than
+# routed through the Ansible controller twice. The role's own header already
+# anticipated this ("add a second, symmetric run of this role with source/target
+# swapped if that changes later") — this is that, done by variable rather than by
+# copying the role.
+#
+# Override per invocation, e.g.:
+#   - role: cross_cluster_ssh_trust
+#     vars:
+#       ssh_trust_target_host: "{{ groups['observer_nodes'][0] }}"
+
+ssh_trust_source_host: "{{ groups['rac_node1'][0] }}"
+ssh_trust_target_host: "{{ groups['standby_node1'][0] }}"
+
+# Purely cosmetic: named in the final failure message so it says what the trust
+# was actually for rather than always naming db19c_software_install.
+ssh_trust_purpose: "db19c_software_install's cross-cluster file copy"

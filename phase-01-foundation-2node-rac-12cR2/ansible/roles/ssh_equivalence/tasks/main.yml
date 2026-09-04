@@ -1,115 +1,46 @@
 ---
-# Sets up passwordless SSH equivalence for the grid and oracle OS users, bidirectionally,
-# across every host in rac_nodes (including self — GI's own tooling SSHes to its own
-# hostname too, not just the peer node). This is a genuine, mandatory Grid
-# Infrastructure/OUI prerequisite, not just a cluvfy nicety: gridSetup.sh's "OUI copies
-# GRID_HOME to every node in the response file's clusterNodes list over SSH equivalence"
-# behavior (see grid_silent_install's and db_silent_install's task comments) needs this
-# to already exist — nothing in this project's CRS_CONFIG response file sets it up for
-# you the way `-setupSSH` with inline passwords would.
+# Passwordless SSH between a set of SOURCE hosts and a set of TARGET hosts, for a
+# set of users, optionally both ways.
 #
-# Symptom if this hasn't run yet: grid_install's cluvfy pre-check task (or, if you
-# somehow got past that, gridSetup.sh's own -applyRU step) hangs indefinitely with NO
-# output at all — not slow, actually stuck. Ansible's `command` module allocates no
-# PTY, so an SSH password prompt from cluvfy/gridSetup.sh trying to reach the peer node
-# as grid/oracle just blocks forever waiting for input that can never arrive. Ctrl+C the
-# hung run, run this role/tag, then re-run grid_install from where it left off.
+# GENERALISED 2026-08-31, and this REPLACES cross_cluster_ssh_trust — that role
+# was this same logic hardcoded to one pair (oradbserv05 -> oradbserv09) for
+# db19c_software_install's cross-cluster copy.
 #
-# Uses only ansible-core modules (slurp, lineinfile, copy, command) — deliberately no
-# ansible.posix dependency (authorized_key/known_hosts live there), matching this
-# project's existing preference not to add collection dependencies without a reason.
+# ---------------------------------------------------------------------------
+# WHY THIS FILE IS A ONE-TASK WRAPPER
 #
-# Keys are RSA in legacy PEM format specifically (see per_user.yml), NOT ed25519 —
-# gridSetup.sh's own bundled SSH client (separate from the system `ssh` binary) can't
-# parse anything else; see docs/known-risks.md #16 for the [INS-06003]/"invalid
-# privatekey" failure this fixes.
+# The real work is in configure.yml. This file exists solely to run it ONCE per
+# play, not once per host in the play.
 #
-# Host-key confirmation prompts are a SEPARATE problem from the password-prompt hang
-# above, worth its own note: a per-user ~/.ssh/config with StrictHostKeyChecking no
-# does NOT reliably suppress the prompt, because ssh reads ~/.ssh/config out of the
-# INVOKING user's home directory, not the remote target user's — a manual
-# `ssh grid@oradbserv06 date` typed while logged in as yourself (not `su - grid`
-# first) never reads /home/grid/.ssh/config at all. Fixed below by pre-populating
-# known_hosts directly via ssh-keyscan instead — both a SYSTEM-WIDE copy
-# (/etc/ssh/ssh_known_hosts, covers literally any local OS user) and per-software-owner
-# copies (grid/oracle, belt-and-suspenders).
+# That matters because of what the generalisation changed. The OLD mesh
+# implementation used the play's own host loop as its parallelism: the play
+# targeted `rac_nodes`, and each host configured ITS OWN .ssh directory. Two
+# hosts, two disjoint sets of files, no overlap.
+#
+# configure.yml is fully delegate_to-driven instead — that is what lets one role
+# express "oradbserv05 -> oemserver01", which the old hostvars-based version
+# could not do at all. But it also means the work no longer depends on which
+# host the play is currently iterating. Left ungated, a play across `rac_nodes`
+# would build the ENTIRE mesh twice, concurrently, once from each host's fork —
+# and both forks would run `lineinfile` against the SAME
+# /home/<user>/.ssh/authorized_keys on the SAME delegated target at the same
+# time. lineinfile is read-modify-write via a temp file and a rename; two
+# concurrent writers can silently lose one of the two keys. A missing
+# authorized_keys entry is exactly the failure that makes gridSetup.sh hang with
+# no output (docs/known-risks.md #6), so this is not a cosmetic dedupe.
+#
+# ansible_play_hosts rather than ansible_play_hosts_all: the former excludes
+# hosts already failed or unreachable, so if the first inventory host is down
+# the mesh is still built from the next live one instead of being skipped
+# entirely.
+#
+# include_tasks with a `when`, rather than `meta: end_host`: end_host would end
+# the host for the WHOLE play, silently skipping any role listed after this one.
+# This gate is scoped to this role and nothing else.
+# ---------------------------------------------------------------------------
 
-- name: Build the list of node identities to pre-populate in known_hosts (short name and FQDN only — see known-risks.md #62 for why the IP identity was dropped)
-  # Deliberately NOT including nodes | map(attribute='public_ip') here anymore.
-  # OpenSSH's CheckHostIP (on by default) cross-checks the hostname-keyed entry
-  # against a SEPARATE IP-keyed entry for the same connection and warns
-  # ("Warning: the ED25519 host key for 'X' differs from the key for the IP
-  # address 'Y'") if they don't match — confirmed on a real run against
-  # oradbserv10 self-looping via its own FQDN. Pre-seeding an IP-keyed entry from
-  # a keyscan is exactly what can go stale relative to the hostname-keyed entry:
-  # if this role runs again later (or the node's host key regenerates — expected
-  # on a freshly cloned/rebuilt VM, see per_user.yml's own comment) the two
-  # entries can drift out of sync with each other even though both are populated
-  # from the "same" keyscan pass, because ssh-keyscan makes a separate TCP
-  # connection per target string and nothing guarantees the two connections land
-  # in the same instant. Not pre-seeding an IP entry at all sidesteps the whole
-  # problem: OpenSSH's own CheckHostIP behavior will still add one dynamically on
-  # first real connection, from that live session's actual key — self-consistent
-  # by construction, nothing for it to drift out of sync with. Oracle's own
-  # tooling (cluvfy, gridSetup.sh, GI's SSH equivalence) connects by hostname from
-  # the response file's node list, never by raw IP, so nothing here depends on an
-  # IP-keyed entry existing up front.
-  set_fact:
-    ssh_keyscan_targets: >-
-      {{ (nodes | map(attribute='name') | list)
-       + (nodes | map(attribute='name') | map('regex_replace', '^(.*)$', '\1.' ~ domain) | list) }}
-
-- name: Scan SSH host keys for every rac_nodes identity from this node (self + peers, by name/FQDN/IP)
-  # No auth needed — ssh-keyscan just reads whatever host key sshd presents on port 22,
-  # so this works even before any SSH equivalence exists. Runs on EVERY node (not
-  # run_once): each node needs its OWN known_hosts populated, since ssh gets run in
-  # both directions plus self-loopback (GI's own tooling SSHes to its own hostname
-  # too). -T 5: fail fast on a genuinely unreachable node instead of hanging the play.
-  command: "ssh-keyscan -T 5 -H {{ ssh_keyscan_targets | join(' ') }}"
-  register: keyscan_result
-  changed_when: false
-  failed_when: false
-
-- name: Pre-populate the SYSTEM-WIDE known_hosts (covers any OS user's manual `ssh grid@peer` test, not just the grid/oracle automation below)
-  copy:
-    dest: /etc/ssh/ssh_known_hosts
-    content: "{{ keyscan_result.stdout }}"
-    owner: root
-    group: root
-    mode: "0644"
-
-- name: "Disable CheckHostIP system-wide — the root cause of 'host key for X differs from the key for the IP address', not a security-relevant check on this network (see docs/known-risks.md #64)"
-  # CheckHostIP (on by default) stores and cross-checks a SEPARATE known_hosts
-  # entry keyed by the resolved IP address, specifically to catch DNS-hijacking
-  # (a hostname silently starting to resolve to a different, genuinely different
-  # machine). It assumes a host presents exactly one key. sshd on these nodes
-  # offers RSA, ECDSA, AND ED25519 simultaneously (OL7 default) — which algorithm
-  # a given connection negotiates depends on what the client already has cached
-  # for that EXACT target string, so the short name, the FQDN, and the
-  # dynamically-added IP entry can each end up with a DIFFERENT algorithm for the
-  # literal same sshd, purely from negotiation-order happenstance, not a real
-  # host change. CheckHostIP then compares across those mismatched algorithms and
-  # warns/refuses, even though nothing is actually wrong. Confirmed on a real run:
-  # oradbserv10's FQDN connection to oradbserv09 negotiated ED25519 (stored under
-  # the IP entry), its short-name connection seconds later negotiated ECDSA —
-  # different algorithm, not a different or stale key, and CheckHostIP flagged it
-  # anyway. StrictHostKeyChecking stays ON (see #63 — don't repeat that mistake);
-  # this only disables the secondary IP-based cross-check, which is fundamentally
-  # incompatible with a multi-algorithm host reachable under multiple names.
-  become: true
-  blockinfile:
-    path: /etc/ssh/ssh_config
-    marker: "# {mark} ANSIBLE MANAGED BLOCK — CheckHostIP (see docs/known-risks.md #64)"
-    block: |
-      Host *
-          CheckHostIP no
-
-- name: Set up SSH equivalence for grid
-  include_tasks: per_user.yml
-  vars:
-    ssh_user: "{{ grid_user }}"
-
-- name: Set up SSH equivalence for oracle
-  include_tasks: per_user.yml
-  vars:
-    ssh_user: "{{ oracle_user }}"
+- name: Configure SSH equivalence (once per play, not once per host)
+  include_tasks: configure.yml
+  when: >
+    not (ssh_equiv_run_once | bool)
+    or inventory_hostname == ansible_play_hosts[0]

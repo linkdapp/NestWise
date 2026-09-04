@@ -1,0 +1,104 @@
+---
+# Phase 7a — patch the OEM Management Repository database to 19c RU32.
+#
+# Run:
+#   ansible-playbook -i inventory/hosts.ini oem-repo-patch.yml -e oem_patch_confirm=yes
+#
+# Dry-run the preflight checks only, safe at any time — this stops before the
+# blackout and touches nothing:
+#   ansible-playbook -i inventory/hosts.ini oem-repo-patch.yml \
+#     -e oem_patch_confirm=yes --tags oem_repo_patch_preflight
+#
+# The preflight tag is worth running on its own first. It proves a database is
+# actually running out of the target Oracle home, which this project's own notes
+# leave genuinely ambiguous for oemserver01 (group_vars/all.yml calls that path an
+# "Oracle Client"; emctl reports the EM instance home beneath it). It also checks
+# free space and that the patch is staged. All read-only.
+#
+# Deliberately a separate playbook rather than a play inside site.yml: site.yml
+# builds the RAC/Data Guard estate, and nothing there should ever be one broad
+# tag away from stopping the OMS and shutting the repository database.
+#
+# See monitoring/phase-7a-repository-db-ru32.md for the reasoning behind each
+# step, the rollback path, and what is deliberately left manual.
+
+# The RU zip lives on oradbserv05 from the GI build and is multi-GB. Establish
+# the same one-directional oracle-user SSH trust Phase 6 already uses for its
+# cross-cluster copy, pointed at oemserver01 instead of oradbserv09, so the copy
+# is a direct rsync push rather than a round trip through the controller.
+#
+# Idempotent and safe to re-run: it reuses the key ssh_equivalence already
+# generated on oradbserv05, appends to known_hosts rather than overwriting, and
+# verifies the connection before handing over.
+- name: Establish oracle SSH trust from the RAC node to oemserver01
+  hosts: localhost
+  # NO `connection: local` HERE. Deliberate, and this project has paid for it
+  # once already — see docs/known-risks.md #48's third update and the same
+  # comment above site.yml's gi_db_home_clone play.
+  #
+  # Set explicitly at play level, `connection: local` pins EVERY task in the play
+  # to a local connection, including delegated ones. delegate_to does not override
+  # it: Ansible resolves a delegated task's connection from the delegate's
+  # inventory vars only when the play has not already pinned one, and oradbserv05
+  # has no explicit ansible_connection to win the argument with.
+  #
+  # The result is that every task runs on the WSL2 control node while the output
+  # still reads `[localhost -> oradbserv05]`, and fails at the connection/become
+  # layer — `sudo: a password is required`, ACL chmod errors such as
+  # `chmod: invalid mode: 'A+user:oracle:rx:allow'`, or a generic MODULE FAILURE.
+  # The chmod error in particular is Ansible trying to hand a temp file to a user
+  # that does not exist on the controller.
+  #
+  # `hosts: localhost` alone is enough for a control-node-only play. Every task in
+  # ssh_equivalence is delegate_to-driven and nothing runs against localhost
+  # itself, so each task resolves its real connection from inventory correctly.
+  gather_facts: false
+  roles:
+    - role: ssh_equivalence
+      vars:
+        ssh_equiv_sources: ["{{ groups['rac_node1'][0] }}"]
+        ssh_equiv_targets: ["{{ groups['observer_nodes'][0] }}"]
+        ssh_equiv_users: ["{{ oracle_user }}"]
+        # One way only: nothing needs oemserver01 pushing back to oradbserv05.
+        ssh_equiv_bidirectional: false
+        # No self-pair: this is a copy between two hosts, not a cluster mesh.
+        ssh_equiv_include_self: false
+        # Leave oemserver01's /etc/ssh alone. That host sits outside this
+        # project's build, and rewriting its system SSH config is more intrusive
+        # than a file-copy trust warrants. Per-user known_hosts is enough.
+        ssh_equiv_manage_system_config: false
+        ssh_equiv_purpose: "oem_repo_patch's RU zip copy to the OEM repository host"
+  tags: [oem_repo_patch, oem_repo_patch_preflight, oem_repo_patch_stage, ssh_trust]
+
+- name: Patch the OEM repository database (Phase 7a)
+  hosts: observer_nodes
+  gather_facts: true
+
+  # RUN AS oracle, NOT as the ansible login user and NOT as root.
+  #
+  # This was `become: false`, which meant every task ran as the `ansible` login
+  # user. That user owns nothing under /u01/app/oracle, so the very first task
+  # failed:
+  #
+  #   There was an issue creating /u01/app/oracle/logs as requested:
+  #   [Errno 13] Permission denied
+  #
+  # and had it got past that it would have failed worse and later — `sqlplus /
+  # as sysdba`, `opatch`, `emctl` and `rman` all need to be the software owner,
+  # not merely able to execute the binary.
+  #
+  # ansible.cfg sets `become = True` / `become_user = root` globally, so the
+  # alternative was running the whole role as root. That is worse: OPatch and
+  # datapatch invoked as root leave root-owned files in the Oracle home and the
+  # inventory, which is a real mess to unpick afterwards.
+  #
+  # Same pattern dataguard_fsfo already uses successfully against this host.
+  # The two tasks that genuinely need root — opatchauto, and the extjob
+  # permission fix — say `become_user: root` explicitly, because with a
+  # play-level become_user a bare `become: true` would otherwise still mean
+  # "become oracle". See docs/known-risks.md #148.
+  become: true
+  become_user: "{{ oracle_user }}"
+
+  roles:
+    - oem_repo_patch

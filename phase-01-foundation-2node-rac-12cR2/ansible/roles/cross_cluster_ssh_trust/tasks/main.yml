@@ -1,151 +1,56 @@
 ---
-# Phase 6 (12.2.0.1 -> 19c rolling upgrade): one-directional passwordless SSH
-# for the oracle OS user, oradbserv05 (usatclust1 node1) -> oradbserv09
-# (usatclust2 node1) ONLY — not the peer-cluster-internal, bidirectional,
-# grid+oracle, every-node equivalence that ssh_equivalence already sets up
-# within EACH cluster separately (that role is a genuine GI/OUI install
-# prerequisite; this one exists purely so db19c_software_install's
-# cross-cluster file copy can use a direct `synchronize` (rsync) push instead
-# of routing multi-GB files through the Ansible controller twice).
+# DEPRECATED 2026-08-31 — superseded by ssh_equivalence, which now takes
+# sources, targets, users and a bidirectional flag and does exactly what this
+# role did.
 #
-# Deliberately one-directional (05 -> 09, not also 09 -> 05): the only thing
-# that needs this is oracle@oradbserv05 pushing staged software TO
-# oradbserv09. Nothing in this project currently needs the reverse. Add a
-# second, symmetric run of this role with source/target swapped if that
-# changes later — don't build it speculatively now.
+# This role was the same logic as ssh_equivalence hardcoded to a single pair
+# (oradbserv05 -> oradbserv09) for db19c_software_install's cross-cluster copy.
+# Keeping two roles meant every hard-won detail — PEM keys for gridSetup.sh's
+# bundled Java client, the CheckHostIP algorithm-mismatch fix, the
+# UserKnownHostsFile /dev/null regression, additive rather than wholesale
+# known_hosts writes — had to be remembered and maintained in two places. It
+# already drifted once: this role used additive lineinfile for known_hosts while
+# ssh_equivalence used a wholesale copy, for the same reason, discovered
+# separately.
 #
-# hosts: localhost + delegate_to per host — same modeling choice as
-# dataguard_fsfo/dataguard_broker/etc: this genuinely coordinates two
-# specific named hosts (oradbserv05, oradbserv09), not a whole inventory
-# group, so a normal `hosts: rac_nodes` play doesn't fit.
+# Migration is a straight swap. This:
 #
-# Reuses the RSA/PEM key ssh_equivalence already generated for oracle on
-# oradbserv05 (if that role has already run there) instead of creating a
-# second key — PEM RSA works fine for plain system ssh/rsync (the PEM
-# requirement in ssh_equivalence is specific to gridSetup.sh's own bundled
-# Java SSH client, not a limitation of OpenSSH itself), so there's no reason
-# to introduce a different key type here. If ssh_equivalence hasn't run yet
-# on oradbserv05 for some reason, this generates the same RSA/PEM key itself
-# so it's not a hard dependency on run order.
+#   - role: cross_cluster_ssh_trust
 #
-# known_hosts handling deliberately uses lineinfile, NOT a wholesale
-# `copy: content:` overwrite like ssh_equivalence/per_user.yml does — that
-# role's known_hosts file already holds oradbserv05/oradbserv06 (its own
-# in-cluster RAC peers) by the time this role runs; overwriting the whole
-# file here would silently wipe those entries. Appending line-by-line avoids
-# that regression.
+# becomes:
+#
+#   - role: ssh_equivalence
+#     vars:
+#       ssh_equiv_sources: ["{{ groups['rac_node1'][0] }}"]
+#       ssh_equiv_targets: ["{{ groups['standby_node1'][0] }}"]
+#       ssh_equiv_users: ["{{ oracle_user }}"]
+#       ssh_equiv_bidirectional: false
+#       ssh_equiv_include_self: false
+#       ssh_equiv_manage_system_config: false
+#
+# Add `ssh_equiv_bidirectional: true` if the reverse direction is ever needed,
+# which is what this role's own header said to build "if that changes later".
+#
+# Left in place rather than deleted so that upgrade-19c-rolling.yml keeps working
+# until its call site is updated and re-tested. Delete this role once that is
+# done.
 
-- name: "Ensure oracle's .ssh directory exists on oradbserv05 (source)"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['rac_node1'][0] }}"
-  file:
-    path: "/home/{{ oracle_user }}/.ssh"
-    state: directory
-    owner: "{{ oracle_user }}"
-    group: oinstall
-    mode: "0700"
-  run_once: true
-
-- name: "Generate an RSA/PEM keypair for oracle on oradbserv05 if one doesn't exist yet (reuses ssh_equivalence's own convention/key if it already ran here)"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['rac_node1'][0] }}"
-  command: >
-    ssh-keygen -t rsa -b 2048 -m PEM -N '' -f /home/{{ oracle_user }}/.ssh/id_rsa
-    -C "{{ oracle_user }}@{{ groups['rac_node1'][0] }}"
-  args:
-    creates: "/home/{{ oracle_user }}/.ssh/id_rsa"
-  run_once: true
-
-- name: "Read oracle's public key back from oradbserv05"
-  delegate_to: "{{ groups['rac_node1'][0] }}"
-  slurp:
-    src: "/home/{{ oracle_user }}/.ssh/id_rsa.pub"
-  register: cross_cluster_pubkey_slurp
-  run_once: true
-
-- name: "Scan oradbserv09's SSH host key(s) from oradbserv05 (so the very first real connection below doesn't hit an interactive host-key prompt)"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['rac_node1'][0] }}"
-  command: >
-    ssh-keyscan -T 5 -H
-    {{ groups['standby_node1'][0] }}
-    {{ groups['standby_node1'][0] }}.{{ domain }}
-  register: cross_cluster_keyscan_result
-  changed_when: false
-  failed_when: false
-  run_once: true
-
-- name: "Append oradbserv09's host key(s) to oracle's known_hosts on oradbserv05 (additive — does NOT touch oradbserv05/06's existing entries from ssh_equivalence)"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['rac_node1'][0] }}"
-  lineinfile:
-    path: "/home/{{ oracle_user }}/.ssh/known_hosts"
-    line: "{{ item }}"
-    create: true
-    owner: "{{ oracle_user }}"
-    group: oinstall
-    mode: "0600"
-  loop: "{{ cross_cluster_keyscan_result.stdout_lines }}"
-  loop_control:
-    label: "{{ item.split(' ')[0] if item else '(empty)' }}"
-  when: cross_cluster_keyscan_result.stdout_lines is defined
-  run_once: true
-
-- name: "Ensure oracle's .ssh directory exists on oradbserv09 (target)"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['standby_node1'][0] }}"
-  file:
-    path: "/home/{{ oracle_user }}/.ssh"
-    state: directory
-    owner: "{{ oracle_user }}"
-    group: oinstall
-    mode: "0700"
-  run_once: true
-
-- name: "Authorize oradbserv05's oracle public key on oradbserv09"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['standby_node1'][0] }}"
-  lineinfile:
-    path: "/home/{{ oracle_user }}/.ssh/authorized_keys"
-    line: "{{ cross_cluster_pubkey_slurp.content | b64decode | trim }}"
-    create: true
-    owner: "{{ oracle_user }}"
-    group: oinstall
-    mode: "0600"
-  run_once: true
-
-- name: "Verify: oracle@oradbserv05 -> oracle@oradbserv09, passwordless (non-fatal, informational)"
-  become: true
-  become_user: "{{ oracle_user }}"
-  delegate_to: "{{ groups['rac_node1'][0] }}"
-  command: >
-    ssh -o BatchMode=yes -o ConnectTimeout=5 {{ groups['standby_node1'][0] }} hostname
-  register: cross_cluster_ssh_check
-  changed_when: false
-  failed_when: false
-  run_once: true
-
-- name: "Show verification result"
+- name: Redirect to ssh_equivalence
   debug:
     msg: >-
-      oracle@{{ groups['rac_node1'][0] }} -> oracle@{{ groups['standby_node1'][0] }}:
-      {{ 'OK — ' ~ cross_cluster_ssh_check.stdout if cross_cluster_ssh_check.rc == 0
-         else 'FAILED (rc=' ~ cross_cluster_ssh_check.rc ~ ') — ' ~ cross_cluster_ssh_check.stderr }}
-  run_once: true
+      cross_cluster_ssh_trust is deprecated and now delegates to ssh_equivalence.
+      Update the calling playbook to invoke ssh_equivalence directly with
+      ssh_equiv_sources / ssh_equiv_targets — see this file's header for the exact
+      swap.
 
-- name: "Fail loudly if the verification connection didn't actually work"
-  fail:
-    msg: >-
-      Passwordless SSH from oracle@{{ groups['rac_node1'][0] }} to
-      oracle@{{ groups['standby_node1'][0] }} is not working — read the
-      output above. db19c_software_install's copy tasks still work without
-      this (they fall back to routing through the Ansible controller); this
-      only unlocks the faster direct `synchronize` path once confirmed.
-  when: cross_cluster_ssh_check.rc != 0
-  run_once: true
+- name: Set up the trust via ssh_equivalence
+  include_role:
+    name: ssh_equivalence
+  vars:
+    ssh_equiv_sources: ["{{ ssh_trust_source_host | default(groups['rac_node1'][0]) }}"]
+    ssh_equiv_targets: ["{{ ssh_trust_target_host | default(groups['standby_node1'][0]) }}"]
+    ssh_equiv_users: ["{{ oracle_user }}"]
+    ssh_equiv_bidirectional: false
+    ssh_equiv_include_self: false
+    ssh_equiv_manage_system_config: false
+    ssh_equiv_purpose: "{{ ssh_trust_purpose | default(\"db19c_software_install's cross-cluster file copy\") }}"
