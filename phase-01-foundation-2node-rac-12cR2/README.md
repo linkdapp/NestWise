@@ -67,6 +67,11 @@ phase-01-foundation-2node-rac-12cR2/
 │   ├── golden-image-and-cloning.md    build oradbserv05 by hand, verify, clone via VBoxManage, personalize, verify again
 │   ├── ansible-on-windows.md          WSL2 setup for running this repo's playbooks from Windows
 │   ├── patching-strategy.md           patch-before-configure workflow, RU numbering caveat
+│   ├── ansible-preflight-checklist.md walk this BEFORE handing a playbook over to be run —
+│   │                                   six sections derived from the known-risks entries
+│   │                                   that cost the most time to rediscover. Ansible
+│   │                                   engineering hygiene, not Oracle: repo-only,
+│   │                                   excluded from the published site on purpose
 │   └── ansible-architecture-and-debugging.md   what each ansible-playbook command/role
 │                                       actually does, plus every tool (Ansible's and this
 │                                       repo's own) for seeing what a run actually did
@@ -82,9 +87,12 @@ phase-01-foundation-2node-rac-12cR2/
 │       ├── chrony/                    OEM VM as local time master, RAC nodes as clients
 │       ├── asmlib_disks/              ASMLib service config + shared-disk marking/discovery
 │       │                              (packages install via os_prep, see docs/known-risks.md #21)
-│       ├── ssh_equivalence/           passwordless SSH for grid/oracle across both nodes —
-│       │                              required by cluvfy AND gridSetup.sh/runInstaller's
-│       │                              own node propagation, see docs/known-risks.md #6
+│       ├── ssh_equivalence/           passwordless SSH between any sources/targets/users,
+│       │                              one or both directions. Defaults = the grid/oracle
+│       │                              mesh across both nodes, required by cluvfy AND
+│       │                              gridSetup.sh/runInstaller's own node propagation,
+│       │                              see docs/known-risks.md #6; generalised in #141,
+│       │                              which also replaced cross_cluster_ssh_trust
 │       ├── patch_before_config/       stages RU, patches GI/DB homes before any config step
 │       ├── grid_silent_install/       two-phase GI: stage+install software, then configure the cluster, then DATA02/RECO01 diskgroups (tags: grid_infrastructure / grid_stage / grid_install_software / grid_configure_cluster / grid_storage)
 │       ├── db_silent_install/         two-stage DB: stage software, then install (tags: db_software / db_stage / db_install_software)

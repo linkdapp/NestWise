@@ -1,6 +1,7 @@
 ---
 title: Phase 7a — Ansible reference
 ---
+{% raw %}
 
 # Phase 7a — Ansible reference
 
@@ -492,3 +493,4 @@ instead.
 `utlrp` used to be on this list, on the grounds that it was a read-and-judge call.
 It is not: with a pre-patch baseline captured, the recompile is deterministic and
 the judgement moves to comparing the before and after counts.
+{% endraw %}

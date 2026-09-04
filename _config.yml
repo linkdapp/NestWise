@@ -47,16 +47,35 @@ header_pages:
 # (e.g. `| join(',')`, `{% if not loop.last %}`) that Jekyll's Liquid engine
 # misreads as front matter + template tags, which breaks the whole Pages build.
 #
+# EXCLUSION ONLY COVERS THESE PATHS. A markdown file anywhere else that quotes
+# Jinja syntax — even inside a fenced code block, which Liquid does not respect —
+# will take the whole build down the same way. Two of them did in Sept 2026; see
+# docs/known-risks.md #157. Such files use a Liquid raw block instead, either
+# wrapping the whole file right after the front matter (known-risks.md,
+# monitoring/phase-7a-ansible.md) or guarding each occurrence inline
+# (docs/ansible-architecture-and-debugging.md, high-availability/part1 and part2).
+#
+# Three mechanisms, all already in use. A new document that needs to show Jinja
+# picks one of them; there is nothing else to invent.
+#
 # Also excludes root-level working/draft files (gap analysis, roadmap skeleton,
 # skill-content draft, rebrand notes, and the showcase-post template) so they
 # don't get swept into site.pages and appear in the nav — they're planning
 # documents, not published pages. The showcase-post template in particular has
 # `layout: post` and a literal placeholder title; it belongs in _posts/ once
 # real posts exist, not at the repo root.
+#
+# ansible-preflight-checklist.md joins them for the same reason, with an extra
+# one: this site is about Oracle. That checklist is Ansible engineering hygiene —
+# block scalars, become_user inheritance, argument splitting — and teaches nothing
+# about databases. It stays in the repo and stays linked from the phase-01 README
+# for anyone reading the automation; it is not a page a DBA came here to read.
+# (It is also the file whose `{% if %}` example took the build down in #157.)
 exclude:
   - phase-01-foundation-2node-rac-12cR2/ansible
   - phase-01-foundation-2node-rac-12cR2/response-files
   - phase-01-foundation-2node-rac-12cR2/scripts
+  - phase-01-foundation-2node-rac-12cR2/docs/ansible-preflight-checklist.md
   - 01-gap-analysis-and-questions.md
   - 02-roadmap-skeleton.md
   - 03-showcase-post-template.md

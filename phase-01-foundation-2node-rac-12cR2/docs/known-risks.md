@@ -8318,4 +8318,196 @@ and an explanation; it did not extend the same courtesy to a missing
 red failure for its own missing dependency, or that reports two verdicts at once,
 teaches the reader to stop believing the banner. The cost is not the noise. It is
 the real failure that goes unread inside it.
+
+---
+
+## 157. Two new docs took the whole GitHub Pages build down with Jinja syntax Liquid tried to execute — a failure `_config.yml` already had a comment about
+
+**Where:** `docs/ansible-preflight-checklist.md` and
+`monitoring/phase-7a-ansible.md`, both newly committed. Build error:
+
+```
+Rendering Liquid: phase-01-foundation-2node-rac-12cR2/docs/ansible-preflight-checklist.md
+github-pages 232 | Error: Liquid syntax error (line 40):
+  Syntax Error in tag 'if' - Valid syntax: if [expression]
+```
+
+**Mechanism.** GitHub Pages runs every non-excluded `.md` through **Liquid before
+markdown**. Liquid and Jinja share `{% %}` and `{{ }}`, and **Liquid does not
+respect fenced code blocks or backticks** — it parses the raw file. So a line of
+prose reading
+
+```
+| Jinja block tags (`{% if %}`) indented to match the shell body, never at column 0 |
+```
+
+is read as an opening Liquid `if` tag with no expression and no `{% endif %}`.
+The build aborts and **nothing publishes** — not the broken page, the whole site.
+
+`{{ oracle_user }}` is the quieter and worse variant: Liquid resolves it against
+an empty scope, renders an empty string, and the page builds. The published doc
+then shows `ssh_equiv_users: [""]` and reads like working configuration.
+
+**Why this is a repeat.** `_config.yml` already carries a comment on its
+`exclude:` list saying this Jinja-in-markdown problem "breaks the whole Pages
+build" — that comment is why `phase-01-.../ansible` is excluded. The mitigation
+chosen then was *exclusion*, which only covers files under those paths. Both new
+files sat outside them, so the mitigation did not apply and there was nothing to
+notice its absence. Textbook #145: a trap documented next to one place that
+avoids it is invisible to code written somewhere else.
+
+**Fix.** Both files wrapped in Liquid's raw/endraw block tags, opening
+immediately after the front matter and closing on the last line, the way this
+file has been from the start — look at line 1 and the last line here for the
+literal form.
+
+`docs/ansible-architecture-and-debugging.md` shows the alternative — guarding each
+occurrence inline — which is right when a file also uses Liquid legitimately.
+
+> **You cannot quote the closing tag inside a raw block.** Liquid closes a raw
+> block at the **first** endraw token it sees, so writing that token literally, to
+> illustrate it, terminates the block early and exposes the rest of the file. This
+> entry did exactly that and broke the build a second time; see #157e. That is why
+> the paragraphs here say "raw/endraw block tags" in prose rather than showing
+> them — the same wording entry #96 already used for the same reason.
+
+### 157a. The convention already existed. Three times. Nothing new was needed.
+
+This project had already solved Jinja-in-markdown, in three places, all working:
+
+| Mechanism | Already used by |
+|---|---|
+| `_config.yml` `exclude:` | `phase-01-.../ansible`, `response-files`, `scripts`, five root working drafts |
+| Whole-file raw/endraw wrap after the front matter | `known-risks.md` (this file) |
+| Inline raw/endraw guard per occurrence | `ansible-architecture-and-debugging.md`, `high-availability/part1` and `part2` |
+
+The build was green. It broke because two new documents were written without
+applying any of the three, not because the repository lacked a way to prevent it.
+
+**The correct fix was three lines of existing convention**, and nothing else:
+a raw wrap on `phase-7a-ansible.md`, an `exclude:` entry for
+`ansible-preflight-checklist.md` (see #157c), and inline guards on the two
+`maintenance/part1` lines in #157b.
+
+**What was done instead**, before the user stopped it: a new 130-line
+`docs-check.sh` was invented to detect the class of problem. It went through three
+versions and was never once correct.
+
+- **v1** — "flag any file with `{%` or `{{` and no raw block." Failed `README.md`
+  (`{{ site.baseurl }}`) and `index.md` (`{% include_relative %}`), both
+  deliberate Liquid. **2 false positives out of 3 findings.**
+- **v2** — blanked known-good Liquid first, but treated the raw/endraw pair as
+  *tags to blank* alongside `{% include %}`. That stripped the guards and left the
+  content they protect exposed to the next rule, so **every correctly-guarded line
+  in the repository was reported. 4 out of 4 false positives** — two of them lines
+  guarded by hand an hour earlier in the same session.
+- **v3** — never run. Deleted.
+
+**The script is gone.** The three conventions above are the mechanism. If a
+one-off sweep for unguarded references is ever wanted, it is a one-liner, not a
+tool to maintain:
+
+```bash
+grep -rn '{{\|{%' --include='*.md' . | grep -v 'raw %}'
+```
+
+**The rule this earns, and it is not about Liquid:** when a failure has happened
+before in a repository that has already fixed it, the fix is to find how it was
+fixed and apply that. Reaching for a new mechanism is not thoroughness — it is
+skipping the search. Every version of that script consumed a cycle, broke the
+signal, and moved nothing forward, while the actual repair was three edits that
+were already sitting in the codebase as examples.
+
+Related: #145 says a trap documented next to the code that avoids it is invisible
+to whoever writes new code elsewhere. That is true, and it is what let the two new
+files go out unguarded. It is **not** a licence to build a detector every time —
+`ansible-preflight-checklist.md` is where a convention gets recorded for the next
+author, and that is where this one now lives.
+
+### 157b. The one real defect was silent, and had been published for weeks
+
+`maintenance/part1-dbms-rolling-plan-to-switchover.md` had two unguarded
+`{{ db19c_home }}` references in prose. No `{%` tag, so **the build never failed**.
+Liquid simply resolved the variable to an empty string, and the published page had
+been telling readers to run:
+
+```
+cat /network/admin/tnsnames.ora
+grep -q 'LOC=""' inventory.xml
+```
+
+Both wrong, both plausible-looking, neither flagged by anything. Fixed with inline
+raw guards — the same convention `high-availability/part1` was already using three
+lines away from an identical construct.
+
+**The lesson worth carrying:** the loud version of this bug takes the site down and
+gets fixed within the hour. The quiet version publishes wrong commands under your
+name and survives until somebody tries to run one. Found by reading, not by tooling.
+
+### 157c. The right fix for the checklist was not the raw block
+
+Wrapping `ansible-preflight-checklist.md` in `{% raw %}` unbroke the build, and
+that was still the wrong question. **The document should never have been a
+published page.** It is Ansible engineering hygiene — block scalars, `become_user`
+inheritance, argument splitting, `failed_when` on looped tasks. Oracle appears in
+it only as the example (`sqlplus -s`, `ORACLE_HOME`, RMAN exit codes), never as
+the subject. Nobody learns anything about databases from it.
+
+This site is an Oracle showcase. `_config.yml` already excluded five root-level
+working documents on exactly that reasoning — planning artefacts, not pages — and
+the checklist belongs with them. It is now excluded too. It stays in the repo and
+stays linked from the phase-01 README, so anyone reading the automation finds it.
+
+The raw block stays as well, as insurance rather than as the mechanism: if the
+exclusion is ever lifted, the file does not take the build down again.
+
+**Worth generalising:** "make the build stop failing" and "should this be built at
+all" are different questions, and the first one is loud enough to stop you asking
+the second. Two of the four Phase 7a docs that hit this were genuinely publishable
+Oracle content and needed the raw block. One was not, and needed excluding.
+
+### 157d. The convention, stated once, for the next document
+
+Any markdown file Jekyll renders that needs to *show* Jinja syntax:
+
+- **Whole file is about Ansible internals?** Add it to `_config.yml` `exclude:`.
+  It is not a page this Oracle site should publish anyway (#157c).
+- **Oracle content that quotes Jinja throughout?** Wrap the whole file in
+  raw/endraw block tags right after the front matter, like this file.
+- **Oracle content with a handful of references?** Guard each one inline, like
+  `high-availability/part1`.
+- **Writing prose *about* these tags, inside a file that is itself wrapped?**
+  Name them — "raw/endraw block tags" — never quote the closing token. See #157e.
+
+That is the entire rule. It is also now the "Documentation" section of
+`ansible-preflight-checklist.md`, which is where conventions for the next author
+belong — not in a script.
+
+### 157e. Writing the entry about the fix broke the build with the fix
+
+The paragraphs above originally quoted the pattern literally, as a code block
+showing an opening tag, an ellipsis and a closing tag, so a reader could copy it.
+
+`known-risks.md` is itself wrapped in a raw block from line 1. **Liquid closes a
+raw block at the first closing token it encounters** — it does not track nesting,
+and it does not care that the token sits inside a fenced code block, for the same
+reason it did not care about the fences in #157 proper. So that illustrative
+closing tag, roughly 115 lines from the end, terminated the file-wide block early.
+Everything after it was parsed as Liquid again, and the file's real closing tag
+was left unmatched: another build failure, in the document explaining how to avoid
+build failures.
+
+Three further copies of the same token were introduced in the same edit — a table
+row, a bullet, and a sentence about the deleted checker — plus one in
+`ansible-preflight-checklist.md`, which was harmless only because that file is
+excluded from the site.
+
+**The convention was already here.** Entry #96 discusses this exact hazard and
+refers to *"Liquid's raw/endraw block tags"* in prose, without quoting them. That
+phrasing is not stylistic; it is the only form that survives inside a wrapped
+file. Every reference in this entry now uses it.
+
+**Same root cause as #157a**, one level up: the repository already had the answer,
+in this very file, and a new formulation got written instead of the existing one
+being looked up.
 {% endraw %}

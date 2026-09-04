@@ -1,6 +1,7 @@
 ---
 title: Ansible design checklist — walk this BEFORE handing code over to be run
 ---
+{% raw %}
 
 # Ansible design checklist
 
@@ -85,11 +86,19 @@ Order matters — the structural checks are cheapest and catch the most.
 | | A step that stops a database or a service has a confirm gate or a pause, and cannot be reached by a broad `--tags`. | #129 |
 | | Files modified in place (`tnsnames.ora`, `listener.ora`, `authorized_keys`) are appended to or backed up, never wholesale overwritten. | #85, #141 |
 
-## 6. Before handing over
+## 6. Documentation
+
+| ✔ | Check | Ref |
+|---|---|---|
+| | Writing a `.md` that **shows** Jinja syntax? Jekyll runs every non-excluded markdown file through Liquid before markdown, Liquid shares the same delimiters with Jinja, and it **ignores code fences and backticks**. An unbalanced Jinja `if` takes the entire Pages build down; a bare variable reference renders as an empty string and publishes a wrong command. Pick one of the three mechanisms already in use — `_config.yml` `exclude:`, a whole-file raw/endraw wrap after the front matter, or an inline raw/endraw guard. Do not invent a fourth. | #157 |
+| | Is the document Oracle content at all? Ansible-internals docs (this one included) belong in `_config.yml` `exclude:` — the published site is an Oracle showcase. | #157c |
+| | Writing prose **about** raw/endraw inside a file that is itself wrapped in them? Name the tags, never quote the closing one — Liquid closes the block at the first closing token it sees, fenced or not, and the rest of your file goes unguarded. | #157e |
+
+## 7. Before handing over
 
 | ✔ | Step |
 |---|---|
-| | `bash syntax-check.sh` passes — all seven checks. |
+| | `bash syntax-check.sh` passes — all nine checks. |
 | | Every item above consciously considered, not skimmed. |
 | | Anything genuinely new and unverified is stated as unverified in the handover, not presented as done. |
 | | New trap discovered? Add a `known-risks.md` entry **and**, if it is mechanically detectable, a check in `syntax-check.sh`. A comment alone does not prevent recurrence — that is what #145 proved. |
@@ -107,3 +116,4 @@ Recorded rather than quietly carried, so they are decisions and not oversights.
   writing each block to a `.sql` file and running it with `@`, as
   `dataguard_primary_prep` does. Not done; the tasks that most need it are the
   pre/post baselines, which already `tee` their full output to a file.
+{% endraw %}
