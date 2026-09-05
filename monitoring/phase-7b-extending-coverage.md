@@ -1,32 +1,31 @@
-# Phase 7c — Extending Enterprise Manager Coverage
+# Phase 7b: Extending Enterprise Manager Coverage
 
 **SOP: onboard the RAC and app-tier hosts, group them by lifecycle, standardise them with monitoring templates and an agent golden image, and monitor APEX, ORDS and MongoDB with Metric Extensions**
 
-Status: 🟨 In progress. Parts 1 and 3 are confirmed, the reference agent is deployed
-on `oradbserv05`. Statuses, real console output, screenshots and any surprises
-get filled in as it is actually executed — the same way
-[`../installation/README.md`](../installation/README.md) and
-[`phase-7a-repository-db-ru32.md`](phase-7a-repository-db-ru32.md) were written.
+Status: 🟨 In progress. The agents are deployed and on the gold image. What
+remains is grouping, discovery and application monitoring.
 
 **This phase is manual, by design.** Phase 7a automated a patch window because
-the work was a fixed sequence of shell commands against one host. 7c is the
-opposite: it is console work, most of it one-time configuration whose value is in
-the decisions (which targets are Production, what a Development database should
-alert on), not in the keystrokes. Automating a one-time wizard would take longer
-than running it and would produce a script nobody runs twice.
+the work was a fixed sequence of shell commands against one host. This phase is
+console work, most of it one-time configuration whose value is in the decisions
+(which targets are Production, what a Development database should alert on)
+rather than in the keystrokes.
 
-**The file names follow section numbering; the execution order does not.** Work
+**The file names follow section numbering. The execution order does not.** Work
 through the steps below in order.
 
 | Step | Do this | Where | Status |
 |---|---|---|---|
-| 1 | Deploy **one** reference agent to `oradbserv05` | [Part 1](phase-7c-part1-reference-agent.md) §§1-5 | 🟩 Confirmed |
-| 2 | Cut the gold image from it | [Part 3](phase-7c-part3-golden-image.md) §§13-14 | 🟨 In progress |
-| 3 | **Administration groups, monitoring templates, template collections** | [Part 2](phase-7c-part2-admin-groups.md) §§6-11 | 🟨 Not yet run |
-| 4 | Provision `oradbserv04`, `06`, `09`, `10` from the image | [Part 3](phase-7c-part3-golden-image.md) §15.1-15.4 | 🟨 Not yet run |
+| 1 | Deploy one reference agent to `oradbserv05` | [Part 1](phase-7b-part1-reference-agent.md) §§1-5 | 🟩 Confirmed |
+| 2 | Cut the gold image from it | [Part 3](phase-7b-part3-golden-image.md) §§13-14 | 🟩 Confirmed |
+| 3 | Install agents on `oradbserv04`, `06`, `09`, `10` from the image | [Part 3](phase-7b-part3-golden-image.md) §§15-17 | 🟩 Confirmed |
+| 4 | Administration groups, monitoring templates, template collections | [Part 2](phase-7b-part2-admin-groups.md) §§6-11 | 🟨 Next |
 | 5 | Discover and promote targets on all five hosts | [Discovery procedure](oem-discover-and-promote-targets.md) | 🟨 Not yet run |
-| 6 | Subscribe the estate to the image, verify | [Part 3](phase-7c-part3-golden-image.md) §§16-17 | 🟨 Not yet run |
-| 7 | Metric Extensions for APEX, ORDS, MongoDB | [Part 4](phase-7c-part4-metric-extensions.md) §§18-24 | 🟨 Not yet run |
+| 6 | Metric Extensions for APEX, ORDS, MongoDB | [Part 4](phase-7b-part4-metric-extensions.md) §§18-24 | 🟨 Not yet run |
+
+Subscription is not a step. Installing an agent from a gold image subscribes it
+automatically, confirmed in
+[Part 3 §16](phase-7b-part3-golden-image.md#16-subscriptions).
 
 ---
 
@@ -56,7 +55,7 @@ agent version, its patches and its plug-ins — not that host's targets, its
 **The image is cut before any discovery has run**, which is what keeps it a plain
 13.5 agent. **Target discovery is per-host** and runs on each host after its own
 agent exists — all five together in
-[Part 2 §12](phase-7c-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts).
+[Part 2 §12](phase-7b-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts).
 Each then acquires the plug-ins its own targets need, so there is nothing to be
 gained by letting the reference host decide for everyone.
 
@@ -154,15 +153,21 @@ number in the next patch window, not 43.
 
 ## Screenshots
 
-Screenshots referenced across all four parts go in
-[`screenshots/`](screenshots/) as they are captured — same naming convention as
-[`../installation/README.md`](../installation/README.md#15-screenshot-checklist-and-naming-convention)'s
-Section 15, numbered `7c-NN[a-z]-slug.png` to match each part's own section
-numbers. The `7c-` prefix keeps them distinct from Phase 7a's `03a-`/`16b-`
-series in the same directory.
+Screenshots for all four parts are in [`screenshots/`](screenshots/), following
+the naming convention in
+[`../installation/README.md`](../installation/README.md#15-screenshot-checklist-and-naming-convention)
+Section 15: a prefix, then the section number the image illustrates.
 
-The full checklist is in
-[Part 4 §24](phase-7c-part4-metric-extensions.md#24-screenshot-checklist-and-naming-convention).
+**The prefix is `7c-`, not `7b-`.** These files were captured and committed while
+this phase was numbered 7c, before it was moved ahead of the OMS upgrade. The
+prefix was left alone during the renumber because renaming committed image files
+risks silent broken links for no functional gain. It still serves its purpose,
+which is to keep these distinct from Phase 7a's `03a-` and `16b-` series in the
+same directory.
+
+Per-part checklists are in
+[Part 1 §6](phase-7b-part1-reference-agent.md#6-screenshot-checklist) and
+[Part 3 §18](phase-7b-part3-golden-image.md#18-screenshot-checklist).
 
 ---
 
@@ -174,26 +179,27 @@ from wherever it is needed rather than duplicated:
 - **[Discovering and Promoting Targets in Enterprise Manager 13.5](oem-discover-and-promote-targets.md)**
   — run once per host, after its agent is uploading. Used by Part 2 §12 for all
   five hosts, and by any host onboarded after this phase.
-- **[Creating a Blackout in Enterprise Manager 13.5](oem-create-blackout.md)** —
-  needed before any agent restart that would otherwise raise incidents. Part 3's
-  golden-image rollout restarts every subscribed agent.
-- **[Phase 7a — Patching the OEM repository database](phase-7a-repository-db-ru32.md)**
-  — the prerequisite for Phase 7b, already complete.
-- **[`../nestwise-app/docs/architecture.md`](../nestwise-app/docs/architecture.md)**
-  — the application Part 4 monitors: which data lives in Oracle, which lives in
+- **[Creating a Blackout in Enterprise Manager 13.5](oem-create-blackout.md)**,
+  needed before any agent restart that would otherwise raise incidents. Not
+  required by this phase, since the hosts were unmonitored when their agents were
+  installed. See [Part 3 Appendix B.1](phase-7b-part3-golden-image.md#b1-updating-an-agent-that-is-already-monitoring-live-targets).
+- **[Phase 7a: Patching the OEM repository database](phase-7a-repository-db-ru32.md)**,
+  the prerequisite for the OMS upgrade, already complete.
+- **[`../nestwise-app/docs/architecture.md`](../nestwise-app/docs/architecture.md)**,
+  the application Part 4 monitors: which data lives in Oracle, which lives in
   MongoDB, and how APEX reaches each tier.
 
 ---
 
 ## What this feeds into
 
-- **Phase 7b** — OMS 13.5 → 24ai. Doing 7c first means the upgrade is validated
-  against a realistic estate rather than three hosts, and gives a real
-  before/after target count.
-- **Incident rules and notifications** — much simpler to author once
+- **Phase 7c**, the OMS 13.5 to 24ai upgrade. Doing coverage first means the
+  upgrade is validated against a realistic estate rather than three hosts, and
+  gives a real before and after target count.
+- **Incident rules and notifications**, which are simpler to author once
   administration groups exist, because rule sets target groups rather than
   individual targets.
-- **Phase 7d** — non-CDB to CDB conversion of `oemcdb`.
+- **Phase 7d**, the non-CDB to CDB conversion of `oemcdb`.
 
 ## Open questions
 

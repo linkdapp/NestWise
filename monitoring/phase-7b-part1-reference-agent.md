@@ -1,15 +1,15 @@
-# Phase 7c Part 1: The Reference Agent
+# Phase 7b Part 1: The Reference Agent
 
 **SOP: deploy one EM 13.5 Management Agent to `oradbserv05`, verify it, and leave it ready to serve as the source for the gold agent image**
 
 Part 1 of 4. This page installs a single agent. That agent is the source from
-which [Part 3](phase-7c-part3-golden-image.md) cuts the gold image used to install
+which [Part 3](phase-7b-part3-golden-image.md) cuts the gold image used to install
 agents on the four remaining hosts.
 
 No targets are discovered here. The image is a software baseline, and cutting it
 from an agent that has discovered nothing keeps it a plain 13.5 agent. Discovery
 runs on all five hosts in
-[Part 2 §12](phase-7c-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts),
+[Part 2 §12](phase-7b-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts),
 after the administration groups exist to receive the targets.
 
 Status: 🟩 Confirmed. Ran against the live lab on 2026-09-04.
@@ -187,7 +187,7 @@ this repository contains them.
 ## 4. Deploy the agent
 
 One host. The remaining four are installed from the gold image in
-[Part 3 §15](phase-7c-part3-golden-image.md#15-install-agents-on-the-four-remaining-hosts).
+[Part 3 §15](phase-7b-part3-golden-image.md#15-install-agents-on-the-four-remaining-hosts).
 
 **Setup → Add Target → Add Targets Manually**
 
@@ -339,7 +339,7 @@ minutes, and Partner Agent `oemserver01.usat.com:3872`.
 from an unsecure agent.
 
 The agent is now ready to serve as the image source in
-[Part 3 §13](phase-7c-part3-golden-image.md#13-confirm-the-reference-agent).
+[Part 3 §13](phase-7b-part3-golden-image.md#13-confirm-the-reference-agent).
 
 ---
 
@@ -424,7 +424,7 @@ enrolment and does not belong in this repository.
 
 ## Appendix B: Notes for the remaining hosts
 
-These apply when [Part 3 §15](phase-7c-part3-golden-image.md#15-install-agents-on-the-four-remaining-hosts)
+These apply when [Part 3 §15](phase-7b-part3-golden-image.md#15-install-agents-on-the-four-remaining-hosts)
 installs agents on `oradbserv04`, `06`, `09` and `10`.
 
 ### B.1 The install user on `oradbserv04`
@@ -450,11 +450,11 @@ reporting inventory permissions, this is the field to set.
 
 ## Related pages
 
-- [Part 3: Agent gold image](phase-7c-part3-golden-image.md), which cuts the image from this agent
-- [Part 2: Administration groups and template collections](phase-7c-part2-admin-groups.md), where discovery runs
+- [Part 3: Agent gold image](phase-7b-part3-golden-image.md), which cuts the image from this agent
+- [Part 2: Administration groups and template collections](phase-7b-part2-admin-groups.md), where discovery runs
 - [Discovering and Promoting Targets](oem-discover-and-promote-targets.md), the standing procedure
 
 ---
 
-Continue to **[Part 3: Agent gold image](phase-7c-part3-golden-image.md)**.
-Back to the **[index](phase-7c-extending-coverage.md)**.
+Continue to **[Part 3: Agent gold image](phase-7b-part3-golden-image.md)**.
+Back to the **[index](phase-7b-extending-coverage.md)**.

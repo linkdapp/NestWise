@@ -1,9 +1,9 @@
-# Phase 7c Part 3: Agent Gold Image
+# Phase 7b Part 3: Agent Gold Image
 
 **SOP: build a versioned Management Agent image from a reference agent, then use it to install agents on four unmonitored hosts**
 
 Part 3 of 4, and the next step after Part 1 §4.
-[Part 1](phase-7c-part1-reference-agent.md) deployed a single reference agent
+[Part 1](phase-7b-part1-reference-agent.md) deployed a single reference agent
 to `oradbserv05`. **Part 3 (this page)** cuts a gold image from that agent and
 uses it to install agents on `oradbserv04`, `oradbserv06`, `oradbserv09` and
 `oradbserv10`.
@@ -12,7 +12,7 @@ Discovery has not run on any of these hosts yet. The image is a software baselin
 (agent version, patches, plug-ins), not a copy of `oradbserv05`, and cutting it
 before discovery keeps it a plain 13.5 agent. Targets are discovered on all five
 hosts in
-[Part 2 §12](phase-7c-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts),
+[Part 2 §12](phase-7b-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts),
 after the administration groups exist to receive them.
 
 Status: 🟩 Confirmed. Ran against the live lab on 2026-09-04 and 2026-09-05.
@@ -294,8 +294,8 @@ plug-ins.
 - The image must be Active (Current) from §14.3. A Draft version cannot be
   deployed from.
 - Each host must meet
-  [Part 1 §2](phase-7c-part1-reference-agent.md#2-host-prerequisites) and
-  [Appendix B](phase-7c-part1-reference-agent.md#appendix-b-notes-for-the-remaining-hosts),
+  [Part 1 §2](phase-7b-part1-reference-agent.md#2-host-prerequisites) and
+  [Appendix B](phase-7b-part1-reference-agent.md#appendix-b-notes-for-the-remaining-hosts),
   including the passwordless sudo in [Prerequisites](#prerequisites) above.
 
 ### 15.2 Run the Add Host Targets wizard
@@ -394,7 +394,7 @@ Oracle database and will not carry the database plug-in. Compare before discover
 for image fidelity.
 
 **Next:**
-[Part 2 §12](phase-7c-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts)
+[Part 2 §12](phase-7b-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts)
 discovers and promotes targets on all five hosts.
 
 ---
@@ -790,6 +790,6 @@ first, because the error message truncates its own list.
 
 ---
 
-Back to **[Part 1: The reference agent](phase-7c-part1-reference-agent.md)**.
-Continue to **[Part 2: Administration groups and template collections](phase-7c-part2-admin-groups.md)**.
-Back to the **[index](phase-7c-extending-coverage.md)**.
+Back to **[Part 1: The reference agent](phase-7b-part1-reference-agent.md)**.
+Continue to **[Part 2: Administration groups and template collections](phase-7b-part2-admin-groups.md)**.
+Back to the **[index](phase-7b-extending-coverage.md)**.

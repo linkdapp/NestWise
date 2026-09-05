@@ -7,7 +7,7 @@ in as it is actually executed.
 
 **This is a standing procedure, run once per host.** It is written as its own page
 because it happens more than once: five times in
-[Phase 7c Part 2 §12](phase-7c-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts),
+[Phase 7b Part 2 §12](phase-7b-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts),
 and again for any host onboarded afterwards.
 
 > **Run it after the administration groups exist**, not before. Each target then
@@ -145,8 +145,8 @@ Select the candidates and promote. For each database supply **Monitoring
 Username** `dbsnmp`, the password set above, and role `Normal`.
 
 **Save it as a Named Credential — `NC_DB_DBSNMP`.** Referencing it by name means
-[Phase 7c Part 2](phase-7c-part2-admin-groups.md)'s template work and
-[Part 4](phase-7c-part4-metric-extensions.md)'s SQL Metric Extension do not each
+[Phase 7b Part 2](phase-7b-part2-admin-groups.md)'s template work and
+[Part 4](phase-7b-part4-metric-extensions.md)'s SQL Metric Extension do not each
 need the password re-entered, and the password itself lives only in the OEM
 credential store — never in this repository.
 
@@ -200,7 +200,7 @@ database instance, which joins the existing cluster database.
 type EM 13.5 knows about**, so discovery returns the host and stops.
 
 **That is expected, not a failure.** It is the reason
-[Phase 7c Part 4](phase-7c-part4-metric-extensions.md) exists.
+[Phase 7b Part 4](phase-7b-part4-metric-extensions.md) exists.
 
 Had ORDS been deployed on WebLogic it would discover as an Oracle WebLogic Server
 target with real out-of-the-box metrics. It is deployed **standalone** here
@@ -287,5 +287,5 @@ than repeating the whole set per host.
 
 ## Where this is used
 
-- [Phase 7c Part 2 §12](phase-7c-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts) — all five hosts, after the administration groups exist
-- Any host onboarded after Phase 7c
+- [Phase 7b Part 2 §12](phase-7b-part2-admin-groups.md#12-discover-and-promote-targets--all-five-hosts) — all five hosts, after the administration groups exist
+- Any host onboarded after Phase 7b

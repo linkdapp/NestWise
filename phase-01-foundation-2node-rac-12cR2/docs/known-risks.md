@@ -7565,11 +7565,13 @@ being equivalent the moment Phase 7d converts the database, because the bare for
 only recompiles the container it is connected to. A latent bug with a scheduled
 detonation date.
 
-(Phase numbering: the CDB conversion is **7d**, not 7c. 7c is administration
-groups and the agent golden image. Earlier drafts of this entry and of
-`monitoring/phase-7a-repository-db-ru32.md` collided the two — the original
-scoping had RU32 at 7b and the conversion at 7c, and everything shifted when RU32
-moved to 7a as a hard prerequisite for the OMS upgrade. Corrected 2026-08-31.)
+(Phase numbering: the CDB conversion is **7d**. Earlier drafts of this entry and
+of `monitoring/phase-7a-repository-db-ru32.md` called it 7c, colliding with
+another phase. The original scoping had RU32 at 7b and the conversion at 7c, and
+everything shifted when RU32 moved to 7a as a hard prerequisite for the OMS
+upgrade. Corrected 2026-08-31. Phase 7 was renumbered again on 2026-09-05:
+extending coverage is now **7b** and the OMS upgrade **7c**. The full history is
+in that document's numbering note.)
 
 **Also added, both absent and both documented:** `datapatch -sanity_checks`
 before `-verbose` (README calls it optional, then says Oracle highly recommends

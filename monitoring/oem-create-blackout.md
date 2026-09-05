@@ -5,7 +5,7 @@
 Status: 🟩 Confirmed. Used for real on 2026-09-03/04 to cover the
 [Phase 7a repository patch](phase-7a-repository-db-ru32.md), and written up here
 as a standalone procedure because every maintenance window in this project needs
-it — Phase 7b's OMS upgrade, Phase 7c's agent rollout, and any RAC patching on
+it: Phase 7b's agent rollout, Phase 7c's OMS upgrade, and any RAC patching on
 `oradbserv05/06` all start the same way.
 
 **Why this is its own page rather than a step inside a runbook.** A blackout is
@@ -319,4 +319,4 @@ reproduced as text in §5, and in
 
 - [Phase 7a Part 2, Section 7 — the blackout pause](phase-7a-part2-the-patch-window.md#7-the-blackout-pause)
 - Phase 7b — OMS 13.5 → 24ai (planned)
-- Phase 7c — administration groups and agent golden image (planned)
+- Phase 7c, the OMS 13.5 to 24ai upgrade (planned)

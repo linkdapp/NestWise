@@ -142,21 +142,30 @@ is in [Part 3 §19](phase-7a-part3-verification.md#19-screenshot-checklist-and-n
 
 ## What this feeds into
 
-- **Phase 7b** — the OMS upgrade to 24ai, which required this patch first, and
+- **Phase 7b** — [extending coverage](phase-7b-extending-coverage.md): agents onto
+  the RAC clusters and the app tier via a gold agent image, administration groups
+  and metric templates (dev/test/prod), plus APEX / ORDS / MongoDB monitoring via
+  Metric Extensions.
+- **Phase 7c** — the OMS upgrade to 24ai, which required this patch first, and
   which has its own gate at EM 13.5 RU22. Agent upgrade follows the OMS.
-- **Phase 7c** — administration groups and metric templates (dev/test/prod),
-  agent golden image, pushed to `oradbserv06/09/10`, plus APEX / ORDS / MongoDB
-  monitoring via Metric Extensions.
 - **Phase 7d** — convert `OEMCDB` from non-CDB to a CDB, and create `oempdb`
   (plus `ggpdb` for GoldenGate). Still to do: `SELECT cdb FROM v$database`
   returned `NO` again on 2026-09-04, after the patch.
 
-> **Numbering note.** The original scoping put the RU32 patch at 7b and the CDB
-> conversion at 7c. This renumbered because the patch is a hard prerequisite for
-> the OMS upgrade and had to come first — so RU32 became 7a, and everything after
-> it shifted. The CDB conversion is **7d** here, not 7c. Earlier drafts of this
-> document and of `known-risks.md` #142 called it 7c, which collided with the
-> administration-groups phase; corrected 2026-08-31.
+> **Numbering note.** Phase 7 has been renumbered twice, both times to match the
+> order the work actually has to happen in.
+>
+> First, on 2026-08-31: the original scoping put the RU32 patch at 7b and the CDB
+> conversion at 7c. The patch is a hard prerequisite for the OMS upgrade, so it
+> became **7a** and everything after it shifted. The CDB conversion is **7d**, not
+> 7c. Earlier drafts of this document and of `known-risks.md` #142 called it 7c,
+> which collided with the coverage phase.
+>
+> Second, on 2026-09-05: extending coverage moved from 7c to **7b**, and the OMS
+> upgrade from 7b to **7c**. Upgrading to 24ai against eight monitored hosts
+> exercises the upgrade considerably more than doing it against the three the
+> estate started with. The `7c-` prefix on the coverage phase's screenshot files
+> predates that move and was deliberately not renamed.
 
 ---
 

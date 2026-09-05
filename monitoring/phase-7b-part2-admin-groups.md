@@ -1,9 +1,9 @@
-# Phase 7c — Part 2: Administration Groups and Template Collections
+# Phase 7b Part 2: Administration Groups and Template Collections
 
 **SOP: set Lifecycle Status on every target, build a Production / Test / Development hierarchy, and let OEM apply the right monitoring template automatically**
 
 **Step 3 of 7 in execution order** — after the gold image is cut
-([Part 3 §§13-14](phase-7c-part3-golden-image.md)) and **before** the four
+([Part 3 §§13-14](phase-7b-part3-golden-image.md)) and **before** the four
 remaining hosts are provisioned and discovered.
 
 **Do this before discovery, not after.** Oracle's Monitoring Guide: template
@@ -376,7 +376,7 @@ and read the total.
 
 **This replaces Phase 7a's 43** in every future patch window's verification
 checklist. Write it into the
-[index's estate table](phase-7c-extending-coverage.md).
+[index's estate table](phase-7b-extending-coverage.md).
 
 📸 *Screenshot: `7c-12c-target-count.png` — the estate target count after discovery.*
 
@@ -439,6 +439,6 @@ emcli get_targets | wc -l
 
 ---
 
-Back to **[Part 3 — Agent golden image](phase-7c-part3-golden-image.md)**.
-Continue to **[Part 4 — Metric Extensions](phase-7c-part4-metric-extensions.md)**.
-Back to the **[index](phase-7c-extending-coverage.md)**.
+Back to **[Part 3 — Agent golden image](phase-7b-part3-golden-image.md)**.
+Continue to **[Part 4 — Metric Extensions](phase-7b-part4-metric-extensions.md)**.
+Back to the **[index](phase-7b-extending-coverage.md)**.

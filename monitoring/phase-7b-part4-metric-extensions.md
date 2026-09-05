@@ -1,14 +1,14 @@
-# Phase 7c — Part 4: Metric Extensions for APEX, ORDS and MongoDB
+# Phase 7b Part 4: Metric Extensions for APEX, ORDS and MongoDB
 
 **SOP: monitor three things Enterprise Manager has no target type for — the APEX engine inside `apexdb`, standalone ORDS on `oradbserv04:8080`, and MongoDB 6.0 bound to `127.0.0.1:27017`**
 
 Part 4 of 4, and last in execution order.
-[Part 3 §15](phase-7c-part3-golden-image.md#15-provision-the-remaining-four-hosts-from-the-image)
+[Part 3 §15](phase-7b-part3-golden-image.md#15-provision-the-remaining-four-hosts-from-the-image)
 put an agent on `oradbserv04`, which is what makes everything here possible —
 MongoDB binds to `127.0.0.1`, so the collection has to run locally.
-[Part 2](phase-7c-part2-admin-groups.md) built the Development template
+[Part 2](phase-7b-part2-admin-groups.md) built the Development template
 collection these extensions get added to. Index:
-[`phase-7c-extending-coverage.md`](phase-7c-extending-coverage.md).
+[`phase-7b-extending-coverage.md`](phase-7b-extending-coverage.md).
 
 Status: 🟨 Not yet run.
 
@@ -37,8 +37,8 @@ numbered to this page's own section numbers (18-23).
 23. [ME 4 — MongoDB 6.0](#23-me-4--mongodb-60)
 24. [Screenshot checklist and naming convention](#24-screenshot-checklist-and-naming-convention)
 
-Back to **[Part 3 — Agent golden image](phase-7c-part3-golden-image.md)**.
-Back to the **[index](phase-7c-extending-coverage.md)**.
+Back to **[Part 3 — Agent golden image](phase-7b-part3-golden-image.md)**.
+Back to the **[index](phase-7b-extending-coverage.md)**.
 
 ---
 
@@ -397,7 +397,7 @@ Once each ME tests clean:
 3. **Actions → Deploy To Targets** — `apexdb` for ME 1, `oradbserv04` for MEs 2-4
 
 Then add the published extensions to the **`TC_DEVELOPMENT`** template collection
-from [Part 2 §10](phase-7c-part2-admin-groups.md#10-create-and-associate-template-collections),
+from [Part 2 §10](phase-7b-part2-admin-groups.md#10-create-and-associate-template-collections),
 so any future Development target gets them without a manual deploy.
 
 ```bash
@@ -514,5 +514,5 @@ gives the uncaptured `opatch apply` step.
 
 ---
 
-Back to **[Part 3 — Agent golden image](phase-7c-part3-golden-image.md)**.
-Back to the **[index](phase-7c-extending-coverage.md)**.
+Back to **[Part 3 — Agent golden image](phase-7b-part3-golden-image.md)**.
+Back to the **[index](phase-7b-extending-coverage.md)**.
