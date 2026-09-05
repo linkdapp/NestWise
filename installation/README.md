@@ -609,16 +609,46 @@ distributes every node's public key to every node's `authorized_keys` (self incl
 GI's tooling SSHes to its own hostname too), and pre-populates `known_hosts` from a
 `ssh-keyscan` of every node (both a system-wide copy at `/etc/ssh/ssh_known_hosts` and
 per-user copies for `grid`/`oracle`) so `ssh grid@peer`/`ssh oracle@peer` connects with
-**zero prompts** — no password, no host-key confirmation. An earlier version of this
-role only relaxed host-key checking via each user's `~/.ssh/config`
-(`StrictHostKeyChecking no`); that didn't reliably suppress the prompt in practice —
-`ssh` reads `~/.ssh/config` out of the *invoking* user's home, not the remote target
-user's, so a manual `ssh grid@peer` typed while logged in as yourself never picked up
-`/home/grid/.ssh/config` at all. The `known_hosts` pre-population is the actual fix;
-the per-user config relaxation is kept only as a secondary safety net for cloned nodes
-whose host keys change between rebuilds. Finishes with a non-fatal verification task —
-check its output for `OK` on every `grid ->` and `oracle ->` line before moving on to
-Section 10.
+**zero prompts** — no password, no host-key confirmation.
+
+The `known_hosts` pre-population is the whole fix. An earlier version of this role also
+wrote each user's `~/.ssh/config` with `StrictHostKeyChecking no` and
+`UserKnownHostsFile /dev/null` as a "belt-and-suspenders" measure; that turned out to be
+actively harmful rather than merely redundant — `/dev/null` meant nothing was ever
+persisted, so every connection looked like the first-ever one and the role was silently
+nullifying its own primary fix. That task is gone, and the role now explicitly *removes*
+the file on hosts where a prior run left one behind
+([`known-risks.md`](../phase-01-foundation-2node-rac-12cR2/docs/known-risks.md) #63).
+`StrictHostKeyChecking` stays on; only OpenSSH's secondary `CheckHostIP` cross-check is
+disabled, and for a specific reason (#64).
+
+Finishes with a verification task that actually opens each connection and prints the
+result — check for `OK` on every `grid ->` and `oracle ->` line before moving on to
+Section 10. The play fails if any pair could not connect, rather than letting a broken
+trust reach `grid_infrastructure` and hang there.
+
+**Which hosts does this configure?** Not the tag — the tag only selects which *play* in
+`site.yml` runs. The hosts come from that play's `hosts:` line:
+
+| Command | Play targets | Configures |
+|---|---|---|
+| `--tags ssh_equivalence` | `rac_nodes` | `oradbserv05` ↔ `oradbserv06` (primary cluster, `usatclust1`) |
+| `--tags standby_ssh_equivalence` | `standby_nodes` | `oradbserv09` ↔ `oradbserv10` (standby cluster, `usatclust2`) |
+
+Two separate plays with two separate tags, deliberately — running one must never
+silently re-run the other, and the two clusters are independent by design
+([`known-risks.md`](../phase-01-foundation-2node-rac-12cR2/docs/known-risks.md) #47,
+and #61 for the cross-cluster key leak that a shared tag would have caused).
+
+Inside the role, the node list comes from the cluster-agnostic `nodes` variable, not a
+hardcoded `groups['rac_nodes']`. `nodes` is defined in `group_vars/all.yml` (the primary
+pair) and redirected to `standby_nodes` in `group_vars/standby_nodes.yml`, the same
+pattern `dns_bind` and `asmlib_disks` use. That is what makes one role serve both
+clusters. If you ever need a trust the plays above don't cover, pass the hosts
+explicitly rather than adding a third play — the role takes `ssh_equiv_sources`,
+`ssh_equiv_targets`, `ssh_equiv_users` and `ssh_equiv_bidirectional`, which is how
+[`monitoring/phase-7a-repository-db-ru32.md`](../monitoring/phase-7a-repository-db-ru32.md)
+sets up the one-directional `oradbserv05 → oemserver01` trust for its RU copy.
 
 **If you're already stuck at a hung cluvfy task right now:** `Ctrl+C` it, run the
 command above, then re-run `--tags grid_infrastructure` — the earlier tasks in that

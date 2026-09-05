@@ -9,7 +9,7 @@ built.
 |---|---|---|
 | **7a** — [Patching the OEM repository database to 19c RU32](phase-7a-repository-db-ru32.md) | `oemcdb` 19.19.0.0.0 → 19.32.0.0.0, combo 39618649 (DB RU + OJVM), fully automated with a human checkpoint at the blackout | 🟩 Confirmed 2026-09-04 |
 | **7b** — OMS 13.5 → 24ai | Out-of-place upgrade. Gate: **EM 13.5 RU22 or later**, unconfirmed. Agent upgrade follows the OMS. Fleet Maintenance in 24ai patches databases and Grid Infrastructure out-of-place via the `emcli` verb only — no GUI for that step, which is itself worth documenting | ⬜ Planned |
-| **7c** — Extending coverage | Administration groups and metric templates (dev/test/prod), agent golden image pushed to `oradbserv06/09/10`, APEX / ORDS / MongoDB monitoring via Metric Extensions | ⬜ Planned |
+| **7c** — [Extending coverage](phase-7c-extending-coverage.md) | Agents onto the RAC clusters and the NestWise app tier, administration groups and monitoring templates (Production/Test/Development), agent golden image across the estate, APEX / ORDS / MongoDB via Metric Extensions. **Manual SOP, no Ansible** | 🟨 Planned, documented |
 | **7d** — non-CDB → CDB conversion | Convert `OEMCDB` (which, despite the name, is **not** a CDB) and create `oempdb`, plus `ggpdb` for GoldenGate. A prerequisite for ever taking this database past 19c | ⬜ Planned |
 
 ---
@@ -21,8 +21,16 @@ rather than duplicated into them:
 
 | Page | What it covers |
 |---|---|
-| [Creating a Blackout in Enterprise Manager 13.5](oem-create-blackout.md) | Console click-path, `emcli` and agent-side `emctl`, verifying a blackout is really active, clearing it, and why it is deliberately not automated |
+| [Creating a Blackout in Enterprise Manager 13.5](oem-create-blackout.md) | Console click-path, `emcli` and agent-side `emctl`, verifying a blackout is really active, clearing it, and why it is deliberately not automated. Needed before Phase 7a's patch window and before Phase 7c's golden-image rollout |
+| [Discovering and Promoting Targets in Enterprise Manager 13.5](oem-discover-and-promote-targets.md) | Run once per host, after its agent is uploading. Auto discovery, why discovery is not promotion, `dbsnmp` monitoring credentials, the Data Guard association a standby needs, and what a RAC node versus an app-tier host should yield |
 | [Phase 7a Ansible reference](phase-7a-ansible.md) | Roles, tags, variables, the `ssh_equivalence` consolidation, `syntax-check.sh`, and the design notes behind the `oem_repo_patch` role |
+
+**Why 7a is automated and 7c is not.** 7a was a fixed sequence of shell commands
+against one host, run inside a maintenance window with a rollback path — worth
+automating, and the automation is the artefact. 7c is console configuration whose
+value is in the decisions (which targets are Production, what a Development
+database should alert on), most of it done once. Wrapping a one-time wizard in
+Ansible would take longer than running it and produce a role nobody runs twice.
 
 ---
 

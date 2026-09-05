@@ -28,8 +28,12 @@ the current state.
 **NestWise shipped as one build rather than a v1/v2 split.** The plan was pure-Oracle
 v1 at Phase 3 with MongoDB deferred to Phase 10. In practice both were built
 together: 12 pages, hybrid from the start, including a `venues` collection that was
-never in the original scope. Phase 10's content is therefore complete, and
-`nestwise-app/docs/v2-roadmap.md` describes a future that has already happened.
+never in the original scope. Phase 10's content is therefore complete.
+
+`nestwise-app/docs/v2-roadmap.md` is *not* superseded by that. It now serves a
+different purpose: recording what was deliberately left unbuilt (a Venue Detail page,
+trails and parks, an events calendar) so the scope reads as chosen rather than
+missed.
 
 Neither reordering was a mistake, but a reader comparing this roadmap against the
 repository would otherwise find them contradicting each other.
