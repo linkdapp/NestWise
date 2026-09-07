@@ -777,6 +777,15 @@ The resolution is to cut a later version from an agent that carries the required
 plug-ins, set it Current, and update against that version. Compare plug-in lists
 first, because the error message truncates its own list.
 
+```bash
+emcli list_plugins_on_agent -all
+```
+
+**Measured on this estate, 2026-09-06.** The image source `oradbserv05` carries
+one plug-in, `oracle.sysman.oh`. `oradbserv01` carries three and `orappsserv01`
+carries two, which is why neither could be updated from V1. Full inventory in
+[Phase 7c Part 2 Appendix A](phase-7c-part2-24ai-upgrade.md#appendix-a-oradbserv01-and-orappsserv01).
+
 ---
 
 **Sources:**

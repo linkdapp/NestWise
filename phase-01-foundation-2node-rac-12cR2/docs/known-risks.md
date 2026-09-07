@@ -8512,4 +8512,45 @@ file. Every reference in this entry now uses it.
 **Same root cause as #157a**, one level up: the repository already had the answer,
 in this very file, and a new formulation got written instead of the existing one
 being looked up.
+
+---
+
+## 158. `undeploy_plugin_from_server` is a seven-minute OMS outage, and the restart is nine times longer than the stop
+
+**Where:** `oemserver01`, undeploying `oracle.sysman.orhc` on 2026-09-06 as a
+prerequisite for the 24ai upgrade. Run without a blackout, because the command
+reads like a configuration change rather than a maintenance window.
+
+The verb submits an Enterprise Manager job. Its own step list, from
+`emcli get_plugin_deployment_status -plugin=oracle.sysman.orhc`:
+
+| Step | Elapsed |
+|---|---|
+| Submit job for undeployment | under 1 second |
+| Initialize, validate, preconfiguration | 2 seconds |
+| Delete plug-in's metadata | 18 seconds |
+| **Stop management server** | **41 seconds** |
+| Deconfigure plug-in from middle tier | 4 seconds |
+| Deconfigure plug-in from Management Repository | 14 seconds |
+| Update inventory | 1 second |
+| **Start management server** | **6 minutes 42 seconds** |
+| Remove plug-in's Oracle home | 4 seconds |
+
+**Total OMS outage 7 minutes 42 seconds.** Every monitored target is unmonitored
+for that period. Agents queue their uploads and flush on the OMS return, so no
+collected data is lost, but availability events are raised across the estate.
+
+**The number worth remembering is the restart, not the operation.** An OMS start
+on this hardware takes just under seven minutes. That figure sizes every OMS
+maintenance task in this project, not only plug-in work: the RU33 apply, the 24ai
+upgrade, and any `emctl stop oms` followed by `emctl start oms`.
+
+**The rule:** if a command's step list contains `Stop management server`, it needs
+a blackout. Read the step list before deciding, not after. The equivalent agent
+verb, `undeploy_plugin_from_agent`, restarts only that agent, so its blast radius
+is one host.
+
+Related: Phase 7b Part 3 Appendix B already made this point for agent updates, and
+the same reasoning applies one tier up. The blackout procedure is
+`monitoring/oem-create-blackout.md`.
 {% endraw %}
