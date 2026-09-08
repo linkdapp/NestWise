@@ -2,6 +2,22 @@ theme: minima
 title: NestWise
 description: Oracle DBA POC and learning resources
 
+# Every page title was rendering twice. GitHub Pages runs
+# jekyll-titles-from-headings, which sets page.title from a file's first heading
+# when there is no front matter. Minima then renders page.title as the page
+# header, while the file's own "# Heading" renders again as the first line of
+# content. The plugin defaults to strip_title: false, which leaves both.
+#
+# strip_title: true removes the heading from the content after using it for the
+# title, so each page shows its title once. This is the plugin's documented fix
+# for exactly this case.
+#
+# Site-wide effect: every markdown file without front matter loses its first H1
+# from the rendered body. Nothing else changes. Files that need their heading in
+# the body must declare an explicit `title:` in front matter instead.
+titles_from_headings:
+  strip_title: true
+
 url: "https://linkdapp.github.io"
 baseurl: "/NestWise"
 
