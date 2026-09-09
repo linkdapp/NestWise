@@ -98,8 +98,8 @@ where noted.
 
 `neighborhoods.neighborhood_id` was `GENERATED ALWAYS AS IDENTITY`, and the seed
 reload does `DELETE` + `INSERT`. **`DELETE` does not reset an identity
-sequence**, so every reload produced a fresh, higher range (1–28, then 9–36,
-then 37–64) while MongoDB kept its original numbering.
+sequence**, so every reload produced a fresh, higher range (1 to 28, then 9 to 36,
+then 37 to 64) while MongoDB kept its original numbering.
 
 The failure mode was the dangerous kind: not an error, but *one neighborhood
 quietly showing another neighborhood's listings*, because both were plausible
@@ -147,18 +147,18 @@ the APEX pages call:
 
 | Run | Concurrency | Throughput | p95 | NESTWISE sessions |
 |---|---|---|---|---|
-| Stepped, human think time | 10–100 VUs | 39.6 req/s | 5–14 ms, **flat** | ~6 |
-| Saturate, 50 ms think time | 100–1000 VUs | **928 req/s** | ~1000 ms, uniform | ~100 (pool ceiling) |
+| Stepped, human think time | 10 to 100 VUs | 39.6 req/s | 5 to 14 ms, **flat** | ~6 |
+| Saturate, 50 ms think time | 100 to 1000 VUs | **928 req/s** | ~1000 ms, uniform | ~100 (pool ceiling) |
 
 The second run's tell is the **uniformity**: all six transaction types converged
 within 30 ms of each other at p95, including the heaviest scored-sort query that
-was 5× slower than the rest under light load. Identical latency for
+was five times slower than the rest under light load. Identical latency for
 unequal work is queuing, not query execution.
 
-But it wasn't the connection pool either. Minimum observed latency stayed at
-**2–6 ms**, so 100 connections could theoretically serve ~20,000 req/s. Actual
-database work was roughly **five busy sessions' worth**. The connections were
-open but idle; the constraint sat above Oracle.
+The connection pool was not the constraint either. Minimum observed latency
+stayed at **2 to 6 ms**, so 100 connections could in principle serve about
+20,000 req/s. Actual database work was roughly **five busy sessions' worth**. The
+connections were open but idle, so the constraint sat above Oracle.
 
 **Stated honestly: this run cannot cleanly attribute the ~928 req/s ceiling**,
 because the load generator was running on the same host as ORDS and competing

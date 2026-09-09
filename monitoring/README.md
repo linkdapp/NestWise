@@ -1,14 +1,14 @@
 # Monitoring
 
-**Enterprise Manager Cloud Control — the OEM 13.5 estate, its repository database, and the road to 24ai**
+**Enterprise Manager Cloud Control: the OEM 13.5 estate, its repository database, and the road to 24ai**
 
-Status: 🟨 In progress. Phase 7a is confirmed, 7b and 7c are under way. 7d is
-scoped but not started.
+Status: 🟨 In progress. Phases 7a and 7b are confirmed. 7c Part 1 is confirmed and
+Part 2 is scoped. 7d is scoped but not started.
 
 | Phase | Covers | Status |
 |---|---|---|
 | **7a** [Patching the OEM repository database to 19c RU32](phase-7a-repository-db-ru32.md) | `oemcdb` 19.19.0.0.0 to 19.32.0.0.0, combo 39618649 (DB RU plus OJVM), fully automated with a human checkpoint at the blackout | 🟩 Confirmed 2026-09-04 |
-| **7b** [Extending coverage](phase-7b-extending-coverage.md) | Agents onto the RAC clusters and the NestWise app tier from a gold agent image, administration groups and monitoring templates (Production, Test, Development), APEX, ORDS and MongoDB via Metric Extensions. Manual SOP, no Ansible | 🟨 In progress |
+| **7b** [Extending coverage](phase-7b-extending-coverage.md) | Agents onto the RAC clusters and the NestWise app tier from a gold agent image, administration groups and monitoring templates (Production, Test, Development), APEX, ORDS and MongoDB via Metric Extensions. Manual SOP, no Ansible | 🟩 Confirmed 2026-09-09 |
 | **7c** [OMS 13.5 to 24ai](phase-7c-oms-upgrade.md) | Part 1 takes the OMS from base 13.5.0.0.0 to RU33 (13.5.0.33) with patch 39676211. Part 2 is the 24ai Release 1 upgrade. Verified gates: OMS at 13c Release 5, repository database at 19.22 or later. Agent upgrade follows the OMS. Fleet Maintenance in 24ai patches databases and Grid Infrastructure out of place through the `emcli` verb only, with no GUI for that step | 🟨 In progress |
 | **7d** non-CDB to CDB conversion | Convert `OEMCDB`, which despite the name is **not** a CDB, and create `oempdb` plus `ggpdb` for GoldenGate. A prerequisite for taking this database past 19c, since non-CDB is desupported from 21c onward. **Not** a prerequisite for 7c: 24ai supports a non-CDB repository | ⬜ Planned |
 
@@ -45,11 +45,10 @@ alert on), most of it done once.
   non-container database repositories. Phase 7d is therefore **not** a prerequisite
   for 7c. It remains a prerequisite for taking `oemcdb` past 19c, since non-CDB is
   desupported from 21c onward.
-- **Is there a Release Update floor for the 24ai upgrade?** ~~7c's gate is EM 13.5
-  RU22 minimum~~ — that figure was carried from early scoping and does not appear
-  in the 24ai Upgrade Guide, which names the minimum starting point as 13c Release
-  5 without qualifying it by RU. Phase 7c Part 1 makes the question moot by taking
-  the OMS to 13.5.0.33. Settle it properly before repeating it as fact.
+- **Is there a Release Update floor for the 24ai upgrade?** The EM 13.5 RU22 figure
+  carried from early scoping does not appear in the 24ai Upgrade Guide, which names
+  the minimum starting point as 13c Release 5 without qualifying it by RU. Phase 7c
+  Part 1 makes the question moot by taking the OMS to 13.5.0.33.
 - **What RU is the OMS actually on?** Answered: **none**. The OMS is at base
   13.5.0.0.0, which is why Rapid Platform Update is unavailable for the first RU
   and why the PNEWS1628 post-patch step cannot have been run before.
@@ -58,14 +57,14 @@ alert on), most of it done once.
 
 ## Standing toolkit in this phase
 
-- **AHF / orachk compliance checks** — run before and after every patch or upgrade
-  phase project-wide (see the root README's "Standing toolkit"), with the pre/post
-  reports archived here as evidence rather than asserted. Phase 7a's baseline is
-  [Part 1 §5.6](phase-7a-part1-before-the-window.md#56-ahf-compliance-baseline);
-  the post-patch run is still outstanding.
+- **AHF and orachk compliance checks.** Run before and after every patch or
+  upgrade phase project-wide, with the reports archived here as evidence. Phase
+  7a's baseline is
+  [Part 1 §5.6](phase-7a-part1-before-the-window.md#56-ahf-compliance-baseline).
+  The post-patch run is still outstanding.
 - **Screenshots** live in [`screenshots/`](screenshots/), named to match the
-  section they illustrate — the same convention as
-  [`../installation/README.md`](../installation/README.md#15-screenshot-checklist-and-naming-convention)'s
+  section they illustrate, the same convention as
+  [`../installation/README.md`](../installation/README.md#15-screenshot-checklist-and-naming-convention)
   Section 15.
 
 See [`../02-roadmap-skeleton.md`](../02-roadmap-skeleton.md) for how this phase
