@@ -1098,9 +1098,6 @@ Still to capture:
 - **Phase 7d.** Convert `oemcdb` from non-CDB to a CDB and create `oempdb` plus
   `ggpdb` for GoldenGate. Not a prerequisite for 24ai, which supports a non-CDB
   repository, but required to take the repository past 19c.
-- **Fleet Maintenance**, new in 24ai. Patches databases and Grid Infrastructure
-  out of place, driven through the `emcli` verb with no console equivalent for
-  that step.
 
 ---
 

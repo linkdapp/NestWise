@@ -2,13 +2,13 @@
 
 **SOP: `oemserver01` (Oracle Linux) and the `oemcdb` repository, 13.5.0.0.0 to 24ai Release 1 Update 12**
 
-Status: 🟨 In progress. Part 1 and the upgrade itself are confirmed. Part 2c
-post-upgrade tasks are outstanding.
+Status: 🟩 **Confirmed 2026-09-13.** Both parts are complete. The OMS and all six
+agents run 24ai Release 1 Update 12.
 
 | Part | Covers | Status |
 |---|---|---|
 | [Part 1: Patching the OMS to 13.5 RU33](phase-7c-part1-oms-ru33.md) | Sections 1 to 10: OMSPatcher upgrade, JDBC prerequisites, the property file, analyze, the patch window, verification, rollback | 🟩 Confirmed 2026-09-06 |
-| [Part 2: Upgrading the OMS to 24ai Release 1](phase-7c-part2-24ai-upgrade.md) | Split into three: [2a Pre-deployment](phase-7c-part2a-pre-deployment.md), [2b Deployment](phase-7c-part2b-deployment.md), [2c Post-deployment](phase-7c-part2c-post-deployment.md) | 🟨 2a and 2b confirmed. 2c in progress |
+| [Part 2: Upgrading the OMS to 24ai Release 1](phase-7c-part2-24ai-upgrade.md) | Split into three: [2a Pre-deployment](phase-7c-part2a-pre-deployment.md), [2b Deployment](phase-7c-part2b-deployment.md), [2c Post-deployment](phase-7c-part2c-post-deployment.md) | 🟩 Confirmed 2026-09-13 |
 
 ---
 
@@ -96,15 +96,9 @@ Creating the blackout has its own page:
 
 ## What this feeds into
 
-- **[Part 2c](phase-7c-part2c-post-deployment.md).** The five remaining agents
-  move to 24ai, the new agent homes are patched to match the OMS, and the 13.5
-  homes are removed.
 - **Phase 7d.** Convert `oemcdb` from non-CDB to a CDB and create `oempdb` plus
   `ggpdb` for GoldenGate. Not a prerequisite for 7c, since 24ai supports a
   non-CDB repository. It remains a prerequisite for taking `oemcdb` past 19c.
-- **Fleet Maintenance** in 24ai patches databases and Grid Infrastructure out of
-  place. For the initial 13.5 to 24ai path it is driven through the `emcli` verb
-  only, with no console equivalent for that step.
 
 ---
 

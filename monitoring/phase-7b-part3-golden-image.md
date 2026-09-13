@@ -585,10 +585,8 @@ Agent patching becomes a single operation rather than one per host: create a new
 image version with the patch applied, set it Current, stage it, then update the
 subscribers.
 
-Fleet Maintenance in EM 24ai is a separate feature and patches databases and Grid
-Infrastructure out of place. Gold agent images apply to the agents; Fleet
-Maintenance applies to the Oracle homes those agents monitor. Both are relevant to
-Phase 7b.
+Gold agent images apply to the Management Agents themselves, not to the Oracle homes
+those agents monitor.
 
 ---
 

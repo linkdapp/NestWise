@@ -6,14 +6,14 @@ Part 2 of 2. [Part 1](phase-7c-part1-oms-ru33.md) took the OMS from base
 13.5.0.0.0 to 13.5.0.33 and is confirmed. The phase index is
 [`phase-7c-oms-upgrade.md`](phase-7c-oms-upgrade.md).
 
-Status: 🟨 In progress. The OMS is at **24ai Release 1** as of 2026-09-12. Part 2c
-is outstanding.
+Status: 🟩 **Confirmed 2026-09-13.** The OMS reached **24ai Release 1 Update 12** on
+2026-09-12 and all six agents are at 24.1.0.0.0.
 
 | Part | Covers | Downtime | Status |
 |---|---|---|---|
-| [Part 2a: Pre-deployment](phase-7c-part2a-pre-deployment.md) | Stage, prerequisites, EM Prerequisite Kit, software-only install, RU12 applied to the binaries with `-bitonly` | **None** | 🟨 In progress |
+| [Part 2a: Pre-deployment](phase-7c-part2a-pre-deployment.md) | Stage, prerequisites, EM Prerequisite Kit, software-only install, RU12 applied to the binaries with `-bitonly` | **None** | 🟩 Confirmed 2026-09-11 |
 | [Part 2b: Deployment](phase-7c-part2b-deployment.md) | Blackout, stop the 13.5 stack, backup, `ConfigureGC.sh`, and the five checks that confirm the upgrade succeeded | **The window** | 🟩 Confirmed 2026-09-12 |
-| [Part 2c: Post-deployment](phase-7c-part2c-post-deployment.md) | Clear the blackout, secure the emkey, lock the console and agent upload, verify the Phase 7b configuration, agents to 24ai, restore what the upgrade weakened, deinstall 13.5 | None | ⬜ Planned |
+| [Part 2c: Post-deployment](phase-7c-part2c-post-deployment.md) | Clear the blackout, secure the emkey, lock the console and agent upload, verify the Phase 7b configuration, agents to 24ai, restore what the upgrade weakened, deinstall 13.5 | None | 🟩 Confirmed 2026-09-13 |
 
 Start with Part 2a.
 
