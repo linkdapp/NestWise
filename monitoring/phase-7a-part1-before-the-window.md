@@ -375,22 +375,21 @@ has to say, **per run**, that they have read the finding.
 > the re-check *after* the rollback, which runs against the home exactly as it
 > will be at apply time and is expected to pass cleanly. It did.
 
-### 5.6 AHF compliance baseline
+### 5.6 ORACHK compliance baseline
 
-Standing practice for this project: an AHF compliance check immediately before
+Standing practice for this project: an ORACHK compliance check immediately before
 staging a patch and again after it completes. Two reports, before and after, are
 far stronger evidence than "the patch applied cleanly."
 
-Compliance runs through the compliance framework, not through `ahf analysis`.
 `orachk` is the tool for non-engineered systems, which is what this estate is.
 
 ```bash
-orachk -a
+/opt/oracle.ahf/bin/orachk -a
+/opt/oracle.ahf/bin/ahfctl orachk -profile db
 ```
 
 `-a` runs all checks, including the best practice checks and the recommended patch
-check. `ahfctl compliance -a` wraps the same framework and takes the same options.
-To run a narrower set, use `-profile`, for example `orachk -profile dba`.
+check. To run a narrower set, use `-profile`, for example `orachk -profile dba`.
 
 Keep the report path. It pairs with the post-patch run in
 [Part 3 §16](phase-7a-part3-verification.md#16-verification-checklist).

@@ -1045,63 +1045,16 @@ Archive the generated HTML report as evidence, the same pattern Phase 7a used ei
 side of its patch window. The pre-upgrade baseline is
 [Phase 7a Part 1 §5.6](phase-7a-part1-before-the-window.md#56-ahf-compliance-baseline).
 
-**Compliance is not an `ahf analysis` type.** On AHF 26.5.1 `ahf analysis create
---type` accepts `alert-history`, `patch-summary`, `capacity`, `insights` and `impact`.
-There is no `compliance` value:
-
-```
-oradbserv05-oracle-apexdb1$ ahf analysis create --type compliance
-AHF-01001: parser error: argument --type: invalid AnalysisType value: 'compliance'
-```
-
-The compliance engine is installed regardless:
-
-```
-oradbserv05-oracle-apexdb1$ ahf -v
-AHF version: 26.5.1
-Build Timestamp: 20260626181924
-TFA version: 26.5.1
-Compliance version: 26.5.1
-Compliance metadata version: 20260627
-```
-
-Compliance has its own framework. `orachk` is the tool for non-engineered systems,
+`orachk` is the tool for non-engineered systems,
 `exachk` is the Exadata equivalent, and `ahfctl compliance` wraps both with the same
 options. This estate is non-engineered, so `orachk`.
 
 Locate the binary if it is not on `PATH`:
 
 ```bash
-find /opt/oracle.ahf -name orachk -type f 2>/dev/null
+/opt/oracle.ahf/bin/orachk -a
+/opt/oracle.ahf/bin/ahfctl orachk -profile db
 ```
-
-Corrected in [Phase 7a Part 1 §5.6](phase-7a-part1-before-the-window.md#56-ahf-compliance-baseline),
-[Phase 7a Part 3 §16](phase-7a-part3-verification.md#16-verification-checklist) and
-`docs/patching-strategy.md`, which all carried the invalid form.
-
-### A.4 Two documented behaviours
-
-**The OMS and central agent do not start automatically after a host reboot.**
-This applies where the repository database and the OMS share a host, as they do
-here. Both have to be started by hand, or placed under a systemd unit with a
-documented startup order.
-
-**Agents may fail to communicate with `handshake has no peer`.**
-
-```
-WARN - Ping communication error
-o.s.emSDK.agent.comm.exception.VerifyConnectionException [unable to connect to
-http server at https://<host>:<port>/empbs/upload. [handshake has no peer]
-javax.net.ssl.SSLHandshakeException [handshake has no peer]
-javax.net.ssl.SSLPeerUnverifiedException [peer not authenticated]
-```
-
-Caused by pre 13.4 SSL cipher suites, so it affects estates whose history runs
-13.4 to 13.5 to 24ai. KB639677 has the fix. The six agents here were installed at
-13.5 from a gold image. Check agent uploads in
-[Part 2b §6.2](phase-7c-part2b-deployment.md#62-the-central-agent-is-up-and-uploading).
-
----
 
 ## 12. Screenshot checklist
 
