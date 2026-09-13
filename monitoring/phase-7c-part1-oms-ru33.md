@@ -95,6 +95,11 @@ not an assumption to carry forward.
 or later. Oracle's 24ai Upgrade Guide separately requires 19.22.0.0.0 or later for
 the upgrade in Part 2. At 19.32.0.0.0 the repository meets both.
 
+**Part 1 also clears the OMS Release Update floor for Part 2.** My Oracle Support
+KB590189 requires 13.5 with RU22 or later before an upgrade to 24ai. RU33 clears
+it, and sets the minimum 24ai target at RU06 or later. See
+[Part 2 §2](phase-7c-part2-24ai-upgrade.md#2-version-floors-and-the-upgrade-path).
+
 ### 1.2 What is staged
 
 Confirmed present in `/u01/app/oracle/staging/patches/oem` on 2026-09-06:
@@ -108,10 +113,17 @@ Confirmed present in `/u01/app/oracle/staging/patches/oem` on 2026-09-06:
 | `Oracle_JDBC_Fusion_Middleware_12.2.1.4.0_p31657681_191000_Generic.zip` | 31657681 | JDBC |
 
 
-**OPatch patch 28186730 is not staged and is not required here.** README
-prerequisite 7 states that the *"OPatch version present in Middleware Oracle Home
-is good to apply the JDBC Patches"*. Record the version found in §3.2 as the
-evidence for that.
+**OPatch patch 28186730 is staged but is not applied here.** The file is
+`OPATCH_13.9.4.2.24_OEM_13.5_24.1_FMW_WLS_12.2.1.4.0_p28186730_1394224_Generic.zip`,
+staged 2026-09-06. README prerequisite 7 states that the *"OPatch version present
+in Middleware Oracle Home is good to apply the JDBC Patches"*, so this run uses
+the OPatch already in the home. Record the version found in §3.2 as the evidence
+for that.
+
+The patch is applied in
+[Part 2 §8.3](phase-7c-part2-24ai-upgrade.md#83-upgrade-opatch-in-the-24ai-home),
+against the 24ai home, where My Oracle Support KB282751 names it as a required
+step.
 
 ---
 

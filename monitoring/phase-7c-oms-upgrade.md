@@ -8,7 +8,7 @@ Status: 🟨 In progress. Part 1 is confirmed. Part 2 is scoped and waiting on t
 | Part | Covers | Status |
 |---|---|---|
 | [Part 1: Patching the OMS to 13.5 RU33](phase-7c-part1-oms-ru33.md) | Sections 1 to 10: OMSPatcher upgrade, JDBC prerequisites, the property file, analyze, the patch window, verification, rollback | 🟩 Confirmed 2026-09-06. OMS at 13.5.0.33 |
-| [Part 2: Upgrading the OMS to 24ai Release 1](phase-7c-part2-24ai-upgrade.md) | Verified 24ai prerequisites and where this estate stands against each | ⬜ Planned |
+| [Part 2: Upgrading the OMS to 24ai Release 1](phase-7c-part2-24ai-upgrade.md) | Split into three: [2a Pre-deployment](phase-7c-part2a-pre-deployment.md) stages and patches the 24ai binaries to RU12 with no downtime, [2b Deployment](phase-7c-part2b-deployment.md) is the `ConfigureGC.sh` window, [2c Post-deployment](phase-7c-part2c-post-deployment.md) re-secures the emkey and moves the agents | 🟨 In progress. Binaries staged, no blockers |
 
 Start with Part 1. It is a hard prerequisite for Part 2, and it is executable
 today with what is already staged.
@@ -17,16 +17,21 @@ today with what is already staged.
 
 ## Why two parts, in this order
 
-Oracle's 24ai Upgrade Guide names two version floors: **OMS at 13c Release 5** and
-**repository database at 19.22 or later**. It does not name a Release Update
-floor.
+There are three version floors: **OMS at 13.5 with RU22 or later**, **repository
+database at 19.22 or later in 19c**, and a **24ai target Release Update decided by
+the starting 13.5 Release Update**.
 
-Earlier scoping notes in this project recorded EM 13.5 RU22 as the minimum for
-24ai. That figure is not in the 24ai prerequisites chapter. Rather than resolve
-the discrepancy, Part 1 makes it moot by taking the OMS to 13.5.0.33, which clears
-any RU floor that might exist. RU33 also carries eight releases' worth of
-accumulated fixes onto an OMS that has never had a Release Update applied, which
-is worth doing on its own merits.
+The 24ai Upgrade Guide's prerequisites chapter names only 13c Release 5 and the
+repository database version. The Release Update floor is in My Oracle Support
+KB590189, along with the matrix that ties the starting Release Update to the
+minimum 24ai target. At 13.5.0.33 this estate must go to **24ai RU06 or later**,
+which is why Part 2 uses the **Upgrade software only with plug-ins and Configure
+Later** method. The matrix is in
+[Part 2 §2.1](phase-7c-part2-24ai-upgrade.md#21-the-starting-release-update-decides-the-target-release-update).
+
+Part 1 clears the OMS floor with margin. RU33 also carries accumulated fixes onto
+an OMS that has never had a Release Update applied, which is worth doing on its
+own merits.
 
 **Two floors were already cleared by earlier phases, neither of them for this
 reason.**
@@ -131,15 +136,17 @@ project starts with it:
   24ai supports pluggable database, lone pluggable database and non-container
   database repositories, and its postupgrade chapter documents migrating a non-CDB
   repository to a PDB *after* the upgrade. Phase 7d does not block Part 2. See
-  [Part 2 §4.1](phase-7c-part2-24ai-upgrade.md#41-the-repository-does-not-have-to-be-a-cdb).
-- **Is there a Release Update floor for the 24ai upgrade at all?** The RU22 figure
-  carried in earlier project notes is not in the 24ai Upgrade Guide's
-  prerequisites chapter. Part 1 makes the question moot rather than answering it.
-  Worth settling properly before it is repeated as fact in a showcase post.
-- **Which upgrade mode for Part 2?** Standard GUI, software-only with
-  `ConfigureGC.sh`, or silent. The software-only route allows a 24ai Release
-  Update to be applied to the binaries before configuration, which reduces total
-  downtime.
+  [Part 2 §3.2](phase-7c-part2-24ai-upgrade.md#32-the-repository-does-not-have-to-be-a-cdb).
+- ~~**Is there a Release Update floor for the 24ai upgrade at all?**~~ **Answered
+  2026-09-09: yes, RU22.** My Oracle Support KB590189 states it, and adds the
+  matrix that sets the minimum 24ai target from the starting 13.5 Release Update.
+  At 13.5.0.33 the target is 24ai RU06 or later.
+- ~~**Which upgrade mode for Part 2?**~~ **Answered 2026-09-09: Upgrade software
+  only with plug-ins and Configure Later.** KB590189 requires it for any upgrade
+  starting at 13.5 RU25 or later, because it is the method that allows the 24ai
+  Release Update to be applied to the binaries before configuration.
+- **Which 24ai Release Update.** RU06 is the floor. The one to stage is the
+  latest available at the time of the window.
 
 ---
 

@@ -9,7 +9,7 @@ Part 2 is scoped. 7d is scoped but not started.
 |---|---|---|
 | **7a** [Patching the OEM repository database to 19c RU32](phase-7a-repository-db-ru32.md) | `oemcdb` 19.19.0.0.0 to 19.32.0.0.0, combo 39618649 (DB RU plus OJVM), fully automated with a human checkpoint at the blackout | 🟩 Confirmed 2026-09-04 |
 | **7b** [Extending coverage](phase-7b-extending-coverage.md) | Agents onto the RAC clusters and the NestWise app tier from a gold agent image, administration groups and monitoring templates (Production, Test, Development), APEX, ORDS and MongoDB via Metric Extensions. Manual SOP, no Ansible | 🟩 Confirmed 2026-09-09 |
-| **7c** [OMS 13.5 to 24ai](phase-7c-oms-upgrade.md) | Part 1 takes the OMS from base 13.5.0.0.0 to RU33 (13.5.0.33) with patch 39676211. Part 2 is the 24ai Release 1 upgrade. Verified gates: OMS at 13c Release 5, repository database at 19.22 or later. Agent upgrade follows the OMS. Fleet Maintenance in 24ai patches databases and Grid Infrastructure out of place through the `emcli` verb only, with no GUI for that step | 🟨 In progress |
+| **7c** [OMS 13.5 to 24ai](phase-7c-oms-upgrade.md) | Part 1 takes the OMS from base 13.5.0.0.0 to RU33 (13.5.0.33) with patch 39676211. Part 2 is the 24ai Release 1 upgrade, out of place, using **Upgrade software only with plug-ins and Configure Later** so the 24ai Release Update is applied to the binaries before `ConfigureGC.sh` runs. Verified gates: OMS at 13.5 RU22 or later, repository database at 19.22 or later, 24ai target at RU06 or later from RU28 and above. Agent upgrade follows the OMS. Fleet Maintenance in 24ai patches databases and Grid Infrastructure out of place through the `emcli` verb only, with no GUI for that step | 🟨 In progress |
 | **7d** non-CDB to CDB conversion | Convert `OEMCDB`, which despite the name is **not** a CDB, and create `oempdb` plus `ggpdb` for GoldenGate. A prerequisite for taking this database past 19c, since non-CDB is desupported from 21c onward. **Not** a prerequisite for 7c: 24ai supports a non-CDB repository | ⬜ Planned |
 
 **Coverage before the upgrade.** 7b was moved ahead of the OMS upgrade
@@ -45,10 +45,14 @@ alert on), most of it done once.
   non-container database repositories. Phase 7d is therefore **not** a prerequisite
   for 7c. It remains a prerequisite for taking `oemcdb` past 19c, since non-CDB is
   desupported from 21c onward.
-- **Is there a Release Update floor for the 24ai upgrade?** The EM 13.5 RU22 figure
-  carried from early scoping does not appear in the 24ai Upgrade Guide, which names
-  the minimum starting point as 13c Release 5 without qualifying it by RU. Phase 7c
-  Part 1 makes the question moot by taking the OMS to 13.5.0.33.
+- ~~**Is there a Release Update floor for the 24ai upgrade?**~~ **Answered
+  2026-09-09: yes, RU22.** The 24ai Upgrade Guide's prerequisites chapter names
+  the minimum starting point as 13c Release 5 without qualifying it by Release
+  Update, which is why this was recorded as open. My Oracle Support KB590189
+  states the floor explicitly, and adds a matrix tying the starting Release
+  Update to the minimum 24ai target. At 13.5.0.33 this estate must go to **24ai
+  RU06 or later**, which is why Part 2 uses the software-only method. See
+  [Part 2 §2](phase-7c-part2-24ai-upgrade.md#2-version-floors-and-the-upgrade-path).
 - **What RU is the OMS actually on?** Answered: **none**. The OMS is at base
   13.5.0.0.0, which is why Rapid Platform Update is unavailable for the first RU
   and why the PNEWS1628 post-patch step cannot have been run before.
