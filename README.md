@@ -14,26 +14,33 @@ running a real application on top of it, in public, mistakes included.
 
 ## The short version
 
-Companies don't pay Oracle DBAs to install software once and walk away. They pay
-them to keep systems running when hardware fails, data grows, and versions age out.
-Customers should never notice. This project builds that skill set end to end: a real
-two-node database cluster, automatic failover, live version upgrades, and a working
-application layered on top, so the infrastructure has something real to protect
-instead of sitting there configured but unused.
+> Companies don't pay Oracle DBAs to install software once and walk away. They pay
+> them to keep systems running when hardware fails, data grows, and versions age out.
+> Customers should never notice.
+
+This project builds that skill set end to end: a real two-node database cluster,
+automatic failover, live version upgrades, and a working application layered on top,
+so the infrastructure has something real to protect instead of sitting there
+configured but unused.
 
 **NestWise** is that application, a local-recommendations tool (good neighborhoods,
 restaurants, places to stay, what's playing nearby) built on Oracle APEX and ORDS.
 It's deliberately small. What matters isn't its feature list; it's that it's a real
 app, taking real traffic, depending on the platform underneath it actually staying up.
 
-Where things stand right now: the database cluster is built and running a real
-database, and automatic failover protection (Data Guard broker, Fast-Start
-Failover, and a real Swingbench-driven switchover test with a genuine throughput
-dip and recovery) is confirmed. The 12c to 19c rolling upgrade is done. Enterprise
-Manager has been taken from 13.5 to 24ai, so the estate is monitored. NestWise v1
-is being built on top of that foundation. From there the platform keeps growing
-through replication, security hardening, an upgrade to 26ai, and eventually a
-second data source (MongoDB) feeding into the same app.
+**Where things stand right now:**
+
+- 🟩 [The database cluster](installation/README.md) is built and running a real database
+- 🟩 Automatic failover protection is confirmed: [Data Guard broker, Fast-Start Failover](high-availability/part2-broker-fsfo-observer.md),
+  and [a real Swingbench-driven switchover test with a genuine throughput dip and recovery](high-availability/part3-post-checks.md)
+- 🟩 [The 12c to 19c rolling upgrade](maintenance/README.md) is done
+- 🟩 [Enterprise Manager has been taken from 13.5 to 24ai](monitoring/phase-7c-part2-24ai-upgrade.md),
+  so the estate is monitored
+- 🟨 [NestWise v1](nestwise-app/docs/architecture.md) is being built on top of that foundation
+
+From there the platform keeps growing through replication, security hardening, an
+upgrade to 26ai, and eventually a second data source (MongoDB) feeding into the
+same app.
 
 Every step gets documented as it actually happened, including the parts that broke
 first. [`known-risks.md`](phase-01-foundation-2node-rac-12cR2/docs/known-risks.md) alone
