@@ -39,8 +39,10 @@ automatically, confirmed in
 | `oradbserv01.usat.com` | Legacy single-instance database | Development | Already monitored |
 | `orappsserv01.usat.com` | EBS application server | Development | Already monitored |
 
-**Record the target count.** Phase 7a recorded 43 targets. Part 1 §1 recorded 168
-once the agents were in. Use the current count in the next patch window, not 43.
+**Record the target count.** `emcli get_targets | wc -l` returned 43 at Phase 7a,
+168 in Part 1 §1 once the agents were in, and 203 before the 24ai upgrade window
+in [Phase 7c Part 2b §1.2](phase-7c-part2b-deployment.md#12-record-the-target-count).
+Take a fresh count in each window rather than carrying an earlier one forward.
 
 ---
 

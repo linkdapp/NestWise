@@ -1,6 +1,6 @@
 # Phase 7a — Part 1: Before the Window
 
-**SOP: `oemcdb` on `oemserver01` — Combo 39618649 (Database RU 39472050 + OJVM 39222882), 19.19.0.0.0 → 19.32.0.0.0, Oracle Linux**
+**SOP: `oemcdb` on `oemserver01`, Combo 39618649 (Database RU 39472050 plus OJVM 39222882), 19.19.0.0.0 to 19.32.0.0.0, Oracle Linux**
 
 Part 1 of 3. **Part 1 (this page)** covers everything that is read-only and
 belongs days ahead of the window: prerequisites, the syntax check, preflight,
@@ -10,7 +10,7 @@ staging the combo, and the pre-window checks.
 aftermath. The index with the environment summary and the result is
 [`phase-7a-repository-db-ru32.md`](phase-7a-repository-db-ru32.md).
 
-Status: 🟩 Confirmed — every section below ran clean against the live lab.
+Status: 🟩 Confirmed. Every section below ran clean against the live lab.
 
 | # | Section | Status |
 |---|---|---|
@@ -21,15 +21,15 @@ Status: 🟩 Confirmed — every section below ran clean against the live lab.
 | 5 | Pre-window checks | 🟩 Confirmed |
 
 Before starting, read
-[`known-risks.md`](../phase-01-foundation-2node-rac-12cR2/docs/known-risks.md) —
-the reasoning and debugging history behind every fix referenced across all three
-parts — and
+[`known-risks.md`](../phase-01-foundation-2node-rac-12cR2/docs/known-risks.md),
+which holds the reasoning and debugging history behind every fix referenced
+across all three parts, and
 [`phase-7a-ansible.md`](phase-7a-ansible.md) for the role, tag and variable
 reference.
 
-Screenshots referenced below are in [`screenshots/`](screenshots/) — same naming
-convention as `installation/`'s Section 15, numbered to match this page's own
-section numbers (3, 4).
+Screenshots referenced below are in [`screenshots/`](screenshots/), the same
+naming convention as `installation/`'s Section 15, numbered to match this page's
+own section numbers (3, 4).
 
 ---
 
@@ -41,7 +41,7 @@ section numbers (3, 4).
 4. [Stage the combo](#4-stage-the-combo)
 5. [Pre-window checks](#5-pre-window-checks)
 
-Continue to **[Part 2 — The patch window](phase-7a-part2-the-patch-window.md)**.
+Continue to **[Part 2: The patch window](phase-7a-part2-the-patch-window.md)**.
 
 ---
 
@@ -49,24 +49,24 @@ Continue to **[Part 2 — The patch window](phase-7a-part2-the-patch-window.md)*
 
 | Item | Value |
 |---|---|
-| Target | Combo **39618649** — OJVM Component RU 19.32.0.0.260721 + Database Jul 2026 RU 19.32.0.0.260721 |
+| Target | Combo **39618649**, OJVM Component RU 19.32.0.0.260721 plus Database Jul 2026 RU 19.32.0.0.260721 |
 | MOS zip | `COMBO_OJVM_DBRU_19RU32_p39618649_190000_Linux-x86-64.zip` |
-| OPatch zip | `p6880880_190000v52_Linux-x86-64.zip` — the **19.0.0.0.0** line |
+| OPatch zip | `p6880880_190000v52_Linux-x86-64.zip`, the **19.0.0.0.0** line |
 | Staging root | `/u01/app/oracle/staging/patches` (already staged on `oemserver01`) |
 | Database | `oemcdb`, 19.19.0.0.0, **non-CDB**, **single instance, no Grid Infrastructure** |
 | Oracle Home | `/u01/app/oracle/product/19.3.0/db_1` |
-| Apply mechanism | plain `opatch apply -silent`, twice — neither component is a system patch |
+| Apply mechanism | plain `opatch apply -silent`, twice. Neither component is a system patch |
 | Apply order | Database RU first, then OJVM, then **one** `datapatch` run covering both |
 | OPatch minimum | **12.2.0.1.51** (OJVM README §1.2; the DB RU README names none) |
 | Backup | full RMAN backup to `/u03/backups/rman/$ORACLE_SID/<timestamp>`, plus a guaranteed restore point |
-| Blackout | created by hand through the EM console — [see the blackout page](oem-create-blackout.md) |
+| Blackout | created by hand through the EM console, [see the blackout page](oem-create-blackout.md) |
 
 ### The combo unzips into exactly two component directories
 
 | Component | What it is | In scope |
 |---|---|---|
-| **39472050** | Database Release Update 19.32.0.0.260721 | yes — applied first |
-| **39222882** | OJVM Component Release Update 19.32.0.0.260721 | yes — applied second |
+| **39472050** | Database Release Update 19.32.0.0.260721 | Yes, applied first |
+| **39222882** | OJVM Component Release Update 19.32.0.0.260721 | Yes, applied second |
 
 Neither is Grid-only, and this host has no Grid Infrastructure anyway. Do not
 apply the top-level combo directory the way the GI build does with `-applyRU`;
@@ -77,7 +77,7 @@ that flow is specific to `gridSetup.sh`.
 > because four were Grid-home-only. That was the wrong combo for this host.
 > 39618649 is the DB-home combo, and it brings OJVM with it.
 >
-> The OPatch zip changed too, and not just its version. It was `gi_opatch_zip` —
+> The OPatch zip changed too, and not just its version. It was `gi_opatch_zip`,
 > the 23xxxx-line download used by the Grid build. This home needs the
 > **19.0.0.0.0** line. Full write-up: `known-risks.md` #142.
 
@@ -91,7 +91,7 @@ cause rather than inside OPatch.
 One more OJVM-specific thing, worth knowing before it appears in Part 3:
 **`ORA-04068: existing state of packages has been discarded` may show up in the
 alert log while `datapatch` runs.** OJVM README Known Issue 1 documents it as
-benign — datapatch retries internally, and if datapatch itself reports no error
+benign. Datapatch retries internally, and if datapatch itself reports no error
 the patch applied correctly. Do not chase it.
 
 ---
@@ -146,7 +146,8 @@ ansible-playbook -i inventory/hosts.ini oem-repo-patch.yml \
 ### 3.1 The registry baseline
 
 The first thing it captures is the component and patch registry as it stands
-before anything is touched — the before-picture that Part 3 §16 diffs against.
+before anything is touched. It is the before-picture that Part 3 §16 diffs
+against.
 
 ![Preflight output: dba_registry showing all components VALID at 19.0.0.0.0 except Oracle Real Application Clusters at OPTION OFF, followed by the start of dba_registry_sqlpatch with RU 35042068 APPLY SUCCESS](screenshots/03a-preflight-registry-components.png)
 
@@ -161,16 +162,16 @@ than demanding zero.
 
 ### 3.2 The preflight summary
 
-![Preflight summary: sqlpatch rows for 35042068 (RU) and 29213893 (INTERIM), PRE_INVALID_COUNT=2, PRE_REGISTRY_NOT_VALID=1, Version 19.19.0.0.0, then the reported summary — SID oemcdb, ORACLE_HOME /u01/app/oracle/product/19.3.0/db_1, Invalid (pre) 2, Expected targets 43](screenshots/03b-preflight-summary-19.19.png)
+![Preflight summary: sqlpatch rows for 35042068 (RU) and 29213893 (INTERIM), PRE_INVALID_COUNT=2, PRE_REGISTRY_NOT_VALID=1, Version 19.19.0.0.0, then the reported summary giving SID oemcdb, ORACLE_HOME /u01/app/oracle/product/19.3.0/db_1, Invalid (pre) 2, Expected targets 43](screenshots/03b-preflight-summary-19.19.png)
 
 The five numbers this run has to produce, and what each is for:
 
 | Captured | Value | Used by |
 |---|---|---|
-| SID | `oemcdb` | everything downstream — the backup path, the shutdown, datapatch |
+| SID | `oemcdb` | Everything downstream: the backup path, the shutdown, datapatch |
 | `ORACLE_HOME` | `/u01/app/oracle/product/19.3.0/db_1` | proves the running `pmon` binary lives in the home being patched |
 | Version | `19.19.0.0.0` | Part 3 §16 check 3 |
-| `PRE_INVALID_COUNT` | `2` | Part 3 §16 check 5 — the comparison baseline, not zero |
+| `PRE_INVALID_COUNT` | `2` | Part 3 §16 check 5. It is the comparison baseline, not zero |
 | `PRE_REGISTRY_NOT_VALID` | `1` | Part 3 §16 check 6 |
 | Expected targets | `43` | Part 3 §16 check 12 |
 
@@ -178,8 +179,8 @@ The five numbers this run has to produce, and what each is for:
 > `ora_pmon_*` process and resolves that process's binary through
 > `/proc/<pid>/exe` to confirm it belongs to the target home. Getting that
 > discovery right took four attempts and is the single most-debugged task in the
-> role — `ps -eo pid=,args=` silently emits one column, and `ps -ef | grep` matches
-> the shell running the script. `known-risks.md` #146-#152 has the full account.
+> role. `ps -eo pid=,args=` silently emits one column, and `ps -ef | grep` matches
+> the shell running the script. `known-risks.md` #146 to #152 has the full account.
 
 **This is also what settles the client-home question.** `group_vars/all.yml`
 describes `/u01/app/oracle/product/19.3.0/db_1` as an Oracle *Client* home. A
@@ -219,12 +220,12 @@ is missing:
 
 | State | What happens |
 |---|---|
-| Both present | unzip skipped entirely — no 2.5 GB re-extract |
+| Both present | Unzip skipped entirely. No 2.5 GB re-extract |
 | One component deleted | re-extracts, restoring both |
 | Whole `39618649/` deleted | re-extracts |
 
 That middle row is the one worth knowing about. The guard used to be
-`creates: .../patches/39618649` — the **parent** directory — which meant deleting
+`creates: .../patches/39618649`, the **parent** directory, which meant deleting
 a single component left the parent in place, matched `creates:`, skipped the
 unzip, and then failed verification with no way forward except deleting the
 parent by hand. Same coarse-guard class as `known-risks.md` #32 and #68: the
@@ -245,7 +246,7 @@ ls -l p6880880_190000v52_Linux-x86-64.zip
 ls -ld 39618649/39472050 39618649/39222882
 ```
 
-The last command is the one that matters — **both** component directories must
+The last command is the one that matters. **Both** component directories must
 exist.
 
 > **Unzip into `patches/`, not into `patches/39618649/`.** Oracle's zip already
@@ -255,7 +256,7 @@ exist.
 > **The RU no longer travels from `oradbserv05`.** Earlier drafts described an
 > `rsync` push from the RAC node, because the old GI combo was already there from
 > the Grid build. 39618649 is a different patch and was staged here directly, so
-> the copy step is a no-op — the role's `stat` finds the zip locally and skips it.
+> the copy step is a no-op. The role's `stat` finds the zip locally and skips it.
 > The `ssh_equivalence` trust still gets established and verified, which costs
 > nothing and leaves the path working if a future patch does need copying.
 
@@ -336,23 +337,23 @@ A conflict found here is cheap. A conflict found partway through an apply is not
 
 > **Read the report, not the exit code.** `opatch prereq` exits 0 even when the
 > prereq fails. The role gates on the string `Prereq "..." passed` appearing and
-> `Prereq "..." failed` not appearing — and it checks for **both** verdicts,
+> `Prereq "..." failed` not appearing, and it checks for **both** verdicts,
 > because with two checks writing to one stdout, "passed" being present proves
 > nothing about which check produced it.
 
 > **Two corrections, 2026-08-31, from reading the 39472050 README.** The flag is
 > `-phBaseDir`, not `-ph`. And do **not** expect a *"This command doesn't support
-> System Patch"* refusal — that is true of the combo, not of the Database RU
+> System Patch"* refusal. That is true of the combo, not of the Database RU
 > component this home actually gets. `known-risks.md` #142.
 >
-> Note also that `CheckMinimumOPatchVersion` is how you answer "is OPatch new
-> enough" — the README names no version number at all.
+> `CheckMinimumOPatchVersion` is how you answer whether OPatch is new enough. The
+> README names no version number at all.
 
 ### 5.5 What this check reported, and why the window needs an override
 
 The check came back with **ZOP-47**: `39472050` supersedes `35042068` (RU 19.19)
-but does not carry forward five one-offs layered on top of it — `35037877`,
-`34832725`, `35074478`, `34340632`, `29213893`.
+but does not carry forward five one-offs layered on top of it: `35037877`,
+`34832725`, `35074478`, `34340632` and `29213893`.
 
 **ZOP-47 is a superset finding, not a conflict.** A real conflict needs a
 resolution patch from My Oracle Support; the README points at KB145571 for
@@ -391,5 +392,5 @@ Keep the report path. It pairs with the post-patch run in
 
 ---
 
-Continue to **[Part 2 — The patch window](phase-7a-part2-the-patch-window.md)**.
+Continue to **[Part 2: The patch window](phase-7a-part2-the-patch-window.md)**.
 Back to the **[index](phase-7a-repository-db-ru32.md)**.

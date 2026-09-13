@@ -1,9 +1,9 @@
 # Phase 7a — Part 2: The Patch Window
 
-**SOP: `oemcdb` on `oemserver01` — Combo 39618649 (Database RU 39472050 + OJVM 39222882), 19.19.0.0.0 → 19.32.0.0.0, Oracle Linux**
+**SOP: `oemcdb` on `oemserver01`, Combo 39618649 (Database RU 39472050 plus OJVM 39222882), 19.19.0.0.0 to 19.32.0.0.0, Oracle Linux**
 
 Part 2 of 3. [Part 1](phase-7a-part1-before-the-window.md) covers the
-prerequisites, preflight and staging — read that first; this page assumes the
+prerequisites, preflight and staging. Read that first. This page assumes the
 combo is extracted, the preflight has run, and the conflict check has been read.
 **Part 2 (this page)** is the destructive run: OPatch, the blackout pause,
 stopping the stack, the backup, the rollback of superseded one-offs, and the
@@ -11,7 +11,7 @@ apply. [Part 3](phase-7a-part3-verification.md) is datapatch, verification and
 aftermath. The index is
 [`phase-7a-repository-db-ru32.md`](phase-7a-repository-db-ru32.md).
 
-Status: 🟩 Confirmed — ran clean end to end on 2026-09-04.
+Status: 🟩 Confirmed. Ran clean end to end on 2026-09-04.
 
 | # | Section | Status |
 |---|---|---|
@@ -35,9 +35,9 @@ The sections below explain what each stage does, what its real output looked
 like, and what to check. The manual equivalents are given for anyone running this
 without Ansible.
 
-Screenshots referenced below are in [`screenshots/`](screenshots/) — same naming
-convention as `installation/`'s Section 15, numbered to match this page's own
-section numbers (6-12).
+Screenshots referenced below are in [`screenshots/`](screenshots/), the same
+naming convention as `installation/`'s Section 15, numbered to match this page's
+own section numbers (6 to 12).
 
 ---
 
@@ -51,15 +51,15 @@ section numbers (6-12).
 11. [Roll back the superseded one-offs](#11-roll-back-the-superseded-one-offs)
 12. [Apply both patches](#12-apply-both-patches)
 
-Back to **[Part 1 — Before the window](phase-7a-part1-before-the-window.md)**.
-Continue to **[Part 3 — Datapatch, verification and aftermath](phase-7a-part3-verification.md)**.
+Back to **[Part 1: Before the window](phase-7a-part1-before-the-window.md)**.
+Continue to **[Part 3: Datapatch, verification and aftermath](phase-7a-part3-verification.md)**.
 
 ---
 
 ## 6. Update OPatch
 
 The first thing that changes the home, and it happens **before** the blackout
-pause deliberately — it is reversible, it does not touch the database, and doing
+pause deliberately. It is reversible, it does not touch the database, and doing
 it early means the pause is the last safe stopping point rather than the
 second-to-last.
 
@@ -91,20 +91,20 @@ than trusting the version string, and it passed.
 **Nothing has been shut down yet when this pause fires.** It is the last point at
 which the window can be abandoned with no cleanup.
 
-The role does **not** create the blackout — you do, by hand. The full procedure,
+The role does **not** create the blackout. You do, by hand. The full procedure,
 with the console click-path, the `emcli` form and the agent-side `emctl` form, is
 on its own page:
 
 ### ➜ [Creating a Blackout in Enterprise Manager 13.5](oem-create-blackout.md)
 
 That page is separate because every maintenance window in this project starts
-with it, and because a blackout cannot be created after the OMS is down —
-creating one talks to the OMS, so there is no second chance and no way to mark
+with it, and because a blackout cannot be created after the OMS is down.
+Creating one talks to the OMS, so there is no second chance and no way to mark
 the window as planned retroactively.
 
 ### 7.1 What the pause looks like
 
-![Ansible PAUSE task headed "BLACKOUT CHECKPOINT — nothing has been shut down yet", listing Host oemserver01, SID oemcdb and the log path, then the console path Enterprise > Monitoring > Blackouts and Brownouts > Create, the emcli create_blackout form, the agent-side emctl start blackout form, a note that the OMS emctl has no blackout verb, and a warning that pressing Enter will stop the agent, stop the OMS, back up and shut down the database](screenshots/07a-pause-blackout-checkpoint.png)
+![Ansible PAUSE task headed "BLACKOUT CHECKPOINT, nothing has been shut down yet", listing Host oemserver01, SID oemcdb and the log path, then the console path Enterprise > Monitoring > Blackouts and Brownouts > Create, the emcli create_blackout form, the agent-side emctl start blackout form, a note that the OMS emctl has no blackout verb, and a warning that pressing Enter will stop the agent, stop the OMS, back up and shut down the database](screenshots/07a-pause-blackout-checkpoint.png)
 
 Create the blackout, verify it independently in another session, then press
 Enter. `Ctrl-C` then `A` aborts with nothing changed but OPatch.
@@ -118,14 +118,14 @@ Enter. `Ctrl-C` then `A` aborts with nothing changed but OPatch.
 . /home/oracle/.env/agent_env && emctl status blackout
 ```
 
-![Ansible task "Show the blackout status" printing emctl status blackout output — Blackoutname = Blackout-Sep 3 2026 8:40:08 PM, Targets = (oemserver01.usat.com:host,), Expired = False — followed by "Stop if no blackout appears to be active" skipping](screenshots/07b-blackout-verified-expired-false.png)
+![Ansible task "Show the blackout status" printing emctl status blackout output, with Blackoutname = Blackout-Sep 3 2026 8:40:08 PM, Targets = (oemserver01.usat.com:host,) and Expired = False, followed by "Stop if no blackout appears to be active" skipping](screenshots/07b-blackout-verified-expired-false.png)
 
 The role runs the same command itself and refuses to shut anything down without
 `Blackoutname` and `Expired = False` in the output. That is why the "Stop if no
-blackout appears to be active" task shows as `skipping` — the gate passed.
+blackout appears to be active" task shows as `skipping`. The gate passed.
 
 > **`agent_env`, not `oms_env`.** Blackouts are an **AGENT** `emctl` command. The
-> OMS `emctl` has no blackout verb at all — it prints its own usage text and
+> OMS `emctl` has no blackout verb at all. It prints its own usage text and
 > **exits 0**, which is exactly how an earlier automated attempt reported success
 > having created nothing. `known-risks.md` #150.
 
@@ -158,7 +158,7 @@ WebLogic admin server running, which keeps a lock on the home. The screenshot
 above is the proof it stopped: `AdminServer Successfully Stopped` only appears
 with `-all`.
 
-The database stays **up** through this section — it has to, because §9 backs it
+The database stays **up** through this section. It has to, because §9 backs it
 up next.
 
 ---
@@ -201,8 +201,8 @@ Two things in that output are design decisions rather than defaults:
 
 - **Explicit `FORMAT` on every backup**, and a **session-scoped**
   `SET CONTROLFILE AUTOBACKUP FORMAT`. Without them the pieces land wherever the
-  persistent RMAN configuration points, which on this database is the FRA — not
-  the timestamped directory the run is supposed to be self-contained in. `SET`
+  persistent RMAN configuration points, which on this database is the FRA rather
+  than the timestamped directory the run is supposed to be self-contained in. `SET`
   inside `RUN` rather than `CONFIGURE` means the window does not permanently
   alter the database's backup configuration.
 - **The backup is gated on a positive marker.** The role fails unless
@@ -213,10 +213,10 @@ The real run wrote **1.6 GB** to `/u03/backups/rman/oemcdb/20260904T063751`.
 
 > **`using target database control file instead of recovery catalog`.** This
 > database is backed up with no recovery catalog. That is consistent with there
-> being none configured — but it is an absence of evidence, not evidence of
+> being none configured, but it is an absence of evidence rather than evidence of
 > absence, and it matters because Oracle's §3.3.3 catalog upgrade is a real
-> post-patch step if one exists. Listed as an open question on the
-> [index](phase-7a-repository-db-ru32.md#open-questions-for-the-write-up).
+> post-patch step if one exists. Tracked in
+> [Part 3 §18](phase-7a-part3-verification.md#18-aftermath--what-is-still-outstanding).
 
 ### 9.2 Guaranteed restore point
 
@@ -229,7 +229,7 @@ SELECT name, guarantee_flashback_database, time FROM v$restore_point;
 ![Ansible task "Show restore point result": LOG_MODE ARCHIVELOG and FLASHBACK_ON NO, then "Restore point created.", then v$restore_point showing PRE_RU32 with GUA YES, timestamped 03-SEP-26 08.53.37 PM](screenshots/09b-restore-point-pre-ru32.png)
 
 **Read the two columns before the restore point, not after.** `LOG_MODE` is
-`ARCHIVELOG` — good — but **`FLASHBACK_ON` is `NO`**. The guaranteed restore
+`ARCHIVELOG`, which is correct, but **`FLASHBACK_ON` is `NO`**. The guaranteed restore
 point was created and is real, but flashback database is not enabled, so
 `FLASHBACK DATABASE TO RESTORE POINT PRE_RU32` is not available as a rollback
 path. **The RMAN backup in §9.1 was the actual safety net.**
@@ -292,7 +292,7 @@ echo "RESIDUAL_COUNT=${RESIDUAL}"
 ```
 
 > **Why not `ps -ef | grep`.** Because the shell running the check appears in its
-> own output — the grep pattern is in the script's command line, so it matches
+> own output. The grep pattern is in the script's command line, so it matches
 > itself. An earlier version of this check reported the home as busy on every run,
 > and a variant of it reported `-1`. Resolving a PID's binary through
 > `/proc/<pid>/exe` is immune to that, and also to a process whose command line
@@ -317,7 +317,7 @@ of them are removed here explicitly. The other three are left to OPatch.**
 export ORACLE_HOME=/u01/app/oracle/product/19.3.0/db_1
 export PATH=$ORACLE_HOME/OPatch:$PATH
 
-# 1. Binaries — in this order
+# 1. Binaries, in this order
 opatch rollback -id 29213893 -silent
 opatch rollback -id 35074478 -silent
 
@@ -340,8 +340,8 @@ SQL
 
 `opatch rollback` removes the binaries; `datapatch` removes the matching SQL
 registry entry. Skipping datapatch leaves `dba_registry_sqlpatch` claiming a
-patch that is no longer in the home — the mirror image of the "patched binaries,
-unpatched dictionary" state
+patch that is no longer in the home. That is the mirror image of the "patched
+binaries, unpatched dictionary" state
 [Part 3 §13](phase-7a-part3-verification.md#13-datapatch-the-step-people-forget)
 exists to prevent.
 
@@ -359,7 +359,7 @@ Patch 29213893 rollback: SUCCESS
 > **`-silent` is not optional here.** Interactively, `35074478` prompts *"Please
 > shutdown Oracle instances running out of this ORACLE_HOME ... Is the local
 > system ready for patching? [y|n]"*. Without `-silent` it hangs forever, since
-> Ansible allocates no PTY — the same failure mode as `known-risks.md` #6.
+> Ansible allocates no PTY. Same failure mode as `known-risks.md` #6.
 
 ### 11.2 Verify — and accept two different correct outcomes
 
@@ -377,8 +377,8 @@ FROM   dba_registry_sqlpatch ORDER BY action_time;
 
 `35074478` touched `oracle.rdbms.rsf`/`oracle.rdbms`, not `dbscripts`, so it
 never had a SQL registry entry to remove. The role accepts either
-`ROLLBACK_<id>=SUCCESS` or `ROLLBACK_<id>=NO_ROW` and fails on anything else —
-demanding a `SUCCESS` row for a patch with no SQL payload would fail a correct
+`ROLLBACK_<id>=SUCCESS` or `ROLLBACK_<id>=NO_ROW` and fails on anything else.
+Demanding a `SUCCESS` row for a patch with no SQL payload would fail a correct
 rollback.
 
 ### 11.3 The post-rollback conflict re-check
@@ -392,13 +392,13 @@ apply time.
 one-offs alone: `35037877`, `34832725` and `34340632` are subsets that OPatch
 will deactivate on its own when the superset RU goes on.
 
-§12 then confirmed it explicitly rather than silently — see below.
+§12 then confirmed it explicitly rather than silently. See below.
 
 ---
 
 ## 12. Apply both patches
 
-**Plain `opatch apply -silent`, twice — Database RU first, then OJVM.** Not a
+**Plain `opatch apply -silent`, twice. Database RU first, then OJVM.** Not a
 choice between two mechanisms. Both READMEs say the same thing for a non-RAC
 home: shut down all instances and listeners, `cd` to the patch directory, run
 `opatch apply`.
@@ -410,21 +410,21 @@ home: shut down all instances and listeners, `cd` to the patch directory, run
 export ORACLE_HOME=/u01/app/oracle/product/19.3.0/db_1
 export PATH=$ORACLE_HOME/OPatch:/usr/bin:/bin:$PATH
 
-# make/ar/ld/nm must resolve — OJVM relinks (OJVM README §1.2)
+# make/ar/ld/nm must resolve, because OJVM relinks (OJVM README §1.2)
 which make ar ld nm
 
 # 1. Database Release Update
 cd /u01/app/oracle/staging/patches/39618649/39472050
 $ORACLE_HOME/OPatch/opatch apply -silent
 
-# 2. OJVM Release Update — only after step 1 succeeds
+# 2. OJVM Release Update, only after step 1 succeeds
 cd /u01/app/oracle/staging/patches/39618649/39222882
 $ORACLE_HOME/OPatch/opatch apply -silent
 ```
 
 **Order matters, and there is no datapatch between them.** One `datapatch` run in
 [Part 3 §13](phase-7a-part3-verification.md#13-datapatch-the-step-people-forget)
-covers both — that is the point of shipping them as a combo. Do not run datapatch
+covers both, which is the point of shipping them as a combo. Do not run datapatch
 after the DB RU and again after OJVM.
 
 `-silent` answers prompts with their defaults, which is right for patches the
@@ -444,7 +444,7 @@ That is the ZOP-47 assumption from
 confirmed in the tool's own words. Nothing had to be re-applied on top of the RU.
 
 > **If the OJVM apply fails on make target `jox_refresh_knlopt`**, that is Issue 1
-> in the OJVM README's Known Issues — check it there rather than treating it as a
+> in the OJVM README's Known Issues. Check it there rather than treating it as a
 > generic relink failure. It did not occur on this run; `which make ar ld nm` all
 > resolved.
 
@@ -457,9 +457,9 @@ $ORACLE_HOME/OPatch/opatch lspatches
 ![Ansible task "Show post-apply patch list": opatch lspatches returning 39222882;OJVM RELEASE UPDATE: 19.32.0.0.260721, 39472050;Database Release Update : 19.32.0.0.260721 and 29585399;OCW RELEASE UPDATE 19.3.0.0.0, then OPatch succeeded and the "Fail if the Database RU is not in the inventory" task](screenshots/12-post-apply-lspatches.png)
 
 Both IDs present. **A combo where only one half landed is worse than neither
-landing, because it is silent** — datapatch will happily report SUCCESS for the
-component that is actually there. The role fails on either ID being absent, not
-just the RU.
+landing, because it is silent.** Datapatch will report SUCCESS for the component
+that is actually there. The role fails on either ID being absent, not just the
+RU.
 
 > **The apply itself has no screenshot.** The two `opatch apply -silent` runs took
 > several minutes each and scrolled past; §12.2's inventory and
@@ -470,5 +470,5 @@ just the RU.
 
 ---
 
-Back to **[Part 1 — Before the window](phase-7a-part1-before-the-window.md)**.
-Continue to **[Part 3 — Datapatch, verification and aftermath](phase-7a-part3-verification.md)**.
+Back to **[Part 1: Before the window](phase-7a-part1-before-the-window.md)**.
+Continue to **[Part 3: Datapatch, verification and aftermath](phase-7a-part3-verification.md)**.

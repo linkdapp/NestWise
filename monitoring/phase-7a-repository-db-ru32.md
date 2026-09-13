@@ -106,9 +106,9 @@ Creating the blackout has its own page:
 - **[Phase 7b: Extending coverage](phase-7b-extending-coverage.md).** Agents onto
   the RAC clusters and the app tier, administration groups, monitoring templates,
   and Metric Extensions for APEX, ORDS and MongoDB. Complete.
-- **[Phase 7c: OMS 13.5 to 24ai](phase-7c-oms-upgrade.md).** This patch is a
-  prerequisite. Part 1 of that phase takes the OMS to RU33, Part 2 is the 24ai
-  upgrade.
+- **[Phase 7c: OMS 13.5 to 24ai](phase-7c-oms-upgrade.md).** This patch was a
+  prerequisite. 19.32.0.0.0 clears the 19.22 floor that 24ai requires. Part 1 took
+  the OMS to RU33 and Part 2 took it to 24ai Release 1 Update 12.
 - **Phase 7d.** Convert `oemcdb` from non-CDB to a CDB and create `oempdb` plus
   `ggpdb` for GoldenGate.
 

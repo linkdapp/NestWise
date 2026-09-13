@@ -2,20 +2,17 @@
 
 **SOP: suspend monitoring on one or more targets for a planned maintenance window**
 
-Status: 🟩 Confirmed. Used for real on 2026-09-03/04 to cover the
-[Phase 7a repository patch](phase-7a-repository-db-ru32.md), and written up here
-as a standalone procedure because every maintenance window in this project needs
-it: Phase 7b's agent rollout, Phase 7c's OMS upgrade, and any RAC patching on
-`oradbserv05/06` all start the same way.
+Status: 🟩 Confirmed. Used on 2026-09-03/04 for the
+[Phase 7a repository patch](phase-7a-repository-db-ru32.md), on 2026-09-06 for
+the plug-in undeploy in Phase 7c, and on 2026-09-12 for the 24ai upgrade window.
 
-**Why this is its own page rather than a step inside a runbook.** A blackout is
-created through the OMS, so it has to exist *before* the OMS goes down. That
-makes it the first thing in every window and the one step you cannot go back and
-do afterwards. Duplicating a nine-screenshot click-path into each runbook that
-needs it would guarantee the copies drift.
+A blackout is created through the OMS, so it has to exist before the OMS goes
+down. That makes it the first step in every window and the one step you cannot
+go back and do afterwards. It is a standalone page so that the click-path is
+maintained in one place.
 
-Screenshots referenced below are in [`screenshots/`](screenshots/) — same naming
-convention as [`../installation/README.md`](../installation/README.md#15-screenshot-checklist-and-naming-convention)'s
+Screenshots referenced below are in [`screenshots/`](screenshots/), the same
+naming convention as [`../installation/README.md`](../installation/README.md#15-screenshot-checklist-and-naming-convention)'s
 Section 15.
 
 ---
@@ -57,7 +54,7 @@ change what actually gets covered:
   agent you are about to stop will register as down.
 - **Related targets** are pulled in automatically. Selecting a host selects the
   targets on that host; selecting a composite target selects its members. The
-  form tells you the counts before you submit — on the real run, three selected
+  form tells you the counts before you submit. On the real run, three selected
   hosts brought 70 targets on hosts and 2 dependent targets with them.
 
 A blackout left running after the window is a monitoring gap that looks exactly
@@ -67,8 +64,8 @@ like a healthy system. §6 is not optional.
 
 ## 2. The console click-path
 
-**Who:** a user with at least the **Blackout Target** privilege on each target —
-`SYSMAN` here
+**Who:** a user with at least the **Blackout Target** privilege on each target.
+`SYSMAN` here.
 **Where:** `https://oemserver01.usat.com:7803/em`
 
 ### 2.1 Enterprise → Monitoring → Blackouts
@@ -94,9 +91,9 @@ Per §1: **Blackout**.
 
 | Field | What to put, and why |
 |---|---|
-| **Name** | EM pre-fills a timestamped name like `Blackout-Sep 3 2026 8:40:08 PM`. Accept it or type your own — but **write down whatever it ends up as**, because stopping the blackout later needs the exact name. |
+| **Name** | EM pre-fills a timestamped name like `Blackout-Sep 3 2026 8:40:08 PM`. Accept it or type your own, but **write down whatever it ends up as**, because stopping the blackout later needs the exact name. |
 | **Reason** | Pick from the dropdown; `DB: Database Patch/Maintenance` is the right one for a patch window. This is what makes the outage auditable as planned. |
-| **Comments** | Free text — worth naming the actual change (`Database patch application 19c DB RU32`) so the record means something in six months. |
+| **Comments** | Free text. Name the actual change (`Database patch application 19c DB RU32`) so the record means something in six months. |
 | **Run jobs during the blackout** | Leave ticked unless you have a reason not to. Note EM's own caveat: jobs that are not Agent-bound run regardless of this setting. |
 | **Enable Full blackout on all hosts** | **Tick it.** This is what puts the Agent itself under blackout, which matters here because the window stops the agent. |
 
@@ -105,13 +102,13 @@ Per §1: **Blackout**.
 `Add` opens a target search. Set **Target Type** to `Host`, search, and
 multi-select.
 
-![Select Targets dialog, Target Type Host, three rows returned — oemserver01, oradbserv01 and orappsserv01 — all selected, Rows Selected 3, Mode Multi-Select](screenshots/blackout-05-select-targets-hosts.png)
+![Select Targets dialog, Target Type Host, three rows returned (oemserver01, oradbserv01 and orappsserv01), all selected, Rows Selected 3, Mode Multi-Select](screenshots/blackout-05-select-targets-hosts.png)
 
 Selecting at **host** level rather than picking individual databases is the
 right granularity for a patch window: it covers everything on the box without
 requiring you to enumerate it correctly under time pressure.
 
-Note the status arrows in that dialog — `oradbserv01` and `orappsserv01` are
+Note the status arrows in that dialog. `oradbserv01` and `orappsserv01` are
 already down. Blacking out a target whose agent is unreachable is allowed; EM
 schedules the blackout and starts it if the agent comes up before the window
 ends. §2.8 shows what that looks like afterwards.
@@ -126,13 +123,13 @@ it is the number to sanity-check against what you expect to be taking down.
 
 | Schedule field | Setting used |
 |---|---|
-| **Start** | `Immediately` — the window is starting now. `Later` takes a date/time in the displayed timezone. |
+| **Start** | `Immediately`, because the window is starting now. `Later` takes a date and time in the displayed timezone. |
 | **Repeat** | `Do not repeat` |
-| **Duration** | `For 1 hours` — see the warning below |
+| **Duration** | `For 1 hours`. See the warning below |
 
 > **Size the duration for the window you might have, not the one you hope for.**
 > The Phase 7a window was created with a 1-hour duration and the patch ran from
-> 06:40 to 07:26 — comfortable, but a blackout that expires mid-patch starts
+> 06:40 to 07:26, which was comfortable. A blackout that expires mid-patch starts
 > raising incidents against a database that is deliberately down, which is the
 > exact noise the blackout existed to prevent. `Indefinitely` plus a disciplined
 > §6 is a defensible choice for a long window; an under-sized fixed duration is
@@ -143,7 +140,7 @@ it is the number to sanity-check against what you expect to be taking down.
 
 ### 2.7 Review, then Submit
 
-![Create Blackout page fully populated — Name "Blackout-Sep 3 2026 8:40:08 PM", Reason DB: Database Patch/Maintenance, Comments "Database patch application 19c DB RU32", three host targets, Submit button top right](screenshots/blackout-07-review-before-submit.png)
+![Create Blackout page fully populated, with Name "Blackout-Sep 3 2026 8:40:08 PM", Reason DB: Database Patch/Maintenance, Comments "Database patch application 19c DB RU32", three host targets, and the Submit button top right](screenshots/blackout-07-review-before-submit.png)
 
 ### 2.8 Confirmation
 
@@ -154,11 +151,11 @@ show the row.
 
 Drilling into it shows the per-target picture, which is the part worth reading:
 
-![Blackout detail page headed "(Start Partial)" — Selected Targets Total-5, Started-3, Scheduled-2; oemserver01 and its OMS Platform and OMS Console targets Started, oradbserv01 and orappsserv01 Scheduled with the message "Currently unable to reach agent. Will automatically start blackout if the agent is Up before the blackout ends or stops." Related Targets Total-68, Started-38, Scheduled-30](screenshots/blackout-09-target-blackout-status.png)
+![Blackout detail page headed "(Start Partial)", showing Selected Targets Total-5, Started-3, Scheduled-2. oemserver01 and its OMS Platform and OMS Console targets are Started. oradbserv01 and orappsserv01 are Scheduled with the message "Currently unable to reach agent. Will automatically start blackout if the agent is Up before the blackout ends or stops." Related Targets Total-68, Started-38, Scheduled-30](screenshots/blackout-09-target-blackout-status.png)
 
 **`Start Partial` is not a failure.** It means some targets went into blackout
 and some are waiting on an unreachable agent. For a Phase 7a-style window the
-question is only whether the host you are about to patch is `Started` —
+question is only whether the host you are about to patch is `Started`.
 `oemserver01.usat.com` is, along with its OMS Platform and OMS Console targets.
 The two down hosts will join if their agents come back before the blackout ends.
 
@@ -198,7 +195,7 @@ emctl start blackout ru32_patch_window -nodeLevel
 emctl status blackout
 ```
 
-`-nodeLevel` covers every target on the host — the agent-side equivalent of
+`-nodeLevel` covers every target on the host. It is the agent-side equivalent of
 ticking Full blackout in §2.4.
 
 > **This is the AGENT `emctl`, sourced from `agent_env`.** The OMS `emctl` has no
@@ -261,8 +258,8 @@ emcli stop_blackout -name="Blackout-Sep 3 2026 8:40:08 PM"
 From the console: **Enterprise → Monitoring → Blackouts**, switch **View By** to
 `Blackout Name`, select the row, click **Stop**.
 
-Clear it **after** the window's verification checklist passes, not before — the
-verification itself is what tells you whether monitoring should be trusted again.
+Clear it **after** the window's verification checklist passes, not before. The
+verification is what tells you whether monitoring should be trusted again.
 
 ---
 
@@ -270,7 +267,7 @@ verification itself is what tells you whether monitoring should be trusted again
 
 The Phase 7a Ansible role neither creates nor clears the blackout. It pauses,
 prints the instructions above, waits for you to press Enter, and then verifies
-independently via the agent's `emctl` — refusing to shut anything down if no
+independently via the agent's `emctl`, refusing to shut anything down if no
 active blackout is visible.
 
 Three reasons, in descending order of importance:
@@ -309,7 +306,7 @@ screenshots/
 ```
 
 Captured against EM Cloud Control 13.5 on 2026-09-01/03. The `emcli` and
-agent-side `emctl` paths in §3 and §4 have no screenshots — their output is
+agent-side `emctl` paths in §3 and §4 have no screenshots. Their output is
 reproduced as text in §5, and in
 [Phase 7a Part 2 §7](phase-7a-part2-the-patch-window.md#7-the-blackout-pause).
 
@@ -317,6 +314,7 @@ reproduced as text in §5, and in
 
 ## Where this is used
 
-- [Phase 7a Part 2, Section 7 — the blackout pause](phase-7a-part2-the-patch-window.md#7-the-blackout-pause)
-- Phase 7b — OMS 13.5 → 24ai (planned)
-- Phase 7c, the OMS 13.5 to 24ai upgrade (planned)
+- [Phase 7a Part 2 §7, the blackout pause](phase-7a-part2-the-patch-window.md#7-the-blackout-pause), the repository database patch window
+- [Phase 7c Part 2a §2.2](phase-7c-part2a-pre-deployment.md#22-undeploy-obsolete-plug-ins), before the plug-in undeploy restarts the OMS
+- [Phase 7c Part 2b §1.1](phase-7c-part2b-deployment.md#11-create-the-blackout), the 24ai upgrade window
+- Any future agent update that restarts a live agent

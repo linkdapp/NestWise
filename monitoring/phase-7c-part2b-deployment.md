@@ -474,6 +474,12 @@ emcli get_targets | wc -l
 
 Compare against the 203 recorded in §1.2.
 
+**Compare like with like.** `emcli get_targets | wc -l` and the console's
+**Targets with Status** tile do not count the same thing. The `emcli` line count
+includes composite and group targets and a header row. The console tile counts
+monitored targets currently reporting a status. Use the same command either side
+of the window.
+
 The upgrade ends here. Continue with
 [Part 2c: Post-deployment](phase-7c-part2c-post-deployment.md).
 
