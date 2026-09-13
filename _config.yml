@@ -18,8 +18,14 @@ description: Oracle DBA POC and learning resources
 titles_from_headings:
   strip_title: true
 
-# The home page is README.md itself, carrying `layout: home`, `title: NestWise`
-# and `permalink: /` in its own front matter.
+# The home page is README.md itself, carrying `layout: home` and `permalink: /`
+# in its own front matter.
+#
+# It deliberately carries no `title:`. minima's home layout prints page.title as
+# an h1 above the content, so an explicit title rendered "NestWise" directly above
+# the README's own H1, twice over. With no title declared, titles_from_headings
+# derives one from the H1 and strip_title above removes it from the body, which is
+# how every other page here already behaves.
 #
 # HISTORY, because deleting the wrong file here takes the site down. In August
 # 2026 this site returned "404 File not found ... For root URLs you must provide
