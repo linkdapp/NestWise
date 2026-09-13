@@ -269,7 +269,7 @@ Not one check. A patched database that OMS cannot use is not a successful patch.
 
 | # | Check | Command | Expected | Result |
 |---|---|---|---|---|
-| 0 | AHF compliance, post-patch | `ahf analysis create --type compliance` | diffable against the Part 1 §5.6 baseline | ⬜ outstanding |
+| 0 | AHF compliance, post-patch | `orachk -a` | diffable against the Part 1 §5.6 baseline | ⬜ outstanding |
 | 1 | Binary patches present | `opatch lspatches` | **both** `39472050` and `39222882` | 🟩 both, plus OCW |
 | 2 | Dictionary patched | `SELECT * FROM dba_registry_sqlpatch` | **both** IDs, `APPLY`, `SUCCESS` | 🟩 07:14:28 and 07:10:04 |
 | 3 | Version | `SELECT banner_full FROM v$version` | `19.32.0.0.0` | 🟩 |

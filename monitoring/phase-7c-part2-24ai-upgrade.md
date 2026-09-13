@@ -156,11 +156,27 @@ and moved in [Part 2c](phase-7c-part2c-post-deployment.md).
 - My Oracle Support **KB313420** and **2812403.1**, the 13.5 `-bitonly`
   equivalent and its `OMSPatcher failed: null` known issue
 - My Oracle Support **2543058.1**, emkey copy failure
+- My Oracle Support **2166275.1**, gold agent image creation failing with
+  *"Suspended: Agent is not Ready"*
+- [Compliance Checking with Oracle Orachk and Oracle Exachk, AHF User's Guide](https://docs.oracle.com/en/engineered-systems/health-diagnostics/autonomous-health-framework/ahfug/compliance-checking-with-orchk-or-exachk.html)
+  and [Running Generic Compliance Framework Commands](https://docs.oracle.com/en/engineered-systems/health-diagnostics/autonomous-health-framework/ahfug/generic-compliance-framework-commands.html),
+  the source for Part 2c §10.1: compliance runs through `orachk`, `exachk` or
+  `ahfctl compliance`, and `-a` runs all checks
 - My Oracle Support **1611578.1**, **2179909.1**, key strength and MD5 agents
 - [Prerequisites for Upgrading to Enterprise Manager 24ai Release 1](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/24.1/emupg/prerequisites-upgrading-enterprise-manager-24.html)
 - [Oracle Enterprise Manager Upgrade Guide 24ai Release 1](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/24.1/emupg/enterprise-manager-upgrade-guide.pdf)
 - [Overview of the EM Prerequisite Kit, Basic Installation Guide 24ai](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/24.1/embsc/overview-em-prerequisite-kit.html)
 - [EMCTL Security Commands, Cloud Control Administrator's Guide 13.5](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/13.5/emadm/emctl-security-commands.html)
+- [Upgrading Oracle Management Agents, Upgrade Guide 24ai](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/24.1/emupg/upgrading-oracle-management-agents.html),
+  the source for Part 2c §5: the gold image recommendation, the 24ai standalone
+  source requirement, and the console bootstrap
+- [Managing the Lifecycle of Agent Gold Images, Advanced Installation Guide 24ai](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/24.1/emadv/managing-lifecycle-agent-gold-images.html),
+  what a gold image can update, who cannot subscribe, and the base directory layout
+  after an image update
+- [`update_agents`, EM CLI Verb Reference](https://docs.oracle.com/en/enterprise-manager/cloud-control/enterprise-manager-cloud-control/13.4/emcli/update_agents.html),
+  the source for Part 2c §5.7: `-gold_image_name` and `-agents` are mandatory,
+  `-validate_only` submits no job, and the image is pushed by default when it has
+  not been staged
 
 ### Field reports consulted
 

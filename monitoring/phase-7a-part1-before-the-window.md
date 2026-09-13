@@ -381,11 +381,16 @@ Standing practice for this project: an AHF compliance check immediately before
 staging a patch and again after it completes. Two reports, before and after, are
 far stronger evidence than "the patch applied cleanly."
 
+Compliance runs through the compliance framework, not through `ahf analysis`.
+`orachk` is the tool for non-engineered systems, which is what this estate is.
+
 ```bash
-ahf analysis create --type compliance
-# or, depending on the AHF version installed:
-tfactl orachk -profile dba
+orachk -a
 ```
+
+`-a` runs all checks, including the best practice checks and the recommended patch
+check. `ahfctl compliance -a` wraps the same framework and takes the same options.
+To run a narrower set, use `-profile`, for example `orachk -profile dba`.
 
 Keep the report path. It pairs with the post-patch run in
 [Part 3 §16](phase-7a-part3-verification.md#16-verification-checklist).

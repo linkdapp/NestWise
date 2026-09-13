@@ -246,8 +246,8 @@ after that.
 
 ## AHF baseline around every patch application
 
-Per the project's standing tooling, run an **AHF compliance check** (`ahf runcheck` /
-the `orachk` component AHF now includes) immediately before staging the patch and again
+Per the project's standing tooling, run an **AHF compliance check** (`orachk -a`, the
+compliance component AHF now includes) immediately before staging the patch and again
 immediately after configuration completes. Two compliance reports, before and after, are
 the evidence for the showcase post — "the patch applied cleanly" is a much weaker claim
 than a diffed compliance report showing it.
