@@ -1,6 +1,7 @@
 ---
 layout: home
 title: NestWise
+permalink: /
 ---
 
 # NestWise: A real application running on a real Oracle high-availability platform

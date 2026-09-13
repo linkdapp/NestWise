@@ -18,6 +18,47 @@ description: Oracle DBA POC and learning resources
 titles_from_headings:
   strip_title: true
 
+# The home page is README.md itself, carrying `layout: home`, `title: NestWise`
+# and `permalink: /` in its own front matter.
+#
+# HISTORY, because deleting the wrong file here takes the site down. In August
+# 2026 this site returned "404 File not found ... For root URLs you must provide
+# an index.html file." Cause: README.md carried `title: ""` front matter, and
+# jekyll-readme-index skips any README that already has front matter, so nothing
+# was ever written to /index.html. Two fixes were on the table. A separate
+# index.md holding an include_relative call, which is what was used, and
+# `permalink: /` on README's own front matter, which is what is used now. Both
+# produce /index.html. `baseurl` below was the other half of that fix and is not
+# optional for a project site.
+#
+# index.md was replaced because include_relative broke every link on the home
+# page, for three weeks, before anyone clicked one.
+#
+# GitHub Pages runs jekyll-relative-links, which rewrites a relative `.md` link
+# into the URL Jekyll actually publishes: `part1-active-data-guard.md` becomes
+# `part1-active-data-guard.html`, and `installation/README.md` becomes
+# `installation/`. That rewrite runs against a page's own content, in the
+# pre_render hook. The content of index.md was the include tag and nothing else,
+# so there was never a link in it to rewrite; README's body arrived later, during
+# Liquid rendering. Every link on the home page kept its `.md` target and served
+# the raw markdown source. Pages reached from the top nav looked right because
+# they are real pages and did get rewritten.
+#
+# Confirmed on the live site before this change: swapping one link by hand made
+# it render, while the identical old-form link to the same destination, on the
+# same page, stayed raw. Two other content-phase plugins show the same
+# fingerprint, titles_from_headings never stripped README's H1 on the home page
+# while stripping it everywhere else.
+#
+# Do not reintroduce index.md. A page whose links must work has to be a page in
+# its own right, not a fragment included into one.
+#
+# The explicit `permalink: /` is required. jekyll-readme-index is what maps a
+# README to its directory URL, and it skips a README that already has front
+# matter. That is why nestwise-app/ and backup-recovery/ publish as
+# `README.html` while installation/ and high-availability/ publish as
+# directories. Front matter here without a permalink would publish the home page
+# at /README.html and leave the site root empty.
 url: "https://linkdapp.github.io"
 baseurl: "/NestWise"
 
