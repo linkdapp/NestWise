@@ -7,17 +7,21 @@ The phase index for Enterprise Manager is
 agent to 24ai Release 1 Update 12 and left the repository a non-CDB, which 24ai
 supports. This phase changes that.
 
-This page is filed under `monitoring/` because the database being converted is the
-Enterprise Manager repository and half the procedure is Enterprise Manager
-configuration. It is also this repository's only CDB and PDB work, and is indexed as
-such from [`multitenant/`](../multitenant/README.md).
+> ### Also filed under Multitenant
+>
+> This is the only CDB and PDB work in the repository. It is indexed by skill area
+> from **[Multitenant: CDB and PDB administration across this estate](../multitenant/README.md)**.
+>
+> The pages live here rather than there because the database being converted is the
+> Enterprise Manager repository, and half the procedure is Enterprise Manager
+> configuration.
 
-Status: ⬜ **Planned.** Written from the documentation; nothing here has run against
-the lab yet.
+Status: 🟨 **In progress.** [Part 1](phase-7d-part1-pre-deployment.md) §1 to §5 have
+been run against the lab. The window has not opened.
 
 | Part | Covers | Downtime | Status |
 |---|---|---|---|
-| [Part 1: Pre-deployment](phase-7d-part1-pre-deployment.md) | Record the source state, clear the seven compatibility gates, size the target, build `usatcdb` and `ggpdb`, back up | **None** | ⬜ |
+| [Part 1: Pre-deployment](phase-7d-part1-pre-deployment.md) | Record the source state, clear the seven compatibility gates, size the target, build `usatcdb` and `ggpdb`, prove the service name descriptor | **None** | 🟨 |
 | [Part 2: Deployment](phase-7d-part2-deployment.md) | Stop the stack, describe the non-CDB, plug it in as `oempdb`, run `noncdb_to_pdb.sql`, repoint the OMS | **The window** | ⬜ |
 | [Part 3: Post-deployment](phase-7d-part3-post-deployment.md) | Repoint the repository target, close the dormant Ansible branch, verify, retire the old non-CDB | None | ⬜ |
 

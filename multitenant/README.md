@@ -6,14 +6,22 @@ Multitenant is one of the areas the Oracle Certified Master 19c practical bluepr
 centres on, alongside database and network configuration, tablespace and undo
 management, backup and recovery, and performance tuning.
 
-Status: 🟨 In progress. One build, filed with the phase it belongs to. Phase 7d's
-container exists; the plug-in window has not opened.
+Status: 🟨 In progress. One build, filed with the phase it belongs to.
 
-| Topic | Covers | Where | Status |
-|---|---|---|---|
-| **Moving a non-CDB into a container** | A 19.32 non-CDB plugged into a new container as a PDB using `DBMS_PDB.DESCRIBE`, `CHECK_PLUG_COMPATIBILITY`, `CREATE PLUGGABLE DATABASE ... USING` and `noncdb_to_pdb.sql`, plus the Enterprise Manager side of moving a live repository | [`monitoring/phase-7d-noncdb-to-pdb.md`](../monitoring/phase-7d-noncdb-to-pdb.md) | 🟨 In progress |
-| Creating and managing PDBs | `ggpdb` created from `PDB$SEED`, `SAVE STATE`, service registration | [Phase 7d Part 1 §5](../monitoring/phase-7d-part1-pre-deployment.md#5-create-ggpdb) | 🟨 In progress |
-| Patching a container | `datapatch` across `CDB$ROOT` and every PDB, rather than the single-database path | [Phase 7d Part 3 §4](../monitoring/phase-7d-part3-post-deployment.md#4-close-the-dormant-ansible-branch) | ⬜ Planned |
+> ### The build
+>
+> **[Phase 7d: Moving the Enterprise Manager repository into a container database](../monitoring/phase-7d-noncdb-to-pdb.md)**
+>
+> `oemcdb`, a 19.32 non-CDB, plugged into a new container `usatcdb` as `oempdb`, with
+> `ggpdb` created alongside it. The container exists; the plug-in window has not
+> opened.
+
+| Topic | Covers | Where |
+|---|---|---|
+| **Moving a non-CDB into a container** | `DBMS_PDB.DESCRIBE`, `CHECK_PLUG_COMPATIBILITY`, `CREATE PLUGGABLE DATABASE ... USING ... COPY` and `noncdb_to_pdb.sql`, plus the Enterprise Manager side of moving a live repository | [Phase 7d index](../monitoring/phase-7d-noncdb-to-pdb.md) |
+| Building a container to receive a PDB | Template capture, the component set, character sets, and the memory model a stock template drops | [Part 1 §4](../monitoring/phase-7d-part1-pre-deployment.md#4-create-usatcdb) |
+| Creating and managing PDBs | `ggpdb` created from `PDB$SEED`, `FILE_NAME_CONVERT`, `SAVE STATE`, service registration | [Part 1 §5](../monitoring/phase-7d-part1-pre-deployment.md#5-create-ggpdb) |
+| Patching a container | `datapatch` across `CDB$ROOT` and every PDB, rather than the single-database path | [Part 3 §4](../monitoring/phase-7d-part3-post-deployment.md#4-close-the-dormant-ansible-branch) |
 
 ---
 
