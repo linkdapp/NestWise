@@ -6,6 +6,8 @@ Part 1 of three. The index is
 [`phase-7d-noncdb-to-pdb.md`](phase-7d-noncdb-to-pdb.md).
 [Part 2](phase-7d-part2-deployment.md) runs the window.
 [Part 3](phase-7d-part3-post-deployment.md) follows it.
+Also indexed by skill area under
+[Multitenant](../multitenant/README.md).
 
 Status: 🟨 **In progress.** Sections 1 to 5 have been run. The container was rebuilt
 once, for the reason in [Appendix A](#8-appendix-a-the-template-does-not-carry-automatic-shared-memory-management).

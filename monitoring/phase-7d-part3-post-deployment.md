@@ -5,6 +5,8 @@
 Part 3 of three. [Part 1](phase-7d-part1-pre-deployment.md) built the container.
 [Part 2](phase-7d-part2-deployment.md) ran the window. The index is
 [`phase-7d-noncdb-to-pdb.md`](phase-7d-noncdb-to-pdb.md).
+Also indexed by skill area under
+[Multitenant](../multitenant/README.md).
 
 Status: ⬜ Planned.
 

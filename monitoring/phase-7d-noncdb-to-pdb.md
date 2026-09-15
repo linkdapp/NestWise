@@ -58,7 +58,7 @@ Plug as PDB requires the source and target to share endianness, release and patc
 level. Both sides are the same host and the same Oracle home, so all three hold by
 construction. Data Pump's strengths are cross-platform and cross-version moves and
 neither applies. AutoUpgrade's upgrade half would do nothing at a fixed 19.32, and
-[Phase 9](../02-roadmap-skeleton.md) already gives AutoUpgrade its own window against
+Phase 9 already gives AutoUpgrade its own window against
 19c to 26ai.
 
 ---
@@ -188,9 +188,7 @@ these pages ever move.
 Files are named `7dN-NN-slug.png`, where `N` is the part number. Each part carries its
 own checklist.
 
-## Apendix:
-
-## What this closes
+## Appendix: what this closes
 
 Two places in this repository already carry a dormant branch waiting for this phase.
 Part 3 closes both.

@@ -6,6 +6,8 @@ Part 2 of three. [Part 1](phase-7d-part1-pre-deployment.md) built `usatcdb` and
 `ggpdb` beside the running repository. The index is
 [`phase-7d-noncdb-to-pdb.md`](phase-7d-noncdb-to-pdb.md).
 [Part 3](phase-7d-part3-post-deployment.md) follows.
+Also indexed by skill area under
+[Multitenant](../multitenant/README.md).
 
 Status: ⬜ Planned.
 
