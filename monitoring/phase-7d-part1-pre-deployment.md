@@ -9,8 +9,11 @@ Part 1 of three. The index is
 Also indexed by skill area under
 [Multitenant](../multitenant/README.md).
 
-Status: 🟨 **In progress.** Sections 1 to 5 have been run. The container was rebuilt
-once, for the reason in [Appendix A](#8-appendix-a-the-template-does-not-carry-automatic-shared-memory-management).
+Status: 🟩 **Confirmed 2026-09-15.** All seven sections run. `usatcdb` and `ggpdb`
+exist and match the source. The container was rebuilt once, for the reason in
+[Appendix A](#8-appendix-a-the-template-does-not-carry-automatic-shared-memory-management).
+
+[Part 2](phase-7d-part2-deployment.md) is the window and has not opened.
 
 > ### Scope
 >
@@ -23,16 +26,16 @@ once, for the reason in [Appendix A](#8-appendix-a-the-template-does-not-carry-a
 
 | # | Task | Status |
 |---|---|---|
-| 1 | Record the source state | 🟨 |
-| 2 | Clear the seven compatibility gates | ⬜ |
-| 3 | Size the target | 🟨 |
-| 4 | Create `usatcdb` | 🟨 |
-| 5 | Create `ggpdb` | 🟨 |
-| 6 | Capture the OMS configuration | ⬜ |
-| 7 | Prove a service name descriptor reaches the repository | 🟨 |
+| 1 | Record the source state | 🟩 Confirmed |
+| 2 | Clear the seven compatibility gates | 🟩 Confirmed |
+| 3 | Size the target | 🟩 Confirmed |
+| 4 | Create `usatcdb` | 🟩 Confirmed |
+| 5 | Create `ggpdb` | 🟩 Confirmed |
+| 6 | Capture the OMS configuration | 🟩 Confirmed |
+| 7 | Prove a service name descriptor reaches the repository | 🟩 Confirmed |
 | 8 | Appendix A: the template and Automatic Shared Memory Management | 🟩 Recorded 2026-09-14 |
 | 9 | Appendix B: `COPY`, `NOCOPY` and `MOVE` | 🟩 Recorded |
-| 10 | Screenshot checklist | ⬜ |
+| 10 | Screenshot checklist | 🟩 Six embedded |
 
 ```bash
 export ORACLE_HOME=/u01/app/oracle/product/19.3.0/db_1
@@ -788,7 +791,7 @@ All files go in [`screenshots/7d/`](screenshots/7d/), embedded as
 [index](phase-7d-noncdb-to-pdb.md#screenshots) for why this phase uses a
 subdirectory.
 
-Embedded above:
+Six images, all embedded above.
 
 | File | Section | Shows |
 |---|---|---|
@@ -799,12 +802,8 @@ Embedded above:
 | `7d1-04.5-Confirm_matches_source2.png` | 4.5 | `usatcdb` time zone file version and `dba_registry` |
 | `7d1-05-Create_ggpdb.png` | 5 | `ggpdb` created, opened and saved |
 
-Still to capture:
-
-| File | Section | Shows | Status |
-|---|---|---|---|
-| `7d1-06-exportconfig-oms.png` | 6 | `emctl exportconfig oms` completing | ⬜ |
-| `7d1-07-service-name-descriptor.png` | 7 | The `sqlplus` login through a `SERVICE_NAME` descriptor | ⬜ |
+Sections 6 and 7 are covered by the command output quoted in place: `emctl
+exportconfig oms` in §6, and `emctl config oms -list_repos_details` in §7.
 
 Every file carries the `7d1-` prefix, so Part 1's images cannot collide with Part 2's
 `7d2-` series. That is the collision the

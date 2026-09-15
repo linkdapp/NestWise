@@ -16,12 +16,13 @@ supports. This phase changes that.
 > Enterprise Manager repository, and half the procedure is Enterprise Manager
 > configuration.
 
-Status: 🟨 **In progress.** [Part 1](phase-7d-part1-pre-deployment.md) §1 to §5 have
-been run against the lab. The window has not opened.
+Status: 🟨 **In progress.** [Part 1](phase-7d-part1-pre-deployment.md) is complete:
+`usatcdb` and `ggpdb` are built and verified against the source. The window has not
+opened.
 
 | Part | Covers | Downtime | Status |
 |---|---|---|---|
-| [Part 1: Pre-deployment](phase-7d-part1-pre-deployment.md) | Record the source state, clear the seven compatibility gates, size the target, build `usatcdb` and `ggpdb`, prove the service name descriptor | **None** | 🟨 |
+| [Part 1: Pre-deployment](phase-7d-part1-pre-deployment.md) | Record the source state, clear the seven compatibility gates, size the target, build `usatcdb` and `ggpdb`, prove the service name descriptor | **None** | 🟩 Confirmed 2026-09-15 |
 | [Part 2: Deployment](phase-7d-part2-deployment.md) | Stop the stack, describe the non-CDB, plug it in as `oempdb`, run `noncdb_to_pdb.sql`, repoint the OMS | **The window** | ⬜ |
 | [Part 3: Post-deployment](phase-7d-part3-post-deployment.md) | Repoint the repository target, close the dormant Ansible branch, verify, retire the old non-CDB | None | ⬜ |
 

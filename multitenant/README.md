@@ -13,8 +13,8 @@ Status: 🟨 In progress. One build, filed with the phase it belongs to.
 > **[Phase 7d: Moving the Enterprise Manager repository into a container database](../monitoring/phase-7d-noncdb-to-pdb.md)**
 >
 > `oemcdb`, a 19.32 non-CDB, plugged into a new container `usatcdb` as `oempdb`, with
-> `ggpdb` created alongside it. The container exists; the plug-in window has not
-> opened.
+> `ggpdb` created alongside it. Pre-deployment is complete: the container and `ggpdb`
+> are built and verified against the source. The plug-in window has not opened.
 
 | Topic | Covers | Where |
 |---|---|---|
