@@ -27,7 +27,7 @@ exist and match the source. The container was rebuilt once, for the reason in
 | # | Task | Status |
 |---|---|---|
 | 1 | Record the source state | 🟩 Confirmed |
-| 2 | Clear the seven compatibility gates | 🟩 Confirmed |
+| 2 | Clear the eight compatibility gates | 🟩 Confirmed |
 | 3 | Size the target | 🟩 Confirmed |
 | 4 | Create `usatcdb` | 🟩 Confirmed |
 | 5 | Create `ggpdb` | 🟩 Confirmed |
@@ -239,25 +239,86 @@ The key lives in the OMS home, not in the repository, so it does not travel with
 data and needs no action here. Confirm rather than assume, because a key sitting in
 the repository would move with the schema and change what Part 2 has to do.
 
+### 1.9 Tables dependent on Oracle-maintained types
+
+`noncdb_to_pdb.sql` refuses to run while the database holds unconverted data in
+columns of evolved Oracle-maintained types. Advanced Queuing payload columns are the
+usual case.
+
+```sql
+SELECT u.name AS owner, o.name AS table_name, c.name AS column_name
+FROM   sys.obj$ o, sys.col$ c, sys.coltype$ t, sys.user$ u
+WHERE  BITAND(t.flags, 256) = 256
+AND    o.obj#  = t.obj#
+AND    c.obj#  = t.obj#
+AND    c.col#  = t.col#
+AND    t.intcol# = c.intcol#
+AND    o.owner# = u.user#
+AND    o.owner# NOT IN
+       (SELECT user# FROM sys.user$
+        WHERE  type# = 1 AND BITAND(spare1, 256) = 256)
+AND    t.obj# IN
+       (SELECT DISTINCT d_obj#
+        FROM   sys.dependency$
+        START WITH p_obj# IN
+               (SELECT obj# FROM sys.obj$
+                WHERE  type# = 13 AND BITAND(flags, 4194304) = 4194304)
+        CONNECT BY PRIOR d_obj# = p_obj#)
+ORDER  BY 1, 2, 3;
+```
+
+No rows is the expected result. Rows mean the conversion has to run before §6 of
+Part 2 will proceed:
+
+```sql
+@?/rdbms/admin/utluptabdata.sql
+```
+
+Running it here, on `oemcdb`, keeps the work out of the window, and issues
+`ALTER TABLE ... UPGRADE` against live tables with the OMS up. Running it inside the
+PDB instead, after Part 2 §5, is uncontended but extends the window. Size the tables
+before choosing:
+
+```sql
+SELECT owner, segment_name, bytes/1024/1024 mb
+FROM   dba_segments
+WHERE  (owner, segment_name) IN (<the rows returned above>);
+```
+
+The query is held as [`sql/uptab_check.sql`](sql/uptab_check.sql), which also runs under
+`catcon.pl` across every container of a CDB. See
+[Part 2 Appendix A](phase-7d-part2-deployment.md#appendix-a-checking-every-container).
+
+Measured on this estate: two rows, both Advanced Queuing payload columns. Recorded in
+[Part 2 §6.1](phase-7d-part2-deployment.md#61-before-executing-noncdb_to_pdbsql-need-to-check-the-ora-01722-means-unconverted-type-data).
+
+`BITAND(t.flags, 256) = 256` is `UPGRADED = NO`; `type# = 13` with
+`BITAND(flags, 4194304)` selects Oracle-maintained types. Both come from the check
+inside `noncdb_to_pdb.sql`.
+
 ---
 
 ## 2. Clear the compatibility gates
 
-Seven gates, listed on the [index](phase-7d-noncdb-to-pdb.md#gates). Gates 1 to 5 and
-7 are answered by §1. Gate 6 is §3.
+Eight gates, listed on the [index](phase-7d-noncdb-to-pdb.md#gates).
 
-| # | Gate | Answered by |
-|---|---|---|
-| 1 | Release and patch level identical | §1.1, and by building `usatcdb` from the same Oracle home |
-| 2 | Character set and national character set match | §1.2 and §4.2 |
-| 3 | `COMPATIBLE` matches | §1.1 and §4.2 |
-| 4 | Time zone file version matches | §1.3 |
-| 5 | Components present | §1.4, then `DBMS_PDB.CHECK_PLUG_COMPATIBILITY` in [Part 2 §4](phase-7d-part2-deployment.md#4-check-plug-compatibility) |
-| 6 | Disk for a second copy of the datafiles | §3 |
-| 7 | No encrypted tablespaces | §1.6 |
+| # | Gate | Answered by | Enforced by |
+|---|---|---|---|
+| 1 | Release and patch level identical | §1.1, and by building `usatcdb` from the same Oracle home | `CHECK_PLUG_COMPATIBILITY` |
+| 2 | Character set and national character set match | §1.2 and §4.2 | `CHECK_PLUG_COMPATIBILITY` |
+| 3 | `COMPATIBLE` matches | §1.1 and §4.2 | `CHECK_PLUG_COMPATIBILITY` |
+| 4 | Time zone file version matches | §1.3 | `CHECK_PLUG_COMPATIBILITY` |
+| 5 | Components present | §1.4, then [Part 2 §4](phase-7d-part2-deployment.md#4-check-plug-compatibility) | `CHECK_PLUG_COMPATIBILITY` |
+| 6 | Disk for a second copy of the datafiles | §3 | Nothing. `CREATE PLUGGABLE DATABASE` fails on a full filesystem |
+| 7 | No encrypted tablespaces | §1.6 | `CHECK_PLUG_COMPATIBILITY` |
+| 8 | No unconverted Oracle-maintained type data | §1.9 | **`noncdb_to_pdb.sql`**, in [Part 2 §6](phase-7d-part2-deployment.md#6-run-noncdb_to_pdbsql) |
+
+**Gate 8 is enforced later than the rest.** `CHECK_PLUG_COMPATIBILITY` returns `YES`
+with it outstanding, so §5 creates the PDB and §6 is where the run stops. Clearing it
+here means the window does not discover it.
 
 Gate 5 cannot be fully answered until the XML manifest exists, which happens inside
-the window. §1.4 gives the component list to eyeball beforehand; the authoritative
+the window. §1.4 gives the component list to compare beforehand; the authoritative
 check runs in Part 2 before anything is created.
 
 ---

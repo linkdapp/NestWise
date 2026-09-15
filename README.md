@@ -99,14 +99,15 @@ for.
 | 4 | GoldenGate Classic replication | ⬜ Planned | |
 | 5 | Security and performance baseline (TDE, Unified Audit, AWR/ADDM) | ⬜ Planned | Hardens and tunes NestWise's backend |
 | 6 | [Upgrade 12c to 19c](maintenance/README.md) (DBMS_ROLLING and AutoUpgrade) | 🟩 Built | Live upgrade, near-zero downtime |
-| 7 | [OEM 13.5 to 24ai](monitoring/README.md) | 🟨 In progress. OMS and all six agents at 24ai Release 1 Update 12. Phase 7d, the non-CDB to CDB conversion, is outstanding | Full observability of NestWise |
+| 7 | [OEM 13.5 to 24ai](monitoring/README.md) | 🟨 In progress. OMS and all six agents at 24ai Release 1 Update 12. Phase 7d has moved the repository into a container: the console is served from `oempdb` and post-deployment is outstanding | Full observability of NestWise |
 | 8 | GoldenGate Classic to Microservices | ⬜ Planned | |
 | 9 | Upgrade 19c to 26ai | ⬜ Planned | AI-native features (Vector Search, Select AI) |
 | 10 | **NestWise v2**, MongoDB cross-database integration | ⬜ Planned | Hybrid relational and document data |
 | 11 | Automation & CI/CD wrap-up | ⬜ Planned | Fully rebuildable NestWise demo |
 | 12 | Capstone | ⬜ Planned | End-to-end OCM-style walkthrough |
 
-Full phase detail: [`02-roadmap-skeleton.md`](02-roadmap-skeleton.md).
+Full phase detail lives in `02-roadmap-skeleton.md`, a working document that is not
+published to the site.
 
 ---
 
@@ -126,7 +127,7 @@ Full phase detail: [`02-roadmap-skeleton.md`](02-roadmap-skeleton.md).
   - [`performance-tuning/`](performance-tuning/README.md) ⬜ planned
   - [`monitoring/`](monitoring/README.md) 🟨 in progress:
     Phase 7a repository patch 🟩, Phase 7b coverage 🟩, Phase 7c OMS to 24ai 🟩,
-    Phase 7d repository into a container 🟨
+    Phase 7d repository into a container 🟨 Parts 1 and 2 🟩, Part 3 outstanding
   - [`maintenance/`](maintenance/README.md) 🟩 built:
     [Part 1: INIT_PLAN to SWITCHOVER](maintenance/part1-dbms-rolling-plan-to-switchover.md) 🟩,
     [Part 2: FINISH_PLAN, troubleshooting, pre-flight checklist](maintenance/part2-finish-plan-and-troubleshooting.md) 🟩

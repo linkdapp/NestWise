@@ -18,7 +18,7 @@ Status: 🟩 Confirmed. `19.32.0.0.0`, invalid objects 2 to 0, targets 43 to 43,
 | 13 | Datapatch, the step people forget | 🟩 Confirmed |
 | 14 | `extjob`, and two things left manual | 🟩 Confirmed |
 | 15 | Bring Enterprise Manager back | 🟩 Confirmed |
-| 16 | Verification checklist | 🟩 Confirmed (13 of 15 rows; 2 outstanding, §18) |
+| 16 | Verification checklist | 🟩 Confirmed (13 of 16 rows; 3 outstanding, §18 and §13.4) |
 | 17 | Rollback, if verification fails | ⬜ Not needed |
 | 18 | Aftermath — what is still outstanding | 🟨 Two items open |
 | 19 | Screenshot checklist and naming convention | 🟩 Confirmed |
@@ -171,9 +171,58 @@ The run went **2 → 0**. A count that returned to its pre-patch level is clean
 whatever that level is; a count that rose and stayed risen after `utlrp` is the
 MDSYS seed-template signature described in `patching-strategy.md` Mechanism 3.
 
----
+### 13.4 Tables dependent on Oracle-maintained types
 
-## 14. `extjob`, and two things left manual
+⬜ **Not run on this estate.** Added 2026-09-15, after
+[Phase 7d](phase-7d-noncdb-to-pdb.md) found the condition on this database.
+
+When a release or Release Update evolves an Oracle-maintained type, data in dependent
+user tables is not converted automatically. It stays flagged `UPGRADED = NO` and
+nothing reports it. Advanced Queuing payload columns are the usual case.
+
+```sql
+SELECT u.name AS owner, o.name AS table_name, c.name AS column_name
+FROM   sys.obj$ o, sys.col$ c, sys.coltype$ t, sys.user$ u
+WHERE  BITAND(t.flags, 256) = 256
+AND    o.obj#  = t.obj#
+AND    c.obj#  = t.obj#
+AND    c.col#  = t.col#
+AND    t.intcol# = c.intcol#
+AND    o.owner# = u.user#
+AND    o.owner# NOT IN
+       (SELECT user# FROM sys.user$
+        WHERE  type# = 1 AND BITAND(spare1, 256) = 256)
+AND    t.obj# IN
+       (SELECT DISTINCT d_obj#
+        FROM   sys.dependency$
+        START WITH p_obj# IN
+               (SELECT obj# FROM sys.obj$
+                WHERE  type# = 13 AND BITAND(flags, 4194304) = 4194304)
+        CONNECT BY PRIOR d_obj# = p_obj#)
+ORDER  BY 1, 2, 3;
+```
+
+Rows mean the conversion is outstanding:
+
+```sql
+@?/rdbms/admin/utluptabdata.sql
+```
+
+`catuptabdata.sql` is the equivalent for Oracle-supplied tables.
+
+The query is held as [`sql/uptab_check.sql`](sql/uptab_check.sql).
+
+> **Why this is here.** `oemcdb` reached Phase 7d carrying two unconverted Advanced
+> Queuing tables, `SYSMAN.EM_EVENT_BUS_TABLE` and `SYSMAN.EM_NOTIFY_QTABLE`. Nothing
+> reported it: the database ran normally, `dba_invalid_objects` was clean, and
+> `datapatch` and `utlrp` both passed. It surfaced only when `noncdb_to_pdb.sql`
+> checked, three phases later, and stopped with `ORA-01722: invalid number`. Which
+> upgrade in this database's history evolved the type is not established; what is
+> established is that the conversion had never been run.
+
+The check is read-only and costs nothing. Worth running against any database in this
+estate that has been through a Release Update, rather than assuming it is specific to
+the repository.
 
 ### 14.1 Restore extjob's ownership and permissions
 
@@ -275,8 +324,9 @@ Not one check. A patched database that OMS cannot use is not a successful patch.
 | 3 | Version | `SELECT banner_full FROM v$version` | `19.32.0.0.0` | 🟩 |
 | 4 | Datapatch verdict | datapatch's own `... apply: SUCCESS ... (no errors)` | `(no errors)` both patches. **Do not grep for `ORA-`**, §13.2 | 🟩 |
 | 5 | Invalid objects | `dba_invalid_objects`, §13.3 | back to the pre-patch count, not necessarily zero | 🟩 2 to 0 |
+| 5a | Oracle-maintained type data converted | §13.4's query | no rows | ⬜ Not run. Two rows found in Phase 7d |
 | 6 | Registry components | `SELECT comp_name, status FROM dba_registry` | no component worse than pre-patch | 🟩 1 to 1, `RAC OPTION OFF` |
-| 7 | All PDBs patched (CDB only) | `SELECT name, open_mode FROM v$pdbs` | every PDB open and patched | Not applicable, non-CDB |
+| 7 | All PDBs patched (CDB only) | `SELECT name, open_mode FROM v$pdbs` | every PDB open and patched | Not applicable at the time, non-CDB. Applicable from [Phase 7d](phase-7d-noncdb-to-pdb.md) onward |
 | 8 | `extjob` permissions | `ls -l $ORACLE_HOME/bin/extjob` | `-rwsr-x---`, owner `root` | 🟩 reasserted `root:4750` |
 | 9 | Listener up | `lsnrctl status` | service registered | 🟩 `oemserver01_listener` |
 | 10 | OMS up | `emctl status oms -details` | WebTier and OMS up | 🟩 |

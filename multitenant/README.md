@@ -13,14 +13,16 @@ Status: 🟨 In progress. One build, filed with the phase it belongs to.
 > **[Phase 7d: Moving the Enterprise Manager repository into a container database](../monitoring/phase-7d-noncdb-to-pdb.md)**
 >
 > `oemcdb`, a 19.32 non-CDB, plugged into a new container `usatcdb` as `oempdb`, with
-> `ggpdb` created alongside it. Pre-deployment is complete: the container and `ggpdb`
-> are built and verified against the source. The plug-in window has not opened.
+> `ggpdb` created alongside it. The window is closed: the repository runs from the PDB
+> and the console is served from it. Post-deployment is outstanding.
 
 | Topic | Covers | Where |
 |---|---|---|
 | **Moving a non-CDB into a container** | `DBMS_PDB.DESCRIBE`, `CHECK_PLUG_COMPATIBILITY`, `CREATE PLUGGABLE DATABASE ... USING ... COPY` and `noncdb_to_pdb.sql`, plus the Enterprise Manager side of moving a live repository | [Phase 7d index](../monitoring/phase-7d-noncdb-to-pdb.md) |
 | Building a container to receive a PDB | Template capture, the component set, character sets, and the memory model a stock template drops | [Part 1 §4](../monitoring/phase-7d-part1-pre-deployment.md#4-create-usatcdb) |
-| Creating and managing PDBs | `ggpdb` created from `PDB$SEED`, `FILE_NAME_CONVERT`, `SAVE STATE`, service registration | [Part 1 §5](../monitoring/phase-7d-part1-pre-deployment.md#5-create-ggpdb) |
+| Creating and managing PDBs | `ggpdb` created from `PDB$SEED`, `FILE_NAME_CONVERT`, `SAVE STATE` | [Part 1 §5](../monitoring/phase-7d-part1-pre-deployment.md#5-create-ggpdb) |
+| Services for a PDB | Why a PDB's default service is administrative only, `DBMS_SERVICE.CREATE_SERVICE` in the PDB rather than the root, and what `tnsnames.ora` does and does not need | [Part 2 §6.4](../monitoring/phase-7d-part2-deployment.md#64-add-a-service-for-the-repository) |
+| Working across every container | Oracle-maintained type conversion is per container, and `catcon.pl` is how it is driven | [Part 2 Appendix A](../monitoring/phase-7d-part2-deployment.md#appendix-a-checking-every-container) |
 | Patching a container | `datapatch` across `CDB$ROOT` and every PDB, rather than the single-database path | [Part 3 §4](../monitoring/phase-7d-part3-post-deployment.md#4-close-the-dormant-ansible-branch) |
 
 ---

@@ -16,14 +16,13 @@ supports. This phase changes that.
 > Enterprise Manager repository, and half the procedure is Enterprise Manager
 > configuration.
 
-Status: 🟨 **In progress.** [Part 1](phase-7d-part1-pre-deployment.md) is complete:
-`usatcdb` and `ggpdb` are built and verified against the source. The window has not
-opened.
+Status: 🟨 **In progress.** The window is closed. The repository runs as `oempdb`
+inside `usatcdb` and the console is served from it. Part 3 is outstanding.
 
 | Part | Covers | Downtime | Status |
 |---|---|---|---|
-| [Part 1: Pre-deployment](phase-7d-part1-pre-deployment.md) | Record the source state, clear the seven compatibility gates, size the target, build `usatcdb` and `ggpdb`, prove the service name descriptor | **None** | 🟩 Confirmed 2026-09-15 |
-| [Part 2: Deployment](phase-7d-part2-deployment.md) | Stop the stack, describe the non-CDB, plug it in as `oempdb`, run `noncdb_to_pdb.sql`, repoint the OMS | **The window** | ⬜ |
+| [Part 1: Pre-deployment](phase-7d-part1-pre-deployment.md) | Record the source state, clear the eight compatibility gates, size the target, build `usatcdb` and `ggpdb`, prove the service name descriptor | **None** | 🟩 Confirmed 2026-09-15 |
+| [Part 2: Deployment](phase-7d-part2-deployment.md) | Stop the stack, describe the non-CDB, plug it in as `oempdb`, run `noncdb_to_pdb.sql`, add the repository service, repoint the OMS | **The window** | 🟩 Confirmed 2026-09-15 |
 | [Part 3: Post-deployment](phase-7d-part3-post-deployment.md) | Repoint the repository target, close the dormant Ansible branch, verify, retire the old non-CDB | None | ⬜ |
 
 Start with Part 1.
@@ -102,7 +101,9 @@ Two commands do the telling, both in Part 2 and Part 3:
 ## Gates
 
 Each is verified in [Part 1](phase-7d-part1-pre-deployment.md) before the container is
-built. A failure on any of them stops the phase rather than the window.
+built. A failure on any of them stops the phase rather than the window. Gates 1 to 5
+and 7 are enforced by `DBMS_PDB.CHECK_PLUG_COMPATIBILITY`; gate 8 is enforced later,
+by `noncdb_to_pdb.sql`.
 
 | # | Gate | Why |
 |---|---|---|
@@ -113,6 +114,7 @@ built. A failure on any of them stops the phase rather than the window.
 | 5 | Every component in the non-CDB exists in the container | Checked by `DBMS_PDB.CHECK_PLUG_COMPATIBILITY` |
 | 6 | Disk for a second copy of the datafiles | `COPY` leaves the source intact, which is what makes rollback a restart rather than a restore |
 | 7 | No encrypted tablespaces | TDE is Phase 5. If it lands first, the keystore has to be exported and imported with the PDB |
+| 8 | No unconverted Oracle-maintained type data | Checked by `noncdb_to_pdb.sql` rather than by `CHECK_PLUG_COMPATIBILITY`, so it stops the run in Part 2 §6 rather than at §5 |
 
 ---
 
@@ -140,6 +142,12 @@ built. A failure on any of them stops the phase rather than the window.
 **Sources:**
 [Oracle Multitenant Administrator's Guide 19c](https://docs.oracle.com/en/database/oracle/oracle-database/19/multi/index.html),
 the `DBMS_PDB.DESCRIBE`, `CHECK_PLUG_COMPATIBILITY` and `noncdb_to_pdb.sql` sequence ·
+[Administering PDBs with SQL\*Plus, Multitenant Administrator's Guide 19c](https://docs.oracle.com/en/database/oracle/oracle-database/19/multi/administering-pdbs-with-sql-plus.html),
+the default PDB service, why it is for administration only, and the rule that
+`CREATE_SERVICE` attaches a service to the current container ·
+[`DBMS_SERVICE`, PL/SQL Packages and Types Reference 19c](https://docs.oracle.com/en/database/oracle/oracle-database/19/arpls/DBMS_SERVICE.html),
+the `service_name` and `network_name` parameters and the `ORA-44302` and `ORA-44303`
+exceptions ·
 [`CREATE PLUGGABLE DATABASE`, SQL Language Reference 19c](https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/CREATE-PLUGGABLE-DATABASE.html),
 the `COPY`, `NOCOPY` and `MOVE` clauses and `FILE_NAME_CONVERT` ·
 [Manual Non-CDB Release Upgrades to Multitenant Architecture, Upgrade Guide 21c](https://docs.oracle.com/en/database/oracle/oracle-database/21/upgrd/upgrade-scenarios-non-cdb-oracle-databases.html),

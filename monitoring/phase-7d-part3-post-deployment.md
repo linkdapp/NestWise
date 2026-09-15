@@ -45,45 +45,54 @@ source ~/.env/oms_env
 
 ---
 
-## 1. Repoint the repository target
+## 1. Repoint the repository target (done already)
 
-[Part 2 §7](phase-7d-part2-deployment.md#7-repoint-the-oms) changed where the OMS
-**connects**. Two further targets describe the same database and neither moved with
-it. All three are separate settings.
+## 1.1 Container and pluggable databases 
 
-| Command | Updates | Needs the OMS |
-|---|---|---|
-| `emctl config oms -store_repos_details` | Where the OMS connects to reach its repository | Stopped, Administration Server up |
-| `emctl config emrep -conn_desc` | The **Management Services and Repository** target | Running |
-| `emctl config repos -conn_desc` | The **repository database** target | Running |
+verified to be up in phase -7d-part2 at the end of the deployment No need to do that here. redundanat.
 
-**Who:** `oracle`
-**Where:** `oemserver01`, with the OMS running
+### 1.1 Unlock `dbsnmp` in the container
 
-```bash
-emctl config emrep \
-  -conn_desc '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=oemserver01.usat.com)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=oempdb.usat.com)))'
+A container created by `dbca` has `dbsnmp` as a **common user in `LOCKED` status**.
+Monitoring credentials fail against the new targets until it is unlocked.
+
+```sql
+-- connect to usatcdb as sysdba
+select username, account_status, common from cdb_users where username = 'DBSNMP';
+
+alter user dbsnmp identified by <password> account unlock;
 ```
 
-The repository database target also carries a host and an Oracle home, and the
-database it points at is now a PDB inside a container:
+```
+SQL> col username for a12
+SQL> select con_id, username, account_status, common from cdb_users where username = 'DBSNMP';
 
-```bash
-emctl config repos \
-  -conn_desc '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=oemserver01.usat.com)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=oempdb.usat.com)))'
+    CON_ID USERNAME     ACCOUNT_STATUS                   COM
+---------- ------------ -------------------------------- ---
+         1 DBSNMP       LOCKED                           YES
+         4 DBSNMP       OPEN                             YES
+         3 DBSNMP       LOCKED                           YES
+
+SQL>
+SQL> alter user dbsnmp identified by <password> account unlock;
+
+User altered.
+
+SQL>
+SQL> select con_id, username, account_status, common from cdb_users where username = 'DBSNMP';
+
+    CON_ID USERNAME     ACCOUNT_STATUS                   COM
+---------- ------------ -------------------------------- ---
+         1 DBSNMP       OPEN                             YES
+         3 DBSNMP       OPEN                             YES
+         4 DBSNMP       OPEN                             YES
+
+SQL>
 ```
 
-`emctl config repos` also accepts `-agent`, `-host` and `-oh`. None of those change
-here: the database stays on `oemserver01`, in `/u01/app/oracle/product/19.3.0/db_1`,
-monitored by the same central agent. Only the connect descriptor moves.
+Then set the monitoring credentials on the new targets in the console and test them.
 
-Use the same descriptor in all three places. A mismatch leaves a target reporting
-down while the OMS runs perfectly, which is a confusing failure to diagnose later.
-
-Both verbs describe `-conn_desc` as a *"jdbc connect descriptor"*. The documented
-example form is the TNS descriptor above, not a full JDBC URL.
-
-### 1.1 The monitored database target changed shape
+### 1.2 The monitored database target changed shape
 
 Before this phase Enterprise Manager monitored `oemcdb` as an `oracle_database`
 target: a single non-CDB. It is now a PDB inside a container, which is a different
@@ -92,6 +101,32 @@ target type with a different parent.
 **Setup → Add Target → Add Targets Manually → Add Using Guided Process → Oracle
 Database, Listener and Automatic Storage Management**
 
+7d3-02-targets-promote_launch.png
+
+7d3-03-targets_launch_guided.png
+
+7d3-04-targets_launch_guided_proc.png
+
+Click **Add**
+
+7d3-05-target_discovery.png
+
+Select `oemserver01.usat.com`
+
+Click **Next**
+
+7d3-06-target_discovery_results.png
+
+**Test Connection** 
+Set **Set Global Target Properties**
+Set **Specify Group for Target**
+Click **Next**
+
+7d3-07-target_discovery_review.png
+
+Click **Save**
+Click **Close**
+
 Discover `usatcdb` on `oemserver01`. The container, `oempdb` and `ggpdb` are
 promoted together.
 
@@ -99,38 +134,12 @@ The old `oemcdb` target stops reporting, because the SID no longer starts. Remov
 only after §6 retires the database itself, so that the removal and the retirement are
 one decision rather than two.
 
-### 1.2 Unlock `dbsnmp` in the container
 
-A container created by `dbca` has `dbsnmp` as a **common user in `LOCKED` status**.
-Monitoring credentials fail against the new targets until it is unlocked.
+### 1.3 Verify Console Shows container Database and two Pluggable databases
 
-```sql
--- connect to usatcdb as sysdba
-SELECT username, account_status, common FROM cdb_users WHERE username = 'DBSNMP';
 
-ALTER USER dbsnmp IDENTIFIED BY <password> ACCOUNT UNLOCK;
-```
+7d3-07-target_discovery_show_con.png
 
-Then set the monitoring credentials on the new targets in the console and test them.
-
-### 1.3 Check the targets that keep the old SID anyway
-
-`emctl config oms -list_repos_details` reporting a service name does **not** guarantee
-every target agrees. Two monitoring configurations have been observed still holding
-the SID after the change:
-
-| Target | Where |
-|---|---|
-| Management Service | Its monitoring configuration page |
-| Management Services and Repository | Its monitoring configuration page |
-
-Open each target's **Monitoring Configuration** and read the connect descriptor. Where
-it still names a SID, edit it to the service name form and save. **Change only the
-connect descriptor.** Leave the username and password fields at their existing values.
-
-Running §1's `emctl config emrep` and `emctl config repos` is what should prevent
-this. Check anyway, because the symptom is an incident raised hours later against a
-target that looks healthy from the OMS side.
 
 ---
 
@@ -148,66 +157,15 @@ and clear the ones that are artefacts of it rather than real.
 
 ---
 
-## 3. Verify
+## 3. Remove old targets oemcdb.
 
-### 3.1 The repository is a PDB
 
-```sql
--- connect to usatcdb as sysdba
-SELECT name, open_mode, restricted FROM v$pdbs;
-```
-
-Expected: `PDB$SEED` read only, `OEMPDB` read write with `RESTRICTED` = `NO`,
-`GGPDB` read write.
-
-```sql
-ALTER SESSION SET CONTAINER = oempdb;
-SELECT sys_context('USERENV','CON_NAME') FROM dual;
-SELECT comp_id, version, status FROM dba_registry ORDER BY comp_id;
-```
-
-Every component `VALID`.
-
-### 3.2 No unresolved plug-in violations
-
-```sql
-SELECT name, cause, type, message, status
-FROM   pdb_plug_in_violations
-WHERE  name = 'OEMPDB'
-AND    status != 'RESOLVED'
-ORDER  BY time;
-```
-
-The `PDB plugged in is a non-CDB` warning should read `RESOLVED` once
-[Part 2 §6](phase-7d-part2-deployment.md#6-run-noncdb_to_pdbsql) has run. Anything
-still `PENDING` needs closing before this phase is marked confirmed.
-
-### 3.3 The OMS and its repository
-
-```bash
-emctl status oms -details
-emctl config oms -list_repos_details
-```
-
-The descriptor should name `SERVICE_NAME=oempdb.usat.com`, not the old SID.
-
-### 3.4 Target count
-
-```bash
-emcli login -username=sysman
-emcli get_targets | wc -l
-```
-
-Compare against
-[Part 2 §1.2](phase-7d-part2-deployment.md#12-record-the-target-count). The count
-rises by the new container and PDB targets from §1.1 and falls by the old `oemcdb`
-target once §6 removes it.
-
-### 3.5 Agents are uploading
+### 4 Agents are uploading
 
 **Setup → Manage Cloud Control → Agents**
 
-Six agents Up, Secure Upload Yes, recent Last Successful Load.
+All agents Up, Secure Upload Yes, recent Last Successful Load.
+
 
 ### 3.6 Checklist
 
@@ -267,7 +225,7 @@ start.
 | Location | Change |
 |---|---|
 | `group_vars/all.yml` | The repository connection entries move from a SID to `SERVICE_NAME=oempdb.usat.com` |
-| `tnsnames.ora` on `oemserver01` | Add or repoint the repository alias |
+| `tnsnames.ora` on `oemserver01` | Add or repoint the repository alias. The OMS does not use it: [Part 2 Appendix B.5](phase-7d-part2-deployment.md#b5-tnsnamesora) has the form and why |
 | `~/.env/*` | Any `ORACLE_SID=oemcdb` export becomes a container or PDB connection |
 | Backup scripts | RMAN connects to the container, not to the PDB, for a whole-database backup |
 | Monitoring scripts | Scripts querying the repository directly need the service name |
@@ -301,7 +259,7 @@ directly. This is the removal deferred from §1.1.
 
 ### 6.3 Reclaim the datafiles
 
-[Part 2 §5](phase-7d-part2-deployment.md#5-create-oempdb) used `COPY`, so the
+[Part 2 §5](phase-7d-part2-deployment.md#5-create-oempdb-with-copy-option) used `COPY`, so the
 original datafiles are still on disk and still consuming the space
 [Part 1 §3](phase-7d-part1-pre-deployment.md#3-size-the-target) reserved.
 
@@ -311,6 +269,28 @@ df -h /u01
 
 Delete the old `OEMCDB` datafile directory only after §3 has passed and §6.1 and §6.2
 are done.
+
+### 6.4 Decide on `oemcdbXDB`
+
+`dba_services` inside `oempdb` lists `oemcdbXDB`, the XML DB service that came across
+with the plug-in, because a non-CDB's service definitions travel into the PDB. It is
+named for a database that no longer exists.
+
+```sql
+alter session set container = oempdb;
+select name, network_name from dba_services order by name;
+select name from v$active_services order by name;
+```
+
+Confirm nothing connects through it before removing it. Checked over a period that
+covers a full monitoring cycle, not a single sample:
+
+```sql
+select service_name, count(*) from v$session group by service_name;
+```
+
+Leaving it costs nothing. It is listed here so that the name is a recorded decision
+rather than an unexplained leftover.
 
 ---
 
@@ -345,46 +325,32 @@ shut down and the job has nothing left to run in.
 It remains the right tool for migrating any **other** non-CDB in this estate into
 `usatcdb`, which is worth remembering when Phase 5 or Phase 9 need it.
 
-### A.2 Three connect descriptor commands, none interchangeable
+### A.2 Why the three descriptor commands are not interchangeable
 
-| Command | Changes | Needs the OMS |
-|---|---|---|
-| `emctl config oms -store_repos_details` | Where the OMS connects to reach its repository | Stopped, with the Administration Server up |
-| `emctl config emrep -conn_desc` | The Management Services and Repository target | Running |
-| `emctl config repos -conn_desc` | The repository database target | Running |
-
-Running only the first leaves Enterprise Manager working while two of its own targets
+The three in §1's table change three different settings. Running only
+`store_repos_details` leaves Enterprise Manager working while two of its own targets
 report down. Running either of the others alone does nothing useful, because the OMS
 cannot start until the first has run.
 
-`emctl config oms -help` documents the order for the first one, and it is not the
-obvious one:
-
-```
-1) Stop all the OMSs using 'emctl stop oms'
-2) Run 'emctl config oms -store_repos_details' on each of the OMSs
-3) Stop all the OMSs completely using 'emctl stop oms -all'
-4) Start all of the OMSs using 'emctl start oms'
-```
-
-Step 1 is `emctl stop oms`, not `emctl stop oms -all`. The Administration Server has
-to be up while the command runs, the same requirement `emctl secure lock` has in
+The ordering for `store_repos_details` is in
+[Part 2 §2](phase-7d-part2-deployment.md#2-stop-the-stack). Step 1 is `emctl stop oms`,
+not `emctl stop oms -all`, because the Administration Server has to be up while the
+command runs. That is the same requirement `emctl secure lock` has in
 [Phase 7c Part 2c §3.3](phase-7c-part2c-post-deployment.md#33-lock-it).
 
 ### A.3 A PDB has no SID
 
-The old connect descriptor named `oemcdb` as a SID, which worked because a non-CDB
-has one. A PDB does not. Every connection to `oempdb` goes through a service name,
-which is why [Part 2 §6.3](phase-7d-part2-deployment.md#63-add-a-service-for-the-repository)
-creates one rather than relying on the default.
+The old connect descriptor named `oemcdb` as a SID, which worked because a non-CDB has
+one. A PDB does not, so every connection to `oempdb` goes through a service name.
+[Part 2 Appendix B](phase-7d-part2-deployment.md#appendix-b-service-names-and-tnsnamesora)
+covers the service itself.
 
-This is also what decides the form of the `store_repos_details` command.
-`emctl config oms -help` offers `-repos_host`, `-repos_port` and `-repos_sid` as one
-shape and `-repos_conndesc` as another. The first cannot name a PDB, so the second is
-the only option here. The help text recommends `-repos_conndesc` for repositories in
-TCPS mode; that recommendation is about TLS and does not restrict the parameter to
-TCPS, and the Administrator's Guide uses the same parameter over TCP for a RAC
-failover descriptor.
+That decides the form of the `store_repos_details` command. `emctl config oms -help`
+offers `-repos_host`, `-repos_port` and `-repos_sid` as one shape and `-repos_conndesc`
+as another. The first cannot name a PDB, so the second is the only option here. The
+help text recommends `-repos_conndesc` for repositories in TCPS mode; that
+recommendation is about TLS and does not restrict the parameter to TCPS, and the
+Administrator's Guide uses the same parameter over TCP for a RAC failover descriptor.
 
 ### A.4 `SAVE STATE` is not optional
 
@@ -412,6 +378,7 @@ subdirectory.
 | `7d3-05-list-repos-details.png` | 3.3 | The descriptor naming `oempdb.usat.com` | ⬜ |
 | `7d3-06-ansible-cdb-branch.png` | 4.1 | The CDB branch taken and datapatch across the PDBs | ⬜ |
 | `7d3-07-df-reclaimed.png` | 6.3 | `/u01` after the old datafiles are removed | ⬜ |
+| `7d3-08-services-after-cleanup.png` | 6.4 | `dba_services` in `oempdb` after the `oemcdbXDB` decision | ⬜ |
 
 ---
 
