@@ -1,3 +1,7 @@
+---
+description: "Moving a live Oracle 19.32 non-CDB Enterprise Manager repository into a container database as a PDB: DBMS_PDB.DESCRIBE, CHECK_PLUG_COMPATIBILITY and noncdb_to_pdb.sql."
+---
+
 # Phase 7d: Moving the Enterprise Manager repository into a container database
 
 **SOP: `oemcdb` on `oemserver01`, a 19.32.0.0.0 non-CDB, plugged into a new container database as `oempdb`, Oracle Linux**
