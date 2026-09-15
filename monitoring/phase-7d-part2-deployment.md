@@ -1,3 +1,7 @@
+---
+description: "Plugging a 19.32 non-CDB into an Oracle container database: CREATE PLUGGABLE DATABASE with COPY and FILE_NAME_CONVERT, and the ORA-01722 that stops noncdb_to_pdb.sql."
+---
+
 # Phase 7d Part 2: Deployment
 
 **The window. Enterprise Manager is down from section 2 until section 7 completes**
