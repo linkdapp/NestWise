@@ -120,11 +120,13 @@ Full phase detail: [`02-roadmap-skeleton.md`](02-roadmap-skeleton.md).
     [Part 1: Active Data Guard](high-availability/part1-active-data-guard.md) 🟩,
     [Part 2: Broker, FSFO, Observer](high-availability/part2-broker-fsfo-observer.md) 🟩,
     [Part 3: Post checks](high-availability/part3-post-checks.md) 🟩
+  - [`multitenant/`](multitenant/README.md) 🟨 index into the CDB and PDB work,
+    which lives with Phase 7d under `monitoring/`
   - [`backup-recovery/`](backup-recovery/README.md) ⬜ planned
   - [`performance-tuning/`](performance-tuning/README.md) ⬜ planned
   - [`monitoring/`](monitoring/README.md) 🟨 in progress:
     Phase 7a repository patch 🟩, Phase 7b coverage 🟩, Phase 7c OMS to 24ai 🟩,
-    Phase 7d non-CDB to CDB ⬜
+    Phase 7d repository into a container 🟨
   - [`maintenance/`](maintenance/README.md) 🟩 built:
     [Part 1: INIT_PLAN to SWITCHOVER](maintenance/part1-dbms-rolling-plan-to-switchover.md) 🟩,
     [Part 2: FINISH_PLAN, troubleshooting, pre-flight checklist](maintenance/part2-finish-plan-and-troubleshooting.md) 🟩
@@ -148,6 +150,7 @@ Oracle-DBA-POC/
 ├── backup-recovery/                            planned: RMAN, Data Pump
 ├── performance-tuning/                         planned: AWR, ADDM, SQL Tuning Advisor
 ├── monitoring/                                 in progress: OEM 13.5 to 24ai, AHF
+├── multitenant/                                index: CDB and PDB work, filed under monitoring/
 ├── maintenance/                                built: DBMS_ROLLING 12c to 19c upgrade
 └── phase-01-foundation-2node-rac-12cR2/        the actual Ansible/scripts for Phase 1
     ├── README.md

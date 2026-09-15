@@ -87,6 +87,13 @@ baseurl: "/NestWise"
 # "Tools" has a real landing page — Swingbench is linked from there, plus any future
 # standing tools (AHF, SQL Developer) as their own pages get built.
 #
+# multitenant/README.md is an index, not a build. Phase 7d is the only CDB and PDB
+# work in this repository and its pages live under monitoring/, because the database
+# being converted is the Enterprise Manager repository and half the procedure is EM
+# configuration. Multitenant is a named area of the OCM 19c practical blueprint, so
+# it gets a nav entry that points into those pages rather than staying invisible
+# under "Monitoring". Same arrangement as tools/README.md and AHF.
+#
 # nestwise-app/README.md sits second, directly after Installation: the
 # infrastructure gets built first, then the application that runs on it and
 # proves it works. It carries explicit `title: NestWise App` front matter —
@@ -100,6 +107,7 @@ header_pages:
   - nestwise-app/README.md
   - high-availability/README.md
   - monitoring/README.md
+  - multitenant/README.md
   - backup-recovery/README.md
   - maintenance/README.md
   - performance-tuning/README.md

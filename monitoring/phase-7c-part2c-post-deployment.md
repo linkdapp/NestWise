@@ -1095,9 +1095,9 @@ Still to capture:
 
 ## What this feeds into
 
-- **Phase 7d.** Convert `oemcdb` from non-CDB to a CDB and create `oempdb` plus
-  `ggpdb` for GoldenGate. Not a prerequisite for 24ai, which supports a non-CDB
-  repository, but required to take the repository past 19c.
+- **[Phase 7d](phase-7d-noncdb-to-pdb.md).** Plug `oemcdb` into a new container as
+  `oempdb` and create `ggpdb` alongside it. Not a prerequisite for 24ai, which
+  supports a non-CDB repository, but required to take the repository past 19c.
 
 ---
 
