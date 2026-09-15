@@ -17,13 +17,15 @@ supports. This phase changes that.
 > configuration.
 
 Status: 🟨 **In progress.** The window is closed. The repository runs as `oempdb`
-inside `usatcdb` and the console is served from it. Part 3 is outstanding.
+inside `usatcdb` and the console is served from it. Part 3 is under way: the container
+and both PDBs are promoted as targets, and the old `oemcdb` target and datafiles are
+still in place.
 
 | Part | Covers | Downtime | Status |
 |---|---|---|---|
 | [Part 1: Pre-deployment](phase-7d-part1-pre-deployment.md) | Record the source state, clear the eight compatibility gates, size the target, build `usatcdb` and `ggpdb`, prove the service name descriptor | **None** | 🟩 Confirmed 2026-09-15 |
 | [Part 2: Deployment](phase-7d-part2-deployment.md) | Stop the stack, describe the non-CDB, plug it in as `oempdb`, run `noncdb_to_pdb.sql`, add the repository service, repoint the OMS | **The window** | 🟩 Confirmed 2026-09-15 |
-| [Part 3: Post-deployment](phase-7d-part3-post-deployment.md) | Repoint the repository target, close the dormant Ansible branch, verify, retire the old non-CDB | None | ⬜ |
+| [Part 3: Post-deployment](phase-7d-part3-post-deployment.md) | Repoint the repository target, close the dormant Ansible branch, verify, retire the old non-CDB | None | 🟨 In progress |
 
 Start with Part 1.
 
@@ -173,10 +175,10 @@ documents do not spell out. It is not a substitute for them.
   proving a service name descriptor against the source **before** the window
   ([Part 1 §7](phase-7d-part1-pre-deployment.md#7-prove-a-service-name-descriptor-reaches-the-repository));
   the `dbsnmp` common user arriving locked in a new container
-  ([Part 3 §1.2](phase-7d-part3-post-deployment.md#1-repoint-the-repository-target));
+  ([Part 3 §1.1](phase-7d-part3-post-deployment.md#1-repoint-the-repository-target));
   and two targets that keep the old SID in their monitoring configuration even after
   `-list_repos_details` reports the service name
-  ([Part 3 §1.3](phase-7d-part3-post-deployment.md#1-repoint-the-repository-target))
+  ([Part 3 §1.4](phase-7d-part3-post-deployment.md#1-repoint-the-repository-target))
 
 ---
 

@@ -8,22 +8,23 @@ Part 3 of three. [Part 1](phase-7d-part1-pre-deployment.md) built the container.
 Also indexed by skill area under
 [Multitenant](../multitenant/README.md).
 
-Status: ⬜ Planned.
+Status: 🟨 **In progress.** `dbsnmp` is unlocked and `usatcdb`, `oempdb` and `ggpdb`
+are promoted. The old `oemcdb` target and datafiles are still in place.
 
 [Part 2](phase-7d-part2-deployment.md) ends with the console served from `oempdb`.
 Everything here follows that.
 
 | # | Task | Status |
 |---|---|---|
-| 1 | Repoint the repository target | ⬜ |
-| 2 | Clear the blackout | ⬜ |
-| 3 | Verify | ⬜ |
+| 1 | Repoint the repository target | 🟨 1.1 and 1.2 done; 1.3 and 1.4 open |
+| 2 | Clear the blackout | Not needed, none was created |
+| 3 | Remove old targets `oemcdb` | ⬜ |
 | 4 | Close the dormant Ansible branch | ⬜ |
 | 5 | Update the estate's connection details | ⬜ |
 | 6 | Retire the old non-CDB | ⬜ |
 | 7 | Close out | ⬜ |
-| 8 | Appendix A: Reference notes | ⬜ |
-| 9 | Screenshot checklist | ⬜ |
+| 8 | Appendix A: Reference notes | 🟩 |
+| 9 | Screenshot checklist | 🟨 6 of 12 |
 
 ```bash
 source ~/.env/oms_env
@@ -35,7 +36,7 @@ source ~/.env/oms_env
 
 1. [Repoint the repository target](#1-repoint-the-repository-target)
 2. [Clear the blackout](#2-clear-the-blackout)
-3. [Verify](#3-verify)
+3. [Remove old targets `oemcdb`](#3-remove-old-targets-oemcdb)
 4. [Close the dormant Ansible branch](#4-close-the-dormant-ansible-branch)
 5. [Update the estate's connection details](#5-update-the-estates-connection-details)
 6. [Retire the old non-CDB](#6-retire-the-old-non-cdb)
@@ -45,11 +46,14 @@ source ~/.env/oms_env
 
 ---
 
-## 1. Repoint the repository target (done already)
+## 1. Repoint the repository target
 
-## 1.1 Container and pluggable databases 
+Status: 🟩 the OMS connection itself was repointed in
+[Part 2 §7](phase-7d-part2-deployment.md#7-repoint-the-oms). What remains here is the
+two monitored targets that describe the same database and did not move with it.
 
-verified to be up in phase -7d-part2 at the end of the deployment No need to do that here. redundanat.
+`usatcdb`, `oempdb` and `ggpdb` were confirmed open at the end of Part 2. That check is
+not repeated here.
 
 ### 1.1 Unlock `dbsnmp` in the container
 
@@ -94,52 +98,62 @@ Then set the monitoring credentials on the new targets in the console and test t
 
 ### 1.2 The monitored database target changed shape
 
-Before this phase Enterprise Manager monitored `oemcdb` as an `oracle_database`
-target: a single non-CDB. It is now a PDB inside a container, which is a different
-target type with a different parent.
+Enterprise Manager monitored `oemcdb` as a single non-CDB `oracle_database` target. It
+is now a PDB inside a container: a different target type with a different parent. The
+container, `oempdb` and `ggpdb` are promoted together in one pass.
 
-**Setup → Add Target → Add Targets Manually → Add Using Guided Process → Oracle
-Database, Listener and Automatic Storage Management**
+**Setup → Add Target → Add Targets Manually**
 
-7d3-02-targets-promote_launch.png
+![Setup, Add Target, Add Targets Manually](screenshots/7d/7d3-02-targets-promote_launch.png)
 
-7d3-03-targets_launch_guided.png
+**Add Using Guided Process**
 
-7d3-04-targets_launch_guided_proc.png
+![Add Using Guided Process selected](screenshots/7d/7d3-03-targets-promote_launch_guided.png)
 
-Click **Add**
+**Oracle Database, Listener and Automatic Storage Management**, then **Add**
 
-7d3-05-target_discovery.png
+![The guided process list with the database target type chosen](screenshots/7d/7d3-04-targets_launch_guided_proc.png)
 
-Select `oemserver01.usat.com`
+Select `oemserver01.usat.com`, then **Next**
 
-Click **Next**
+![Target discovery against oemserver01](screenshots/7d/7d3-05-target_discovery.png)
 
-7d3-06-target_discovery_results.png
+Run **Test Connection**, then set **Global Target Properties** and **Specify Group for
+Target**, then **Next**
 
-**Test Connection** 
-Set **Set Global Target Properties**
-Set **Specify Group for Target**
-Click **Next**
+![Discovery results listing usatcdb, oempdb and ggpdb](screenshots/7d/7d3-06-target_discovery_results.png)
 
-7d3-07-target_discovery_review.png
+**Save**, then **Close**
 
-Click **Save**
-Click **Close**
+![The review page before saving](screenshots/7d/7d3-07-target_discovery_review.png)
 
-Discover `usatcdb` on `oemserver01`. The container, `oempdb` and `ggpdb` are
-promoted together.
-
-The old `oemcdb` target stops reporting, because the SID no longer starts. Remove it
-only after §6 retires the database itself, so that the removal and the retirement are
-one decision rather than two.
+The old `oemcdb` target stops reporting, because the SID no longer starts. It is
+removed in [§3](#3-remove-old-targets-oemcdb).
 
 
 ### 1.3 Verify Console Shows container Database and two Pluggable databases
 
+**Targets → Databases**
 
-7d3-07-target_discovery_show_con.png
+Expected: `usatcdb` listed as a container database, with `oempdb` and `ggpdb` beneath
+it.
 
+![The console listing usatcdb with oempdb and ggpdb](screenshots/7d/7d3-07-target_discovery_show_con.png)
+
+### 1.4 Check the targets that keep the old SID anyway
+
+`emctl config oms -list_repos_details` reporting a service name does not guarantee
+every target agrees. Two monitoring configurations have been observed still holding the
+SID after the change:
+
+| Target | Where |
+|---|---|
+| Management Service | Its monitoring configuration page |
+| Management Services and Repository | Its monitoring configuration page |
+
+Open each target's **Monitoring Configuration** and read the connect descriptor. Where
+it still names a SID, edit it to the service name form and save. Change only the
+connect descriptor; leave the username and password fields alone.
 
 ---
 
@@ -159,15 +173,21 @@ and clear the ones that are artefacts of it rather than real.
 
 ## 3. Remove old targets oemcdb.
 
+### 3.1 Remove the target
 
-### 4 Agents are uploading
+**Setup → Add Target → Auto Discovery Results**, or remove the `oemcdb` target
+directly.
+
+The database itself stays on disk until [§6](#6-retire-the-old-non-cdb). Removing the
+target ends the availability alerts; it does not end the rollback.
+
+### 3.2 Agents are uploading
 
 **Setup → Manage Cloud Control → Agents**
 
 All agents Up, Secure Upload Yes, recent Last Successful Load.
 
-
-### 3.6 Checklist
+### 3.3 Checklist
 
 | # | Check | Expected |
 |---|---|---|
@@ -177,9 +197,9 @@ All agents Up, Secure Upload Yes, recent Last Successful Load.
 | 4 | `emctl status oms -details` | Up, console and agent upload still locked |
 | 5 | `emctl config oms -list_repos_details` | Names `oempdb.usat.com` |
 | 6 | Repository target in the console | Up, monitored through the new descriptor |
-| 7 | Management Service and Management Services and Repository | Monitoring configuration naming a service name, not a SID. §1.3 |
-| 8 | `dbsnmp` in `usatcdb` | `OPEN`, with monitoring credentials tested. §1.2 |
-| 9 | Agents | Six Up and uploading |
+| 7 | Management Service and Management Services and Repository | Monitoring configuration naming a service name, not a SID. §1.4 |
+| 8 | `dbsnmp` in `usatcdb` | `OPEN`, with monitoring credentials tested. §1.1 |
+| 9 | Agents | All Up and uploading. §3.2 |
 | 10 | Rollback still available | The old non-CDB is intact until §6 |
 
 ---
@@ -252,10 +272,11 @@ ps -ef | grep [o]ra_pmon_oemcdb
 
 No output. Remove any `/etc/oratab` entry that would restart it.
 
-### 6.2 Remove the target from Enterprise Manager
+### 6.2 Confirm the target is gone
 
-**Setup → Add Target → Auto Discovery Results**, or remove the `oemcdb` target
-directly. This is the removal deferred from §1.1.
+Removed in [§3.1](#3-remove-old-targets-oemcdb). Confirm it before deleting datafiles,
+so that a target still polling a dead SID does not raise incidents against a database
+that no longer exists.
 
 ### 6.3 Reclaim the datafiles
 
@@ -370,15 +391,20 @@ subdirectory.
 
 | File | Section | Shows | Status |
 |---|---|---|---|
-| `7d3-01-config-emrep.png` | 1 | `emctl config emrep` and `emctl config repos` completing | ⬜ |
-| `7d3-02-targets-promoted.png` | 1.1 | `usatcdb`, `oempdb` and `ggpdb` promoted, old `oemcdb` down | ⬜ |
-| `7d3-02b-monitoring-config-service-name.png` | 1.3 | A monitoring configuration page after the SID was replaced | ⬜ |
-| `7d3-03-blackout-cleared.png` | 2 | The blackout cleared | ⬜ |
-| `7d3-04-pdbs-and-registry.png` | 3.1 | `v$pdbs` and `dba_registry` in `oempdb` | ⬜ |
-| `7d3-05-list-repos-details.png` | 3.3 | The descriptor naming `oempdb.usat.com` | ⬜ |
-| `7d3-06-ansible-cdb-branch.png` | 4.1 | The CDB branch taken and datapatch across the PDBs | ⬜ |
-| `7d3-07-df-reclaimed.png` | 6.3 | `/u01` after the old datafiles are removed | ⬜ |
-| `7d3-08-services-after-cleanup.png` | 6.4 | `dba_services` in `oempdb` after the `oemcdbXDB` decision | ⬜ |
+| `7d3-02-targets-promote_launch.png` | 1.2 | Setup, Add Target, Add Targets Manually | 🟩 |
+| `7d3-03-targets-promote_launch_guided.png` | 1.2 | Add Using Guided Process | 🟩 |
+| `7d3-04-targets_launch_guided_proc.png` | 1.2 | The database target type chosen | 🟩 |
+| `7d3-05-target_discovery.png` | 1.2 | Discovery against `oemserver01` | 🟩 |
+| `7d3-06-target_discovery_results.png` | 1.2 | `usatcdb`, `oempdb` and `ggpdb` found | 🟩 |
+| `7d3-07-target_discovery_review.png` | 1.2 | The review page before saving | 🟩 |
+| `7d3-07-target_discovery_show_con.png` | 1.3 | The console listing the container and both PDBs | 🟩 |
+| `7d3-08-monitoring-config-service-name.png` | 1.4 | A monitoring configuration page after the SID was replaced | ⬜ |
+| `7d3-09-oemcdb-target-removed.png` | 3.1 | The old `oemcdb` target gone | ⬜ |
+| `7d3-10-ansible-cdb-branch.png` | 4.1 | The CDB branch taken and `datapatch` across the PDBs | ⬜ |
+| `7d3-11-df-reclaimed.png` | 6.3 | `/u01` after the old datafiles are removed | ⬜ |
+| `7d3-12-services-after-cleanup.png` | 6.4 | `dba_services` in `oempdb` after the `oemcdbXDB` decision | ⬜ |
+
+Two files share the `7d3-07-` prefix. Both are referenced as they are on disk.
 
 ---
 

@@ -14,7 +14,8 @@ Status: 🟨 In progress. One build, filed with the phase it belongs to.
 >
 > `oemcdb`, a 19.32 non-CDB, plugged into a new container `usatcdb` as `oempdb`, with
 > `ggpdb` created alongside it. The window is closed: the repository runs from the PDB
-> and the console is served from it. Post-deployment is outstanding.
+> and the console is served from it. Post-deployment is under way, with the container
+> and both PDBs promoted as monitored targets.
 
 | Topic | Covers | Where |
 |---|---|---|
