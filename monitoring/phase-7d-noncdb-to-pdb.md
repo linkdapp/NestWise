@@ -20,16 +20,17 @@ supports. This phase changes that.
 > Enterprise Manager repository, and half the procedure is Enterprise Manager
 > configuration.
 
-Status: 🟨 **In progress.** The window is closed. The repository runs as `oempdb`
-inside `usatcdb` and the console is served from it. Part 3 is under way: the container
-and both PDBs are promoted as targets, and the old `oemcdb` target and datafiles are
-still in place.
+Status: 🟨 **Nearly complete.** The repository runs as `oempdb` inside `usatcdb` and
+the console is served from it. The old non-CDB is fully retired: target removed,
+instance down, datafiles deleted, so the rollback is closed and recovery is the RMAN
+level 0 of the container. Outstanding in Part 3: the two targets that may still hold
+the old SID, the estate's connection details, and six screenshots.
 
 | Part | Covers | Downtime | Status |
 |---|---|---|---|
 | [Part 1: Pre-deployment](phase-7d-part1-pre-deployment.md) | Record the source state, clear the eight compatibility gates, size the target, build `usatcdb` and `ggpdb`, prove the service name descriptor | **None** | 🟩 Confirmed 2026-09-15 |
 | [Part 2: Deployment](phase-7d-part2-deployment.md) | Stop the stack, describe the non-CDB, plug it in as `oempdb`, run `noncdb_to_pdb.sql`, add the repository service, repoint the OMS | **The window** | 🟩 Confirmed 2026-09-15 |
-| [Part 3: Post-deployment](phase-7d-part3-post-deployment.md) | Repoint the repository target, close the dormant Ansible branch, verify, retire the old non-CDB | None | 🟨 In progress |
+| [Part 3: Post-deployment](phase-7d-part3-post-deployment.md) | Repoint the repository target, remove the old targets, update the estate's connection details, retire the old non-CDB | None | 🟨 Nearly complete |
 
 Start with Part 1.
 
@@ -205,13 +206,15 @@ own checklist.
 
 ## Appendix: what this closes
 
-Two places in this repository already carry a dormant branch waiting for this phase.
-Part 3 closes both.
+Two places in this repository carry a dormant branch written for this phase. Neither
+needed a step here; both are simply live now.
 
 - **[`phase-7a-ansible.md`](phase-7a-ansible.md#design-notes-for-anyone-editing-the-role).**
   The `oem_repo_patch` role detects CDB against non-CDB and keeps an
-  `ALTER PLUGGABLE DATABASE ALL OPEN` branch that has never executed. From this phase
-  on it does.
+  `ALTER PLUGGABLE DATABASE ALL OPEN` branch that has never executed. Its detection now
+  resolves to the CDB path, confirmed read-only on 2026-09-15 and recorded in
+  [Part 3 Appendix A.4](phase-7d-part3-post-deployment.md#7-appendix-a-reference-notes).
+  The branch itself runs at the next repository Release Update.
 - **[`phase-7a-part3-verification.md` §13.1](phase-7a-part3-verification.md#13-datapatch-the-step-people-forget).**
   Records that the branch stays in the role permanently because "Phase 7d converts
   this database, and the day it does, the branch has to already be there."

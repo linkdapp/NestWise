@@ -8,8 +8,12 @@ Part 3 of three. [Part 1](phase-7d-part1-pre-deployment.md) built the container.
 Also indexed by skill area under
 [Multitenant](../multitenant/README.md).
 
-Status: 🟨 **In progress.** `dbsnmp` is unlocked and `usatcdb`, `oempdb` and `ggpdb`
-are promoted. The old `oemcdb` target and datafiles are still in place.
+Status: 🟨 **Nearly complete.** The old non-CDB is fully retired: target removed,
+instance down, datafiles deleted. The container is backed up, the compliance check has
+run. Outstanding: §1.4, §4, and six screenshots.
+
+**The rollback to `oemcdb` no longer exists.** Recovery is the RMAN level 0 of
+`usatcdb` from §6.1.
 
 [Part 2](phase-7d-part2-deployment.md) ends with the console served from `oempdb`.
 Everything here follows that.
@@ -18,13 +22,12 @@ Everything here follows that.
 |---|---|---|
 | 1 | Repoint the repository target | 🟨 1.1 and 1.2 done; 1.3 and 1.4 open |
 | 2 | Clear the blackout | Not needed, none was created |
-| 3 | Remove old targets `oemcdb` | ⬜ |
-| 4 | Close the dormant Ansible branch | ⬜ |
-| 5 | Update the estate's connection details | ⬜ |
-| 6 | Retire the old non-CDB | ⬜ |
-| 7 | Close out | ⬜ |
-| 8 | Appendix A: Reference notes | 🟩 |
-| 9 | Screenshot checklist | 🟨 6 of 12 |
+| 3 | Remove old targets `oemcdb` | 🟩 Confirmed 2026-09-15 |
+| 4 | Update the estate's connection details | ⬜ |
+| 5 | Retire the old non-CDB | 🟩 Confirmed 2026-09-15. Rollback ended |
+| 6 | Close out | 🟩 Confirmed 2026-09-15 |
+| 7 | Appendix A: Reference notes | 🟩 |
+| 8 | Screenshot checklist | 🟨 6 of 11 |
 
 ```bash
 source ~/.env/oms_env
@@ -37,12 +40,11 @@ source ~/.env/oms_env
 1. [Repoint the repository target](#1-repoint-the-repository-target)
 2. [Clear the blackout](#2-clear-the-blackout)
 3. [Remove old targets `oemcdb`](#3-remove-old-targets-oemcdb)
-4. [Close the dormant Ansible branch](#4-close-the-dormant-ansible-branch)
-5. [Update the estate's connection details](#5-update-the-estates-connection-details)
-6. [Retire the old non-CDB](#6-retire-the-old-non-cdb)
-7. [Close out](#7-close-out)
-8. [Appendix A: Reference notes](#8-appendix-a-reference-notes)
-9. [Screenshot checklist](#9-screenshot-checklist)
+4. [Update the estate's connection details](#4-update-the-estates-connection-details)
+5. [Retire the old non-CDB](#5-retire-the-old-non-cdb)
+6. [Close out](#6-close-out)
+7. [Appendix A: Reference notes](#7-appendix-a-reference-notes)
+8. [Screenshot checklist](#8-screenshot-checklist)
 
 ---
 
@@ -178,7 +180,7 @@ and clear the ones that are artefacts of it rather than real.
 **Setup → Add Target → Auto Discovery Results**, or remove the `oemcdb` target
 directly.
 
-The database itself stays on disk until [§6](#6-retire-the-old-non-cdb). Removing the
+The database itself stays on disk until [§5](#5-retire-the-old-non-cdb). Removing the
 target ends the availability alerts; it does not end the rollback.
 
 ### 3.2 Agents are uploading
@@ -200,44 +202,11 @@ All agents Up, Secure Upload Yes, recent Last Successful Load.
 | 7 | Management Service and Management Services and Repository | Monitoring configuration naming a service name, not a SID. §1.4 |
 | 8 | `dbsnmp` in `usatcdb` | `OPEN`, with monitoring credentials tested. §1.1 |
 | 9 | Agents | All Up and uploading. §3.2 |
-| 10 | Rollback still available | The old non-CDB is intact until §6 |
+| 10 | Rollback still available | The old non-CDB is intact until §5 |
 
 ---
 
-## 4. Close the dormant Ansible branch
-
-Two pages in this repository carry a branch written for this day and never executed.
-
-**[`phase-7a-ansible.md`](phase-7a-ansible.md#design-notes-for-anyone-editing-the-role).**
-The `oem_repo_patch` role detects CDB against non-CDB and holds an
-`ALTER PLUGGABLE DATABASE ALL OPEN` branch that has been dormant because
-`SELECT cdb FROM v$database` returned `NO`. It now returns `YES`.
-
-**[`phase-7a-part3-verification.md` §13.1](phase-7a-part3-verification.md#13-datapatch-the-step-people-forget).**
-Records why the branch stays in the role permanently: *"Phase 7d converts this
-database, and the day it does, the branch has to already be there."*
-
-### 4.1 Exercise the branch
-
-Do not take the branch on trust. Run the role against the new container and confirm
-the CDB path is the one taken.
-
-```bash
-ansible-playbook -i inventory/hosts.ini site.yml --tags oem_repo_patch_datapatch
-```
-
-Expected in the run output: the CDB branch, the PDBs opened, and `datapatch` reporting
-against `CDB$ROOT` plus every PDB rather than a single database.
-
-### 4.2 Record the result
-
-Update
-[`phase-7a-part3-verification.md` §16](phase-7a-part3-verification.md#16-verification-checklist)'s
-row 7, currently *"Not applicable, non-CDB"*. It is applicable now.
-
----
-
-## 5. Update the estate's connection details
+## 4. Update the estate's connection details
 
 Anything that names the repository by SID now points at a database that does not
 start.
@@ -258,13 +227,15 @@ grep -rn 'oemcdb' --include='*.yml' --include='*.ora' --include='*.sh' .
 
 ---
 
-## 6. Retire the old non-CDB
+## 5. Retire the old non-CDB
+
+🟩 Complete 2026-09-15. Target removed, instance down, datafiles deleted.
 
 **Not until §3 passes and the estate has run long enough to trust.** The old non-CDB
 is the rollback in
 [Part 2 §8](phase-7d-part2-deployment.md#8-rollback). Removing it ends that.
 
-### 6.1 Confirm it is down and stays down
+### 5.1 Confirm it is down and stays down
 
 ```bash
 ps -ef | grep [o]ra_pmon_oemcdb
@@ -272,26 +243,32 @@ ps -ef | grep [o]ra_pmon_oemcdb
 
 No output. Remove any `/etc/oratab` entry that would restart it.
 
-### 6.2 Confirm the target is gone
+### 5.2 Confirm the target is gone
 
-Removed in [§3.1](#3-remove-old-targets-oemcdb). Confirm it before deleting datafiles,
-so that a target still polling a dead SID does not raise incidents against a database
-that no longer exists.
+🟩 Removed 2026-09-15, per [§3.1](#3-remove-old-targets-oemcdb). Confirmed before
+deleting datafiles, so that a target still polling a dead SID cannot raise incidents
+against a database that no longer exists.
 
-### 6.3 Reclaim the datafiles
+### 5.3 Reclaim the datafiles
 
-[Part 2 §5](phase-7d-part2-deployment.md#5-create-oempdb-with-copy-option) used `COPY`, so the
-original datafiles are still on disk and still consuming the space
-[Part 1 §3](phase-7d-part1-pre-deployment.md#3-size-the-target) reserved.
+🟩 Removed 2026-09-15. **This is the step that ended the rollback.**
+
+[Part 2 §5](phase-7d-part2-deployment.md#5-create-oempdb-with-copy-option) used `COPY`,
+so the original datafiles stayed on disk through the window and through §3, holding the
+space [Part 1 §3](phase-7d-part1-pre-deployment.md#3-size-the-target) reserved. They
+were deleted once §3 had passed and §5.1 and §5.2 were confirmed.
 
 ```bash
 df -h /u01
 ```
 
-Delete the old `OEMCDB` datafile directory only after §3 has passed and §6.1 and §6.2
-are done.
+> ### The fallback to the non-CDB no longer exists
+>
+> From this point the only recovery path is the RMAN level 0 of `usatcdb` taken in
+> [§6.1](#6-close-out). [Part 2 §8](phase-7d-part2-deployment.md#8-rollback) describes
+> a route that is no longer available and is kept as a record of the window.
 
-### 6.4 Decide on `oemcdbXDB`
+### 5.4 Decide on `oemcdbXDB`
 
 `dba_services` inside `oempdb` lists `oemcdbXDB`, the XML DB service that came across
 with the plug-in, because a non-CDB's service definitions travel into the PDB. It is
@@ -315,15 +292,19 @@ rather than an unexplained leftover.
 
 ---
 
-## 7. Close out
+## 6. Close out
 
-### 7.1 Back up the new shape
+### 6.1 Back up the new shape
+
+🟩 Taken 2026-09-15.
 
 An RMAN level 0 of `usatcdb`, which now covers `CDB$ROOT`, `oempdb` and `ggpdb` in
 one backup. The previous backup strategy targeted a single non-CDB and no longer
 describes this database.
 
-### 7.2 AHF compliance check
+### 6.2 AHF compliance check
+
+🟩 Run 2026-09-15.
 
 ```bash
 orachk -a
@@ -331,10 +312,12 @@ orachk -a
 
 Diffable against the baseline in
 [Phase 7a Part 1 §5.6](phase-7a-part1-before-the-window.md#56-ahf-compliance-baseline).
+This also closes the post-patch compliance run that has been outstanding since
+Phase 7a.
 
 ---
 
-## 8. Appendix A: Reference notes
+## 7. Appendix A: Reference notes
 
 ### A.1 Why `emcli migrate_noncdb_to_pdb` is not used
 
@@ -373,7 +356,38 @@ help text recommends `-repos_conndesc` for repositories in TCPS mode; that
 recommendation is about TLS and does not restrict the parameter to TCPS, and the
 Administrator's Guide uses the same parameter over TCP for a RAC failover descriptor.
 
-### A.4 `SAVE STATE` is not optional
+### A.4 The Ansible role followed the rename on its own
+
+The `oem_repo_patch` role discovers `oem_repo_sid` from `ora_pmon_*` rather than
+reading a hardcoded value, so it picked up `usatcdb` with no variable change anywhere.
+Its CDB detection, dormant since it was written because `SELECT cdb FROM v$database`
+returned `NO`, now resolves to the CDB path:
+
+```
+usatcdb is a CDB — datapatch will be preceded by ALTER PLUGGABLE DATABASE ALL OPEN
+```
+
+Confirmed 2026-09-15 by a read-only preflight run. The branch itself executes on the
+next repository Release Update; nothing in this phase needed it.
+
+That run also read `dba_registry_sqlpatch` from inside `usatcdb` and found both Phase
+7a patches already `APPLY / SUCCESS`, timestamped 14-SEP. The dictionary changes
+travelled across with the datafiles, which is why no `datapatch` step appears anywhere
+in this part.
+
+One defect surfaced. The role's check for the RU zip is tagged
+`oem_repo_patch_preflight`, so a preflight-only run fails at the last task demanding
+patch media it will never use:
+
+```
+COMBO_OJVM_DBRU_19RU32_p39618649_190000_Linux-x86-64.zip not found on
+oemserver01 or on oradbserv05
+```
+
+The zip was deleted after Phase 7a, correctly. Moving that check to
+`oem_repo_patch_stage` would make preflight a true read-only probe. Not done.
+
+### A.5 `SAVE STATE` is not optional
 
 Without `ALTER PLUGGABLE DATABASE ... SAVE STATE`, a PDB returns to `MOUNTED` after
 every container restart. For `oempdb` that means the OMS fails to start after any
@@ -382,7 +396,7 @@ and central agent do not start automatically after a host reboot on this estate.
 
 ---
 
-## 9. Screenshot checklist
+## 8. Screenshot checklist
 
 All files go in [`screenshots/7d/`](screenshots/7d/), embedded as
 `screenshots/7d/<file>`. See the
@@ -400,9 +414,8 @@ subdirectory.
 | `7d3-07-target_discovery_show_con.png` | 1.3 | The console listing the container and both PDBs | 🟩 |
 | `7d3-08-monitoring-config-service-name.png` | 1.4 | A monitoring configuration page after the SID was replaced | ⬜ |
 | `7d3-09-oemcdb-target-removed.png` | 3.1 | The old `oemcdb` target gone | ⬜ |
-| `7d3-10-ansible-cdb-branch.png` | 4.1 | The CDB branch taken and `datapatch` across the PDBs | ⬜ |
-| `7d3-11-df-reclaimed.png` | 6.3 | `/u01` after the old datafiles are removed | ⬜ |
-| `7d3-12-services-after-cleanup.png` | 6.4 | `dba_services` in `oempdb` after the `oemcdbXDB` decision | ⬜ |
+| `7d3-10-df-reclaimed.png` | 5.3 | `/u01` after the old datafiles are removed | ⬜ |
+| `7d3-11-services-after-cleanup.png` | 5.4 | `dba_services` in `oempdb` after the `oemcdbXDB` decision | ⬜ |
 
 Two files share the `7d3-07-` prefix. Both are referenced as they are on disk.
 

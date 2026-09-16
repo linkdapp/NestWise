@@ -18,7 +18,7 @@ Status: 🟩 Confirmed. `19.32.0.0.0`, invalid objects 2 to 0, targets 43 to 43,
 | 13 | Datapatch, the step people forget | 🟩 Confirmed |
 | 14 | `extjob`, and two things left manual | 🟩 Confirmed |
 | 15 | Bring Enterprise Manager back | 🟩 Confirmed |
-| 16 | Verification checklist | 🟩 Confirmed (13 of 16 rows; 3 outstanding, §18 and §13.4) |
+| 16 | Verification checklist | 🟩 Confirmed (14 of 16 rows; 2 outstanding, §18 and §13.4) |
 | 17 | Rollback, if verification fails | ⬜ Not needed |
 | 18 | Aftermath — what is still outstanding | 🟨 Two items open |
 | 19 | Screenshot checklist and naming convention | 🟩 Confirmed |
@@ -318,7 +318,7 @@ Not one check. A patched database that OMS cannot use is not a successful patch.
 
 | # | Check | Command | Expected | Result |
 |---|---|---|---|---|
-| 0 | AHF compliance, post-patch | `orachk -a` | diffable against the Part 1 §5.6 baseline | ⬜ outstanding |
+| 0 | AHF compliance, post-patch | `orachk -a` | diffable against the Part 1 §5.6 baseline | 🟩 run 2026-09-15, at [Phase 7d Part 3 §6.2](phase-7d-part3-post-deployment.md#6-close-out) |
 | 1 | Binary patches present | `opatch lspatches` | **both** `39472050` and `39222882` | 🟩 both, plus OCW |
 | 2 | Dictionary patched | `SELECT * FROM dba_registry_sqlpatch` | **both** IDs, `APPLY`, `SUCCESS` | 🟩 07:14:28 and 07:10:04 |
 | 3 | Version | `SELECT banner_full FROM v$version` | `19.32.0.0.0` | 🟩 |
@@ -466,8 +466,10 @@ on a host already at 15% free is a real risk rather than a theoretical one. It
 
 ### 18.3 Smaller follow-ups
 
-- **Post-patch AHF compliance check**, to diff against the Part 1 §5.6 baseline
-  (§16 check 0).
+- ~~**Post-patch AHF compliance check**~~, §16 check 0. Run 2026-09-15 as
+  [Phase 7d Part 3 §6.2](phase-7d-part3-post-deployment.md#6-close-out). It ran against
+  the container rather than the non-CDB, so the diff against the Part 1 §5.6 baseline
+  carries that difference with it.
 - **Confirm the console loads** in a browser (§16 check 14).
 - **Fix the `group_vars/all.yml` description** of
   `/u01/app/oracle/product/19.3.0/db_1`, which calls it an Oracle *Client* home.

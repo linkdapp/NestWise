@@ -608,7 +608,7 @@ oempdb
 in §7.
 
 `oemcdbXDB` arrived with the plug-in. A non-CDB's service definitions travel into the
-PDB. It is left alone in this window; [Part 3 §6](phase-7d-part3-post-deployment.md#6-retire-the-old-non-cdb)
+PDB. It is left alone in this window; [Part 3 §5](phase-7d-part3-post-deployment.md#5-retire-the-old-non-cdb)
 is where the old naming is cleared.
 
 > ### Create the service in the PDB, not in `CDB$ROOT`
@@ -688,7 +688,7 @@ emctl config oms -store_repos_details -repos_conndesc <connect descriptor> -repo
 ```
 
 The first cannot express this target. A PDB has no SID, which is
-[Appendix A.3 in Part 3](phase-7d-part3-post-deployment.md#8-appendix-a-reference-notes).
+[Appendix A.3 in Part 3](phase-7d-part3-post-deployment.md#7-appendix-a-reference-notes).
 
 ```bash
 source ~/.env/oms_env
@@ -734,7 +734,13 @@ needs a running OMS, which is why it is not here.
 
 ## 8. Rollback
 
-Not used on 2026-09-15. Recorded because it is the reason `COPY` was chosen.
+Not used on 2026-09-15, and no longer available: the source datafiles were deleted in
+[Part 3 §5.3](phase-7d-part3-post-deployment.md#5-retire-the-old-non-cdb) once the new
+shape had been verified and backed up. Recovery from here is the RMAN level 0 of
+`usatcdb`.
+
+This section is kept as the record of what the window's fallback was, and because it is
+the reason `COPY` was chosen over `NOCOPY` or `MOVE`.
 
 The fallback is the original non-CDB: `COPY` leaves `oemcdb`'s datafiles intact, so the
 way back at every point in this window is to start the old database and run the window
@@ -957,7 +963,7 @@ appends a domain to unqualified aliases and breaks the ones that already resolve
 `dba_services` inside `oempdb` lists `oemcdbXDB`, the XML DB service that came across
 with the plug-in, because a non-CDB's service definitions travel into the PDB. It is
 named for a database that will not exist after
-[Part 3 §6](phase-7d-part3-post-deployment.md#6-retire-the-old-non-cdb). It is left in
+[Part 3 §5](phase-7d-part3-post-deployment.md#5-retire-the-old-non-cdb). It is left in
 place during the window. Removing it is a Part 3 decision and needs XML DB usage
 confirmed first.
 
