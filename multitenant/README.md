@@ -6,7 +6,7 @@ Multitenant is one of the areas the Oracle Certified Master 19c practical bluepr
 centres on, alongside database and network configuration, tablespace and undo
 management, backup and recovery, and performance tuning.
 
-Status: 🟨 In progress. One build, filed with the phase it belongs to.
+Status: 🟩 One build, complete, filed with the phase it belongs to.
 
 > ### The build
 >
@@ -14,16 +14,17 @@ Status: 🟨 In progress. One build, filed with the phase it belongs to.
 >
 > `oemcdb`, a 19.32 non-CDB, plugged into a new container `usatcdb` as `oempdb`, with
 > `ggpdb` created alongside it. The window is closed: the repository runs from the PDB
-> and the console is served from it. Post-deployment is nearly complete: the container
-> and both PDBs are promoted as monitored targets, the old non-CDB is fully retired,
-> and the container is backed up.
+> and the console is served from it. Confirmed 2026-09-16: the container and both PDBs
+> are promoted as monitored targets, the old non-CDB is fully retired, and the container
+> is backed up.
 
 | Topic | Covers | Where |
 |---|---|---|
 | **Moving a non-CDB into a container** | `DBMS_PDB.DESCRIBE`, `CHECK_PLUG_COMPATIBILITY`, `CREATE PLUGGABLE DATABASE ... USING ... COPY` and `noncdb_to_pdb.sql`, plus the Enterprise Manager side of moving a live repository | [Phase 7d index](../monitoring/phase-7d-noncdb-to-pdb.md) |
 | Building a container to receive a PDB | Template capture, the component set, character sets, and the memory model a stock template drops | [Part 1 §4](../monitoring/phase-7d-part1-pre-deployment.md#4-create-usatcdb) |
 | Creating and managing PDBs | `ggpdb` created from `PDB$SEED`, `FILE_NAME_CONVERT`, `SAVE STATE` | [Part 1 §5](../monitoring/phase-7d-part1-pre-deployment.md#5-create-ggpdb) |
-| Services for a PDB | Why a PDB's default service is administrative only, `DBMS_SERVICE.CREATE_SERVICE` in the PDB rather than the root, and what `tnsnames.ora` does and does not need | [Part 2 §6.4](../monitoring/phase-7d-part2-deployment.md#64-add-a-service-for-the-repository) |
+| Services for a PDB | Why a PDB's default service is administrative only, `DBMS_SERVICE.CREATE_SERVICE` in the PDB rather than the root, and the two mechanisms needed to make a service survive a restart | [Part 2 §6.4](../monitoring/phase-7d-part2-deployment.md#64-add-a-service-for-the-repository) |
+| A service that does not restart | A PDB service started but never persisted, and the application outage that followed a reboot | [Part 2 §6.5](../monitoring/phase-7d-part2-deployment.md#65-what-happens-when-the-service-does-not-come-back) |
 | Working across every container | Oracle-maintained type conversion is per container, and `catcon.pl` is how it is driven | [Part 2 Appendix A](../monitoring/phase-7d-part2-deployment.md#appendix-a-checking-every-container) |
 | Patching a container | Why the plugged-in PDB arrives already patched, and what changes about `datapatch` from here on | [Part 3 Appendix A.4](../monitoring/phase-7d-part3-post-deployment.md#7-appendix-a-reference-notes) |
 

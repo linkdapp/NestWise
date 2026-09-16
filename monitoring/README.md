@@ -3,15 +3,15 @@
 **Enterprise Manager Cloud Control: the OEM 13.5 estate, its repository database, and the road to 24ai**
 
 Status: 🟨 In progress. Phases 7a, 7b and 7c are confirmed: the estate runs
-**24ai Release 1 Update 12** on the OMS and on all six agents. 7d's window is closed;
-the repository now runs as a PDB and its post-deployment is outstanding.
+**24ai Release 1 Update 12** on the OMS and on all six agents, and 7d has moved the
+repository into a container database.
 
 | Phase | Covers | Status |
 |---|---|---|
 | **7a** [Patching the OEM repository database to 19c RU32](phase-7a-repository-db-ru32.md) | `oemcdb` 19.19.0.0.0 to 19.32.0.0.0, combo 39618649 (DB RU plus OJVM), fully automated with a human checkpoint at the blackout | 🟩 Confirmed 2026-09-04 |
 | **7b** [Extending coverage](phase-7b-extending-coverage.md) | Agents onto the RAC clusters and the NestWise app tier from a gold agent image, administration groups and monitoring templates (Production, Test, Development), APEX, ORDS and MongoDB via Metric Extensions. Manual SOP, no Ansible | 🟩 Confirmed 2026-09-09 |
 | **7c** [OMS 13.5 to 24ai](phase-7c-oms-upgrade.md) | Part 1 took the OMS from base 13.5.0.0.0 to RU33 (13.5.0.33) with patch 39676211. Part 2 took it to **24ai Release 1 Update 12**, out of place, using **Upgrade software only with plug-ins and Configure Later** so RU12 was applied to the binaries before `ConfigureGC.sh` ran. Gates: OMS at 13.5 RU22 or later, repository database at 19.22 or later, 24ai target at RU06 or later from RU28 and above. Part 2c took the remaining agents to 24ai, one through the Agent Upgrade Console and the rest through the gold image | 🟩 Confirmed 2026-09-13 |
-| **7d** [Moving the repository into a container](phase-7d-noncdb-to-pdb.md), also indexed under [Multitenant](../multitenant/README.md) | `OEMCDB`, which despite the name is **not** a CDB, is plugged into a new container `usatcdb` as `oempdb`, and `ggpdb` is created alongside it for GoldenGate. There is no in-place conversion: a non-CDB becomes a PDB inside a container. A prerequisite for taking this database past 19c, since non-CDB is desupported from 21c onward. **Not** a prerequisite for 7c: 24ai supports a non-CDB repository | 🟨 In progress. [Part 1](phase-7d-part1-pre-deployment.md) and [Part 2](phase-7d-part2-deployment.md) confirmed 2026-09-15; the console is served from `oempdb`. [Part 3](phase-7d-part3-post-deployment.md) nearly complete: targets promoted, old `oemcdb` fully retired including its datafiles, container backed up, compliance check run |
+| **7d** [Moving the repository into a container](phase-7d-noncdb-to-pdb.md), also indexed under [Multitenant](../multitenant/README.md) | `OEMCDB`, which despite the name is **not** a CDB, is plugged into a new container `usatcdb` as `oempdb`, and `ggpdb` is created alongside it for GoldenGate. There is no in-place conversion: a non-CDB becomes a PDB inside a container. A prerequisite for taking this database past 19c, since non-CDB is desupported from 21c onward. **Not** a prerequisite for 7c: 24ai supports a non-CDB repository | 🟩 Confirmed 2026-09-16. [Parts 1 and 2](phase-7d-part2-deployment.md) ran the window on 2026-09-15 and the console is served from `oempdb`. [Part 3](phase-7d-part3-post-deployment.md) retired the old non-CDB including its datafiles, backed up the container and closed the compliance check. The repository service not restarting with the PDB took the OMS down the next day and is recorded as [Part 2 §6.5](phase-7d-part2-deployment.md#65-what-happens-when-the-service-does-not-come-back) |
 
 **Coverage before the upgrade.** 7b was moved ahead of the OMS upgrade
 deliberately. Upgrading to 24ai against eight monitored hosts and a real target

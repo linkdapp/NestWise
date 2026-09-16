@@ -20,17 +20,17 @@ supports. This phase changes that.
 > Enterprise Manager repository, and half the procedure is Enterprise Manager
 > configuration.
 
-Status: 🟨 **Nearly complete.** The repository runs as `oempdb` inside `usatcdb` and
-the console is served from it. The old non-CDB is fully retired: target removed,
+Status: 🟩 **Confirmed 2026-09-16.** The repository runs as `oempdb` inside `usatcdb`
+and the console is served from it. The old non-CDB is fully retired: target removed,
 instance down, datafiles deleted, so the rollback is closed and recovery is the RMAN
-level 0 of the container. Outstanding in Part 3: the two targets that may still hold
-the old SID, the estate's connection details, and four screenshots.
+level 0 of the container. All three parts are complete; some screenshots are still
+outstanding.
 
 | Part | Covers | Downtime | Status |
 |---|---|---|---|
 | [Part 1: Pre-deployment](phase-7d-part1-pre-deployment.md) | Record the source state, clear the eight compatibility gates, size the target, build `usatcdb` and `ggpdb`, prove the service name descriptor | **None** | 🟩 Confirmed 2026-09-15 |
 | [Part 2: Deployment](phase-7d-part2-deployment.md) | Stop the stack, describe the non-CDB, plug it in as `oempdb`, run `noncdb_to_pdb.sql`, add the repository service, repoint the OMS | **The window** | 🟩 Confirmed 2026-09-15 |
-| [Part 3: Post-deployment](phase-7d-part3-post-deployment.md) | Repoint the repository target, remove the old targets, update the estate's connection details, retire the old non-CDB | None | 🟨 Nearly complete |
+| [Part 3: Post-deployment](phase-7d-part3-post-deployment.md) | Repoint the repository target, remove the old targets, update the estate's connection details, retire the old non-CDB | None | 🟩 Confirmed 2026-09-16 |
 
 Start with Part 1.
 
@@ -123,6 +123,13 @@ by `noncdb_to_pdb.sql`.
 | 7 | No encrypted tablespaces | TDE is Phase 5. If it lands first, the keystore has to be exported and imported with the PDB |
 | 8 | No unconverted Oracle-maintained type data | Checked by `noncdb_to_pdb.sql` rather than by `CHECK_PLUG_COMPATIBILITY`, so it stops the run in Part 2 §6 rather than at §5 |
 
+Two things in this phase are not gates and still stopped it. `noncdb_to_pdb.sql` halted
+on unconverted type data
+([Part 2 §6.1](phase-7d-part2-deployment.md#61-before-executing-noncdb_to_pdbsql-need-to-check-the-ora-01722-means-unconverted-type-data)),
+and the repository service did not restart with the PDB, which took the OMS down the
+day after the window
+([Part 2 §6.5](phase-7d-part2-deployment.md#65-what-happens-when-the-service-does-not-come-back)).
+
 ---
 
 ## Estate facts this phase depends on
@@ -183,7 +190,9 @@ documents do not spell out. It is not a substitute for them.
   ([Part 3 §1.1](phase-7d-part3-post-deployment.md#1-repoint-the-repository-target));
   and two targets that keep the old SID in their monitoring configuration even after
   `-list_repos_details` reports the service name
-  ([Part 3 §1.4](phase-7d-part3-post-deployment.md#1-repoint-the-repository-target))
+  ([Part 3 §1.4](phase-7d-part3-post-deployment.md#1-repoint-the-repository-target)).
+  That last one names the targets as EM 13.4 did; 24ai qualifies one of them with the
+  host and port, which Part 3 records
 
 ---
 

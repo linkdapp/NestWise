@@ -8,26 +8,31 @@ Part 3 of three. [Part 1](phase-7d-part1-pre-deployment.md) built the container.
 Also indexed by skill area under
 [Multitenant](../multitenant/README.md).
 
-Status: 🟨 **Nearly complete.** The old non-CDB is fully retired: target removed,
-instance down, datafiles deleted. The container is backed up, the compliance check has
-run. Outstanding: §1.4, §4, and four screenshots.
-
-**The rollback to `oemcdb` no longer exists.** Recovery is the RMAN level 0 of
-`usatcdb` from §6.1.
+Status: 🟩 **Confirmed 2026-09-16.** Every section is closed. Three screenshots remain
+uncaptured.
 
 [Part 2](phase-7d-part2-deployment.md) ends with the console served from `oempdb`.
 Everything here follows that.
 
+> ### Where this leaves the estate
+>
+> | | |
+> |---|---|
+> | Repository | `oempdb`, a PDB in `usatcdb`, monitored as a PDB target |
+> | Old non-CDB | Retired. Target removed, instance down, datafiles deleted |
+> | Rollback | **Closed.** Recovery is the RMAN level 0 of `usatcdb` from [§6.1](#6-close-out) |
+> | Anything naming `oemcdb` | None found, in the repository or on the host |
+
 | # | Task | Status |
 |---|---|---|
-| 1 | Repoint the repository target | 🟨 1.1 to 1.3 confirmed 2026-09-15; 1.4 open |
+| 1 | Repoint the repository target | 🟩 Confirmed. 1.1 to 1.3 on 2026-09-15, 1.4 on 2026-09-16 |
 | 2 | Clear the blackout | Not needed, none was created |
 | 3 | Remove old targets `oemcdb` | 🟩 Confirmed 2026-09-15 |
-| 4 | Update the estate's connection details | ⬜ |
+| 4 | Update the estate's connection details | 🟩 Confirmed 2026-09-16 |
 | 5 | Retire the old non-CDB | 🟩 Confirmed 2026-09-15. Rollback ended |
 | 6 | Close out | 🟩 Confirmed 2026-09-15 |
 | 7 | Appendix A: Reference notes | 🟩 |
-| 8 | Screenshot checklist | 🟨 7 of 11 |
+| 8 | Screenshot checklist | 🟨 7 of 10 |
 
 ```bash
 source ~/.env/oms_env
@@ -50,12 +55,11 @@ source ~/.env/oms_env
 
 ## 1. Repoint the repository target
 
-Status: 🟩 the OMS connection itself was repointed in
-[Part 2 §7](phase-7d-part2-deployment.md#7-repoint-the-oms). What remains here is the
-two monitored targets that describe the same database and did not move with it.
+🟩 Confirmed. §1.1 to §1.3 on 2026-09-15, §1.4 on 2026-09-16.
 
-`usatcdb`, `oempdb` and `ggpdb` were confirmed open at the end of Part 2. That check is
-not repeated here.
+[Part 2 §7](phase-7d-part2-deployment.md#7-repoint-the-oms) changed where the OMS
+connects. What remains here is the monitored targets that describe the same database
+and did not move with it.
 
 ### 1.1 Unlock `dbsnmp` in the container
 
@@ -146,32 +150,41 @@ it.
 
 ### 1.4 Check the targets that keep the old SID anyway
 
+🟩 Confirmed 2026-09-16.
+
 `emctl config oms -list_repos_details` reporting a service name does not guarantee
-every target agrees. Two monitoring configurations have been observed still holding the
-SID after the change:
+every target agrees.
 
-| Target | Where |
+**Targets → All Targets**, search `management`. Two of the nine results carry
+repository connection details:
+
+| Target name | Target type |
 |---|---|
-| Management Service | Its monitoring configuration page |
-| Management Services and Repository | Its monitoring configuration page |
+| `Management Services and Repository` | OMS and Repository |
+| `oemserver01.usat.com:4889_Management_Service` | Oracle Management Service |
 
-Open each target's **Monitoring Configuration** and read the connect descriptor. Where
-it still names a SID, edit it to the service name form and save. Change only the
-connect descriptor; leave the username and password fields alone.
+Open each, go to **Monitoring Configuration** and read the connect descriptor. Where it
+still names a SID, edit it to the service name form and save. Change only the connect
+descriptor; leave the username and password fields alone.
+
+All nine reported Up on this estate, which closes the check: `oemcdb`'s datafiles were
+deleted in [§5.3](#5-retire-the-old-non-cdb), so a target still resolving through it
+would read Down.
+
+[Appendix A.4](#7-appendix-a-reference-notes) covers why the target names here differ
+from the field report this check comes from.
 
 ---
 
 ## 2. Clear the blackout
 
-The blackout created in
-[Part 2 §1.1](phase-7d-part2-deployment.md#11-create-the-blackout) suppresses every
-alert on the estate while it is active.
+Not needed on 2026-09-15: none was created in
+[Part 2 §1.1](phase-7d-part2-deployment.md#11-create-the-blackout).
 
-Through the console, following
-**[Creating a Blackout in Enterprise Manager](oem-create-blackout.md)**.
-
-Check Incident Manager afterwards for availability events raised during the window
-and clear the ones that are artefacts of it rather than real.
+Where one exists, clear it through the console per
+**[Creating a Blackout in Enterprise Manager](oem-create-blackout.md)**, then check
+Incident Manager for availability events raised during the window and clear the ones
+that are artefacts of it rather than real.
 
 ---
 
@@ -209,6 +222,10 @@ All agents Up, Secure Upload Yes, recent Last Successful Load.
 ---
 
 ## 4. Update the estate's connection details
+
+🟩 Confirmed 2026-09-16. The search below returned nothing, and `listener.ora` and
+`tnsnames.ora` on `oemserver01` name only `usatcdb`, `oempdb` and the Data Guard
+aliases.
 
 Anything that names the repository by SID now points at a database that does not
 start.
@@ -282,15 +299,16 @@ select name, network_name from dba_services order by name;
 select name from v$active_services order by name;
 ```
 
-Confirm nothing connects through it before removing it. Checked over a period that
-covers a full monitoring cycle, not a single sample:
+**Decision 2026-09-16: it stays.** Leaving it costs nothing and removing it risks an
+XML DB dependency nobody has enumerated. It is recorded here so the name is a decision
+rather than an unexplained leftover.
+
+Were it ever to be removed, nothing should be connecting through it first, checked over
+a period covering a full monitoring cycle rather than a single sample:
 
 ```sql
 select service_name, count(*) from v$session group by service_name;
 ```
-
-Leaving it costs nothing. It is listed here so that the name is a recorded decision
-rather than an unexplained leftover.
 
 ---
 
@@ -358,7 +376,15 @@ help text recommends `-repos_conndesc` for repositories in TCPS mode; that
 recommendation is about TLS and does not restrict the parameter to TCPS, and the
 Administrator's Guide uses the same parameter over TCP for a RAC failover descriptor.
 
-### A.4 The Ansible role followed the rename on its own
+### A.4 Target names differ between EM 13.4 and 24ai
+
+The §1.4 check comes from a field report written against EM 13.4, where the second
+target is named simply "Management Service". 24ai qualifies it with the host and the
+port: `oemserver01.usat.com:4889_Management_Service`. The other seven results from that
+search are the beacon, `Management_Servers`, and five `_Management_Service_*`
+application targets, none of which holds a connect descriptor of its own.
+
+### A.5 The Ansible role followed the rename on its own
 
 The `oem_repo_patch` role discovers `oem_repo_sid` from `ora_pmon_*` rather than
 reading a hardcoded value, so it picked up `usatcdb` with no variable change anywhere.
@@ -389,12 +415,18 @@ oemserver01 or on oradbserv05
 The zip was deleted after Phase 7a, correctly. Moving that check to
 `oem_repo_patch_stage` would make preflight a true read-only probe. Not done.
 
-### A.5 `SAVE STATE` is not optional
+### A.6 `SAVE STATE` carries two things, and order matters
 
 Without `ALTER PLUGGABLE DATABASE ... SAVE STATE`, a PDB returns to `MOUNTED` after
 every container restart. For `oempdb` that means the OMS fails to start after any
 reboot of `oemserver01`, which pairs badly with the documented behaviour that the OMS
 and central agent do not start automatically after a host reboot on this estate.
+
+It also records the PDB's services, which is what took the OMS down on 2026-09-16: the
+`SAVE STATE` in Part 2 ran one section before the repository service was created, so it
+saved a PDB with no service attached.
+[Part 2 §6.5](phase-7d-part2-deployment.md#65-what-happens-when-the-service-does-not-come-back)
+has the outage and the fix. Re-run `SAVE STATE` after adding a service, not before.
 
 ---
 
@@ -414,10 +446,10 @@ subdirectory.
 | `7d3-06-target_discovery_results.png` | 1.2 | `usatcdb`, `oempdb` and `ggpdb` found | 🟩 |
 | `7d3-07-target_discovery_review.png` | 1.2 | The review page before saving | 🟩 |
 | `7d3-07-target_discovery_show_con.png` | 1.3 | The console listing the container and both PDBs | 🟩 |
-| `7d3-08-monitoring-config-service-name.png` | 1.4 | A monitoring configuration page after the SID was replaced | ⬜ |
+| `7d3-08-management-targets-up.png` | 1.4 | All nine management targets Up after the move | ⬜ |
 | `7d3-09-oemcdb-target-removed.png` | 3.1 | The old `oemcdb` target gone | ⬜ |
 | `7d3-10-df-reclaimed.png` | 5.3 | `/u01` after the old datafiles are removed | ⬜ |
-| `7d3-11-services-after-cleanup.png` | 5.4 | `dba_services` in `oempdb` after the `oemcdbXDB` decision | ⬜ |
+| | 5.4 | Not applicable. `oemcdbXDB` is being kept | Closed |
 
 Two files share the `7d3-07-` prefix. Both are referenced as they are on disk.
 

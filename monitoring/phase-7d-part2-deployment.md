@@ -22,10 +22,11 @@ and the console is served from it. Part 3 follows.
 > `CREATE PLUGGABLE DATABASE ... COPY` → `noncdb_to_pdb.sql` → open and `SAVE STATE`
 > → create the service → repoint the OMS.
 >
-> **The one that bites:** `noncdb_to_pdb.sql` stops with `ORA-01722` if any table
-> holds unconverted Oracle-maintained type data. It did here.
-> [§6.1](#61-before-executing-noncdb_to_pdbsql-need-to-check-the-ora-01722-means-unconverted-type-data)
-> is the fix.
+> **Two that bite.** `noncdb_to_pdb.sql` stops with `ORA-01722` if any table holds
+> unconverted Oracle-maintained type data, which it did here:
+> [§6.1](#61-before-executing-noncdb_to_pdbsql-need-to-check-the-ora-01722-means-unconverted-type-data).
+> And the repository service does not restart with the PDB on its own, which took the
+> OMS down the next day: [§6.5](#65-what-happens-when-the-service-does-not-come-back).
 
 | # | Task | Status |
 |---|---|---|
@@ -34,10 +35,10 @@ and the console is served from it. Part 3 follows.
 | 3 | Shut the source down | 🟩 Confirmed 2026-09-15 |
 | 4 | Check plug compatibility | 🟩 Confirmed 2026-09-15 |
 | 5 | Create `oempdb` with COPY option | 🟩 Confirmed 2026-09-15 |
-| 6 | Run `noncdb_to_pdb.sql` | 🟩 Confirmed 2026-09-15 |
+| 6 | Run `noncdb_to_pdb.sql` | 🟩 Confirmed 2026-09-15. §6.4's restart test added and passed 2026-09-16, see §6.5 |
 | 7 | Repoint the OMS | 🟩 Confirmed 2026-09-15 |
 | 8 | Rollback | Not needed |
-| 9 | Screenshot checklist | 🟨 10 of 12 |
+| 9 | Screenshot checklist | 🟨 10 of 13 |
 | | Appendices A, B and C | 🟩 Recorded 2026-09-15 |
 
 ```bash
@@ -601,15 +602,13 @@ oempdb
 oempdb
 ```
 
-`db_domain` is empty, so the default service is the bare PDB name and
-`oempdb.usat.com` is free. A `db_domain` of `usat.com` would make the default service
-`oempdb.usat.com` already, `CREATE_SERVICE` would return
-`ORA-44303: service name exists`, and a different network name would be needed here and
+`db_domain` empty means the default service is the bare PDB name, so `oempdb.usat.com`
+is free. Were it set to `usat.com`, `CREATE_SERVICE` would return
+`ORA-44303: service name exists` and a different network name would be needed here and
 in §7.
 
-`oemcdbXDB` arrived with the plug-in. A non-CDB's service definitions travel into the
-PDB. It is left alone in this window; [Part 3 §5](phase-7d-part3-post-deployment.md#5-retire-the-old-non-cdb)
-is where the old naming is cleared.
+`oemcdbXDB` arrived with the plug-in and is left alone:
+[Appendix B.6](#b6-oemcdbxdb).
 
 > ### Create the service in the PDB, not in `CDB$ROOT`
 >
@@ -656,10 +655,111 @@ Expected: `oempdb.usat.com` and `oempdb` both listed. A missing entry means PMON
 not registered yet: wait for the next registration, or force it with
 `ALTER SYSTEM REGISTER;` from the root.
 
+**Make it survive a restart.** `CREATE_SERVICE` defines the service and
+`START_SERVICE` starts it in the running instance. Neither brings it back after a
+restart. Two mechanisms; [Appendix B.4](#b4-lifetime) covers why both.
+
+Re-save the PDB's state, now that the service exists. The `SAVE STATE` in
+[§6.2](#62-open-it-and-save-the-state) ran before it did:
+
+```sql
+alter session set container = CDB$ROOT;
+alter pluggable database oempdb save state;
+```
+
+Then the trigger, **inside `oempdb`** rather than in `CDB$ROOT`:
+
+```sql
+alter session set container = oempdb;
+
+create or replace trigger start_repo_service
+  after startup on database
+declare
+  running number;
+begin
+  select count(*) into running
+  from   v$active_services
+  where  name = 'oempdb_srv';
+
+  if running = 0 then
+    dbms_service.start_service('oempdb_srv');
+  end if;
+end;
+/
+```
+
+> ### Then restart the container and check the listener again
+>
+> ```sql
+> shutdown immediate;
+> startup;
+> ```
+>
+> ```bash
+> lsnrctl status | grep -i oempdb
+> ```
+>
+> `oempdb.usat.com` must be listed before the OMS is started. This test is the step,
+> not a suggestion: see [§6.5](#65-what-happens-when-the-service-does-not-come-back).
+
+🟩 Tested 2026-09-16. After a full `shutdown immediate` and `startup`:
+
+```
+SQL> ! lsnrctl status | grep -i oempdb
+Service "oempdb" has 1 instance(s).
+Service "oempdb.usat.com" has 1 instance(s).
+```
+
+`SAVE STATE`, re-run after the service was created, was sufficient on its own. The
+trigger is the backstop for the case where that saved state is later cleared, not a
+second mechanism the service needs in order to work.
+
 **`tnsnames.ora` needs no entry for §7.** That step stores a full connect descriptor,
 so no naming method is consulted. An alias is optional and is for interactive use only.
 [Appendix B](#appendix-b-service-names-and-tnsnamesora) has the form and the reasoning
 behind the choices above.
+
+### 6.5 What happens when the service does not come back
+
+Recorded 2026-09-16, the day after the window. `oemserver01` restarted and the OMS
+would not start. `emctl start oms` hung, and `emctl.log` gave the reason:
+
+```
+ERROR oms.StatusOMSCmd - Status failure reason value is:
+  DB Connection service is invalid or temporarily unavailable
+INFO  commands.BaseCommand - Oracle Management Server is Down
+```
+
+The database was up and both PDBs were open. `lsnrctl status` showed why:
+
+```
+Service "ggpdb" has 1 instance(s).
+Service "oempdb" has 1 instance(s).
+Service "usatcdb" has 2 instance(s).
+Service "usatcdbXDB" has 1 instance(s).
+```
+
+`oempdb.usat.com` is absent. The OMS descriptor asks for that name and nothing answers
+to it, so every repository connection fails at the listener.
+
+The `SAVE STATE` above had been taken before the service existed, and no trigger was in
+place. Recovery is one statement:
+
+```sql
+alter session set container = oempdb;
+exec dbms_service.start_service('oempdb_srv');
+```
+
+Then `emctl start oms`. The AdminServer connection refusals on port 7102 in the same
+log are downstream of this and clear on their own once the repository is reachable.
+
+**Resolved 2026-09-16.** The service was started, `SAVE STATE` was re-run with the
+service in place, and a `shutdown immediate` / `startup` confirmed it registers on its
+own. The OMS came up with all nine management targets reporting Up.
+
+The root cause was ordering, not the mechanism: `SAVE STATE` records a PDB's services
+along with its open mode, and [§6.2](#62-open-it-and-save-the-state) ran it one section
+before the service existed.
 
 ---
 
@@ -828,6 +928,7 @@ subdirectory.
 | `7d2-11-console-reachable.png` | 7 | The console served from the repository in its new home | 🟩 |
 | `7d2-01-blackout-set.png` | 1.1 | The blackout active | ⬜ |
 | `7d2-03-plug-compatibility.png` | 4 | `CHECK_PLUG_COMPATIBILITY` returning `YES` | ⬜ |
+| `7d2-12-service-after-restart.png` | 6.4 | `lsnrctl status` showing `oempdb.usat.com` after a container restart | ⬜ |
 
 Three files carry a `d2-` prefix rather than `7d2-`. The pages reference them as they
 are on disk. Renaming them means editing the embeds in the same commit.
@@ -930,8 +1031,27 @@ Passing the network name to `STOP_SERVICE` fails.
 
 `CREATE_SERVICE` defines the service; `START_SERVICE` starts it in the running
 instance. The definition is stored in the PDB rather than in the root, so it travels
-with an unplug or a relocate. Confirm it comes back after the first PDB restart rather
-than assuming it does.
+with an unplug or a relocate.
+
+**It does not start itself.** This page originally said to confirm it came back after
+the first restart rather than assuming it does, and then did not make that a step. It
+did not come back, and the OMS was down until it was started by hand;
+[§6.5](#65-what-happens-when-the-service-does-not-come-back) has the evidence.
+
+Two mechanisms now cover it, in [§6.4](#64-add-a-service-for-the-repository):
+
+| Mechanism | What it does | How it fails |
+|---|---|---|
+| `SAVE STATE` | Records the PDB's services along with its open mode. Proven sufficient on its own, 2026-09-16 | Run before the service exists, it saves a PDB with no service. A later `DISCARD STATE`, clone or relocate clears it |
+| Trigger in the PDB | Starts the service on PDB open if it is not already running | Created in `CDB$ROOT` instead, it fires on container open, which can precede the PDB opening |
+
+The trigger is the backstop, not a second requirement. It travels with an unplug or a
+relocate the way the service definition does, and it is a no-op whenever `SAVE STATE`
+has already done the work.
+
+`srvctl` would be the documented answer on a host running Oracle Restart or Grid
+Infrastructure, where services are cluster resources with their own restart policy.
+`oemserver01` runs neither, per [B.2](#b2-why-dbms_service-rather-than-srvctl).
 
 ### B.5 `tnsnames.ora`
 
