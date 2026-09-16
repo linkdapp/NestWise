@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Non-CDB to PDB carousel</title>
+<style>
+  @page { size: 1080px 1080px; margin: 0; }
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  body {
+    background:#4a4a4a;
+    font-family:"Segoe UI", Helvetica, Arial, sans-serif;
+    display:flex; flex-direction:column; align-items:center; gap:24px; padding:24px;
+  }
+
+  .slide {
+    width:1080px; height:1080px;
+    background:linear-gradient(135deg,#0b1b2b 0%,#13293d 100%);
+    color:#ffffff;
+    position:relative;
+    padding:96px 84px;
+    display:flex; flex-direction:column;
+    overflow:hidden;
+  }
+  .slide::before {
+    content:""; position:absolute; top:0; left:0; right:0; height:10px; background:#c74634;
+  }
+
+  .kicker { color:#8fb8d6; font-size:28px; letter-spacing:4px; text-transform:uppercase; margin-bottom:28px; }
+  h1 { font-size:96px; line-height:1.02; font-weight:600; letter-spacing:-1px; }
+  h2 { font-size:68px; line-height:1.08; font-weight:600; margin-bottom:40px; }
+  .amber { color:#f0b429; }
+  .teal  { color:#7fd1a6; }
+  .red   { color:#ff9e8a; }
+  p  { font-size:38px; line-height:1.45; }
+  .lead { font-size:44px; line-height:1.4; margin-top:36px; }
+  .small { font-size:30px; color:#8fb8d6; line-height:1.5; }
+
+  .spacer { flex:1; }
+
+  .foot {
+    border-top:1px solid #2d6a8f; padding-top:28px;
+    font-size:26px; color:#6f9fc0; display:flex; justify-content:space-between;
+  }
+
+  code, .mono { font-family:"Cascadia Mono", Consolas, monospace; }
+
+  .box { border-radius:14px; padding:36px 40px; margin-top:28px; }
+  .box-blue { background:#16394f; border:2px solid #2d6a8f; }
+  .box-red  { background:#3a1f24; border:2px solid #c74634; }
+  .box-lab  { background:#10222f; border:1px solid #2d6a8f; }
+  .box h3 { font-size:26px; letter-spacing:3px; text-transform:uppercase; margin-bottom:22px; font-weight:600; }
+
+  table { width:100%; border-collapse:collapse; margin-top:32px; font-size:36px; }
+  td, th { padding:20px 12px; text-align:left; border-bottom:1px solid #2d6a8f; }
+  th { color:#8fb8d6; font-size:26px; letter-spacing:2px; text-transform:uppercase; font-weight:600; }
+  tr.hl td { color:#f0b429; font-weight:600; }
+
+  .cmd {
+    background:#081420; border-left:5px solid #7fd1a6; border-radius:6px;
+    padding:26px 30px; margin-top:28px; font-size:31px; line-height:1.6;
+    font-family:"Cascadia Mono", Consolas, monospace; color:#d6e8f5;
+  }
+  .cmd-red { border-left-color:#c74634; color:#ffc9bd; }
+
+  .num { font-size:150px; font-weight:700; color:#f0b429; line-height:1; }
+
+  .steps { margin-top:36px; }
+  .steps li { list-style:none; font-size:34px; line-height:1.5; padding:16px 0 16px 76px; position:relative; border-bottom:1px solid #1d4257; }
+  .steps li:last-child { border-bottom:none; }
+  .steps li span.n { position:absolute; left:0; top:16px; width:48px; height:48px; border-radius:24px; background:#16394f; border:2px solid #2d6a8f; color:#8fb8d6; font-size:26px; text-align:center; line-height:44px; }
+
+  .stat-row { display:flex; gap:28px; margin-top:44px; }
+  .stat { flex:1; background:#10222f; border:1px solid #2d6a8f; border-radius:12px; padding:30px 24px; text-align:center; }
+  .stat .v { font-size:72px; font-weight:700; color:#ffffff; line-height:1.1; }
+  .stat .l { font-size:24px; color:#8fb8d6; margin-top:12px; letter-spacing:1px; }
+
+  .swipe { position:absolute; right:84px; bottom:84px; font-size:26px; color:#f0b429; letter-spacing:2px; }
+
+  @media print {
+    body { background:none; padding:0; gap:0; display:block; }
+    .slide { page-break-after:always; break-after:page; }
+    .slide:last-child { page-break-after:auto; break-after:auto; }
+  }
+</style>
+</head>
+<body>
+
+<!-- 1 -->
+<section class="slide">
+  <div class="kicker">Oracle Database</div>
+  <h1>Non-CDB is<br><span class="amber">desupported</span>.</h1>
+  <p class="lead">From Oracle Database 21c onward.<br>If yours is still one, 19c is the ceiling.</p>
+  <div class="spacer"></div>
+  <div class="box box-lab">
+    <p class="mono" style="font-size:34px;color:#7fd1a6;">Moving a live Enterprise Manager repository</p>
+    <p class="mono" style="font-size:34px;color:#d6e8f5;margin-top:10px;">19.32.0.0.0 non-CDB &#8594; PDB in a container</p>
+  </div>
+  <div class="swipe">SWIPE &#8594;</div>
+</section>
+
+<!-- 2 -->
+<section class="slide">
+  <div class="kicker">The correction most people need</div>
+  <h2>There is no<br><span class="amber">in-place</span> conversion.</h2>
+  <p>You do not turn a non-CDB into a container. You build a new container and plug the old database into it as a pluggable database.</p>
+  <table>
+    <tr><th>Object</th><th>Before</th><th>After</th></tr>
+    <tr><td>Container</td><td>none</td><td class="mono">usatcdb</td></tr>
+    <tr class="hl"><td>Repository</td><td class="mono">oemcdb</td><td class="mono">oempdb</td></tr>
+  </table>
+  <div class="spacer"></div>
+  <div class="foot"><span>The contents move. The database does not convert.</span><span>19c</span></div>
+</section>
+
+<!-- 3 -->
+<section class="slide">
+  <div class="kicker">The sequence</div>
+  <h2>Seven steps, and<br>one <span class="red">stops</span> you.</h2>
+  <ul class="steps">
+    <li><span class="n">1</span><span class="mono">DBMS_PDB.DESCRIBE</span> writes the manifest</li>
+    <li><span class="n">2</span><span class="mono">CHECK_PLUG_COMPATIBILITY</span> reads it</li>
+    <li><span class="n">3</span><span class="mono">CREATE PLUGGABLE DATABASE ... COPY</span></li>
+    <li><span class="n">4</span><span class="mono">noncdb_to_pdb.sql</span> converts the dictionary</li>
+    <li><span class="n">5</span><span class="mono">OPEN</span>, then <span class="mono">SAVE STATE</span></li>
+    <li><span class="n">6</span>Create a service. A PDB has no SID</li>
+    <li><span class="n">7</span>Repoint Enterprise Manager</li>
+  </ul>
+  <div class="spacer"></div>
+  <div class="swipe">SWIPE &#8594;</div>
+</section>
+
+<!-- 4 -->
+<section class="slide">
+  <div class="kicker">Enterprise Manager</div>
+  <h2>The Oracle verb built<br>for this <span class="red">cannot</span> be used.</h2>
+  <div class="cmd">emcli migrate_noncdb_to_pdb<br>&nbsp;&nbsp;-migrationMethod=PLUG_AS_PDB</div>
+  <p class="lead">It drives a job through the OMS against a monitored target.</p>
+  <div class="box box-red">
+    <h3 class="red">Why not here</h3>
+    <p style="font-size:34px;">The repository is the database the OMS runs on. Shut the source down and the OMS stops with it, leaving the job nothing to run in.</p>
+  </div>
+  <div class="spacer"></div>
+  <div class="foot"><span>Done by hand at the SQL level</span><span>EM told afterwards</span></div>
+</section>
+
+<!-- 5 -->
+<section class="slide">
+  <div class="kicker">Compatibility returned YES</div>
+  <h2>Then the conversion<br><span class="red">stopped cold</span>.</h2>
+  <div class="cmd cmd-red">ORA-01722: invalid number<br><br>User tables dependent on<br>Oracle-Maintained types<br>need to be UPGRADED.<br>Non-CDB conversion aborting.</div>
+  <p class="lead">Every gate checked in advance had passed.<br>This one is not checked by <span class="mono">CHECK_PLUG_COMPATIBILITY</span>.</p>
+  <div class="spacer"></div>
+  <div class="swipe">SWIPE &#8594;</div>
+</section>
+
+<!-- 6 -->
+<section class="slide">
+  <div class="kicker">Two tables</div>
+  <h2>Advanced Queuing<br>payload columns.</h2>
+  <div class="cmd">OWNER&nbsp;&nbsp;&nbsp;&nbsp;TABLE_NAME<br>SYSMAN&nbsp;&nbsp;&nbsp;EM_EVENT_BUS_TABLE<br>SYSMAN&nbsp;&nbsp;&nbsp;EM_NOTIFY_QTABLE</div>
+  <p class="lead">An Oracle-maintained type evolved in an earlier upgrade. The data was never converted.</p>
+  <div class="box box-blue">
+    <h3 class="teal">The fix is one script</h3>
+    <p class="mono" style="font-size:34px;color:#7fd1a6;">@?/rdbms/admin/utluptabdata.sql</p>
+  </div>
+  <div class="spacer"></div>
+  <div class="foot"><span>Finding it is the work</span><span>Not the fixing</span></div>
+</section>
+
+<!-- 7 -->
+<section class="slide">
+  <div class="kicker">Why nothing caught it</div>
+  <h2>The database looked<br><span class="teal">perfectly healthy</span>.</h2>
+  <div class="stat-row">
+    <div class="stat"><div class="v teal">CLEAN</div><div class="l">DBA_INVALID_OBJECTS</div></div>
+    <div class="stat"><div class="v teal">PASS</div><div class="l">DATAPATCH</div></div>
+    <div class="stat"><div class="v teal">PASS</div><div class="l">UTLRP</div></div>
+  </div>
+  <p class="lead">It took a conversion nobody had ever run to surface a condition that had been sitting there through multiple Release Updates.</p>
+  <div class="spacer"></div>
+  <div class="foot"><span>Read-only check, costs nothing</span><span>Worth running anywhere</span></div>
+</section>
+
+<!-- 8 -->
+<section class="slide">
+  <div class="kicker">What changes afterwards</div>
+  <h2>The check is <span class="amber">per container</span>,<br>not per database.</h2>
+  <p>Each PDB carries its own dictionary and its own user tables. There is no <span class="mono">CDB_</span> view over <span class="mono">coltype$</span>, so the root cannot answer it in one statement.</p>
+  <div class="cmd">catcon.pl -u sys -b uptab_check uptab_check.sql</div>
+  <table>
+    <tr><th>Container</th><th>Result</th></tr>
+    <tr><td class="mono">CDB$ROOT</td><td>No rows</td></tr>
+    <tr><td class="mono">PDB$SEED</td><td>No rows</td></tr>
+    <tr><td class="mono">GGPDB</td><td>No rows</td></tr>
+    <tr class="hl"><td class="mono">OEMPDB</td><td>Two rows</td></tr>
+  </table>
+  <div class="spacer"></div>
+  <div class="swipe">SWIPE &#8594;</div>
+</section>
+
+<!-- 9 -->
+<section class="slide">
+  <div class="kicker">One more trap</div>
+  <h2>A PDB has<br><span class="amber">no SID</span>.</h2>
+  <p>Every connection goes through a service name. The old Enterprise Manager connect descriptor named a SID that no longer starts.</p>
+  <div class="box box-red">
+    <h3 class="red">Create it in the PDB, not the root</h3>
+    <p style="font-size:34px;"><span class="mono">CREATE_SERVICE</span> attaches the service to whichever container is current. Created in <span class="mono">CDB$ROOT</span>, the listener registers the name, the connection succeeds, and the session lands somewhere <span class="mono">SYSMAN</span> does not exist.</p>
+  </div>
+  <div class="spacer"></div>
+  <div class="foot"><span>No Grid Infrastructure here</span><span>So DBMS_SERVICE, not srvctl</span></div>
+</section>
+
+<!-- 10 -->
+<section class="slide">
+  <div class="kicker">Written up in full</div>
+  <h1>Every<br>command.<br><span class="amber">Every error.</span></h1>
+  <p class="lead">A three-part SOP: the eight compatibility gates, the window itself including the stop, and repointing every target that still named the old SID.</p>
+  <div class="box box-lab">
+    <p class="mono" style="font-size:32px;color:#7fd1a6;">linkdapp.github.io/NestWise</p>
+    <p style="font-size:30px;color:#8fb8d6;margin-top:14px;">Link in the first comment</p>
+  </div>
+  <div class="spacer"></div>
+  <div class="foot"><span>Data Guard on top of this?</span><span>Or 19c to 26ai next?</span></div>
+</section>
+
+</body>
+</html>

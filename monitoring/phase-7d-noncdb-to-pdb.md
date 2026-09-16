@@ -24,7 +24,7 @@ Status: 🟨 **Nearly complete.** The repository runs as `oempdb` inside `usatcd
 the console is served from it. The old non-CDB is fully retired: target removed,
 instance down, datafiles deleted, so the rollback is closed and recovery is the RMAN
 level 0 of the container. Outstanding in Part 3: the two targets that may still hold
-the old SID, the estate's connection details, and six screenshots.
+the old SID, the estate's connection details, and four screenshots.
 
 | Part | Covers | Downtime | Status |
 |---|---|---|---|

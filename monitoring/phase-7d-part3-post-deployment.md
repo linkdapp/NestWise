@@ -10,7 +10,7 @@ Also indexed by skill area under
 
 Status: 🟨 **Nearly complete.** The old non-CDB is fully retired: target removed,
 instance down, datafiles deleted. The container is backed up, the compliance check has
-run. Outstanding: §1.4, §4, and six screenshots.
+run. Outstanding: §1.4, §4, and four screenshots.
 
 **The rollback to `oemcdb` no longer exists.** Recovery is the RMAN level 0 of
 `usatcdb` from §6.1.
@@ -20,14 +20,14 @@ Everything here follows that.
 
 | # | Task | Status |
 |---|---|---|
-| 1 | Repoint the repository target | 🟨 1.1 and 1.2 done; 1.3 and 1.4 open |
+| 1 | Repoint the repository target | 🟨 1.1 to 1.3 confirmed 2026-09-15; 1.4 open |
 | 2 | Clear the blackout | Not needed, none was created |
 | 3 | Remove old targets `oemcdb` | 🟩 Confirmed 2026-09-15 |
 | 4 | Update the estate's connection details | ⬜ |
 | 5 | Retire the old non-CDB | 🟩 Confirmed 2026-09-15. Rollback ended |
 | 6 | Close out | 🟩 Confirmed 2026-09-15 |
 | 7 | Appendix A: Reference notes | 🟩 |
-| 8 | Screenshot checklist | 🟨 6 of 11 |
+| 8 | Screenshot checklist | 🟨 7 of 11 |
 
 ```bash
 source ~/.env/oms_env
@@ -134,6 +134,8 @@ removed in [§3](#3-remove-old-targets-oemcdb).
 
 
 ### 1.3 Verify Console Shows container Database and two Pluggable databases
+
+🟩 Confirmed 2026-09-15.
 
 **Targets → Databases**
 
