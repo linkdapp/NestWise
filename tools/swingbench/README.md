@@ -4,7 +4,7 @@
 Giles) is this project's standing load-generation tool — the way HA/DR claims get
 proven with an actual throughput chart instead of just a log line saying "failover
 completed." First real use in this project: the Swingbench-driven switchover test in
-[`high-availability/part3-post-checks.md` Section 16](../../high-availability/part3-post-checks.md#16-confirmed--post-standby-validation),
+[`high-availability/part3-post-checks.md` Section 16](../../high-availability/part3-post-checks.md#16--confirmed--post-standby-validation),
 which this README documents the general setup for.
 
 Version used in this project: **2.8.0.1630**, run from a Windows client PC — no
@@ -161,7 +161,7 @@ stabilized baseline is what makes a before/after comparison meaningful.
 
 ## Where this was actually used
 
-[`high-availability/part3-post-checks.md` Section 16](../../high-availability/part3-post-checks.md#16-confirmed--post-standby-validation)
+[`high-availability/part3-post-checks.md` Section 16](../../high-availability/part3-post-checks.md#16--confirmed--post-standby-validation)
 — a real Swingbench `SOE_Client_Side_AC` run, driven through a live Data Guard
 switchover, with the resulting dip-and-recovery chart as evidence. That write-up
 also documents the connect-string mistake referenced above and how it was

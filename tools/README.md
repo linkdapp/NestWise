@@ -8,7 +8,7 @@ worked.
 - **[Swingbench: install and use](swingbench/)** 🟩 Built. The load-generation tool
   behind every real throughput chart in this project, including the Data
   Guard and Application Continuity switchover test in
-  [`high-availability/part3-post-checks.md` Section 16](../high-availability/part3-post-checks.md#16-confirmed--post-standby-validation).
+  [`high-availability/part3-post-checks.md` Section 16](../high-availability/part3-post-checks.md#16--confirmed--post-standby-validation).
 - **Oracle Autonomous Health Framework (AHF)**: the modern home of `orachk` and
   `exachk` plus TFA, run for a compliance check before and after every patch or
   upgrade phase. No dedicated page. The commands and the pre-patch baseline are in

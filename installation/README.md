@@ -87,7 +87,8 @@ VM. Node 1 is the clone source. Full walkthrough with exact commands:
 Step 7 onward below assume both real nodes exist, are personalized, and are reachable
 over SSH with their final hostnames.
 
-📸 *Screenshot: `VBoxManage list vms` showing both nodes registered, plus the `verify_baseline` PASS output for each.*
+⬜ Screenshot not captured: `VBoxManage list vms` showing both nodes registered. The
+`verify_baseline` PASS output for each is embedded at §6.
 
 ---
 

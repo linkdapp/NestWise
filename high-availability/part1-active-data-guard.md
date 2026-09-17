@@ -99,18 +99,18 @@ naming convention as `installation/`'s Section 15.
 ## Contents
 
 1. [Prerequisites and decisions](#1-prerequisites-and-decisions)
-2. [🟩 Confirmed — Host-side VM and storage (built by hand, by me)](#2-confirmed--host-side-vm-and-storage-built-by-hand-by-me)
-3. [🟩 Confirmed — OS baseline on oradbserv09/10](#3-confirmed--os-baseline-on-oradbserv0910)
-4. [🟩 Confirmed — DNS for usatclust2](#4-confirmed--dns-for-usatclust2)
-5. [🟩 Confirmed — Time sync (chrony)](#5-confirmed--time-sync-chrony)
-6. [🟩 Confirmed — ASMLib — mark oradbserv09/10's own shared disks](#6-confirmed--asmlib--mark-oradbserv0910s-own-shared-disks)
-7. [🟩 Confirmed — SSH equivalence for grid/oracle across usatclust2](#7-confirmed--ssh-equivalence-for-gridoracle-across-usatclust2)
-8. [🟩 Confirmed — Clone GI + DB Oracle Homes from oradbserv05](#8-confirmed--clone-gi--db-oracle-homes-from-oradbserv05)
-9. [🟩 Confirmed — Configure the usatclust2 cluster](#9-confirmed--configure-the-usatclust2-cluster)
-10. [🟩 Confirmed — Create the standby database (RMAN duplicate)](#10-confirmed--create-the-standby-database-rman-duplicate)
-11. [🟩 Confirmed — Remove the multiplexed standby redo log member](#11-confirmed--remove-the-multiplexed-standby-redo-log-member)
-12. [🟩 Confirmed — Convert the standby to RAC](#12-confirmed--convert-the-standby-to-rac)
-13. [🟩 Confirmed — Role-based services](#13-confirmed--role-based-services-apexdb_rwapexdb_ro)
+2. [🟩 Confirmed — Host-side VM and storage (built by hand, by me)](#2--confirmed--host-side-vm-and-storage-built-by-hand-by-me)
+3. [🟩 Confirmed — OS baseline on oradbserv09/10](#3--confirmed--os-baseline-on-oradbserv0910)
+4. [🟩 Confirmed — DNS for usatclust2](#4--confirmed--dns-for-usatclust2)
+5. [🟩 Confirmed — Time sync (chrony)](#5--confirmed--time-sync-chrony)
+6. [🟩 Confirmed — ASMLib — mark oradbserv09/10's own shared disks](#6--confirmed--asmlib--mark-oradbserv0910s-own-shared-disks)
+7. [🟩 Confirmed — SSH equivalence for grid/oracle across usatclust2](#7--confirmed--ssh-equivalence-for-gridoracle-across-usatclust2)
+8. [🟩 Confirmed — Clone GI + DB Oracle Homes from oradbserv05](#8--confirmed--clone-gi--db-oracle-homes-from-oradbserv05)
+9. [🟩 Confirmed — Configure the usatclust2 cluster](#9--confirmed--configure-the-usatclust2-cluster)
+10. [🟩 Confirmed — Create the standby database (RMAN duplicate)](#10--confirmed--create-the-standby-database-rman-duplicate)
+11. [🟩 Confirmed — Remove the multiplexed standby redo log member](#11--confirmed--remove-the-multiplexed-standby-redo-log-member)
+12. [🟩 Confirmed — Convert the standby to RAC](#12--confirmed--convert-the-standby-to-rac)
+13. [🟩 Confirmed — Role-based services](#13--confirmed--role-based-services-apexdb_rwapexdb_ro)
 
 Continue to **[Part 2 — Broker, Fast-Start Failover, and Observer](part2-broker-fsfo-observer.md)**.
 
@@ -150,7 +150,7 @@ done). Confirm both VMs are registered and reachable before Section 3:
 "c:\Program Files\Oracle\VirtualBox\VBoxManage" list vms
 ```
 
-📸 *Screenshot: list_vms.png.*
+![VirtualBox VM list showing the standby nodes](screenshots/list_vms.png)
 
 ```bash
 ansible -i inventory/hosts.ini oradbserv09,oradbserv10 -m raw -a "echo pong"
@@ -162,7 +162,7 @@ ansible -i inventory/hosts.ini oradbserv09,oradbserv10 -m raw -a "echo pong"
 2. Confirms both new nodes are up, SSH-key-reachable, and resolve under
    their inventory names, before any real role runs against them.
 
-📸 *Screenshot: echo_pong.png.*
+![Ansible ping returning pong from the standby nodes](screenshots/echo_pong.png)
 
 ---
 
@@ -198,7 +198,7 @@ Same manual spot-checks as [`installation/README.md` Section 6](../installation/
 apply here — `id grid; id oracle`, `df -h /u01`, etc. — just run against `oradbserv09`/
 `oradbserv10` instead. Don't proceed until `verify_baseline` passes on both nodes.
 
-📸 *Screenshot: Manual_spot_check.png.*
+![Manual spot check of the OS baseline](screenshots/Manual_spot_check.png)
 
 ---
 
@@ -227,7 +227,7 @@ nslookup scan-usatclust2.usat.com
 getent hosts scan-usatclust2.usat.com
 ```
 
-📸 *Screenshot: nsloookup_usatclust2.png.*
+![nslookup resolving the usatclust2 SCAN and VIPs](screenshots/nsloookup_usatclust2.png)
 
 ---
 
@@ -256,7 +256,7 @@ chronyc sources     # expect ^* oemserver01.usat.com ...
 chronyc tracking
 ```
 
-📸 *Screenshot: chrony_tracking_sources.png.*
+![chrony tracking and sources on the standby nodes](screenshots/chrony_tracking_sources.png)
 
 ---
 
@@ -278,9 +278,9 @@ ansible-playbook -i inventory/hosts.ini site.yml --tags standby_asmlib_disks
 5. On both nodes, scans for and lists the discovered ASM disks — fails if
    `oradbserv10` doesn't see everything `oradbserv09` marked.
 
-📸 *Screenshot: standby_asmlib_disks.png.*
+![ASMLib disks marked on the standby nodes](screenshots/standby_asmlib_disks.png)
 
-📸 *Screenshot: standby_asmlib_disks_lists.png.*
+![oracleasm listdisks on the standby nodes](screenshots/standby_asmlib_disks_lists.png)
 
 ---
 
@@ -300,7 +300,7 @@ ansible-playbook -i inventory/hosts.ini site.yml --tags standby_ssh_equivalence
    `oracle` users, across both nodes — the actual prerequisite Section 8's
    clone and Section 9's `gridSetup.sh` propagation both depend on.
 
-📸 *Screenshot: not yet captured.*
+⬜ Screenshot not captured.
 
 ---
 
@@ -355,7 +355,7 @@ ansible-playbook -i inventory/hosts.ini site.yml --tags gi_db_home_clone
 sudo $GRID_HOME/bin/crsctl start crs
 ```
 
-📸 *Screenshot: gi_db_home_clone.png.*
+![gi_db_home_clone completing against oradbserv09 and oradbserv10](screenshots/gi_db_home_clone.png)
 
 ---
 
@@ -546,7 +546,8 @@ oradbserv09-grid-+ASM1$
 
 ```
 
-📸 *Screenshot: standby_grid_infrastructure.png.*
+⬜ Screenshot not captured: `standby_grid_infrastructure.png` is referenced here but is
+not in `screenshots/`.
 
 ---
 
@@ -601,7 +602,7 @@ select thread#, group#, bytes/1024/1024 size_mb, members, status from v$log orde
 select group#, thread#, bytes/1024/1024 size_mb, status from v$standby_log order by 1;
 exit;
 ```
-📸 *Screenshot: Show_current_primary_configuration.png.*
+![The primary's current configuration before standby creation](screenshots/Show_current_primary_configuration.png)
 
 Read-only sanity check before touching anything — this task has run
 cleanly every time (`changed_when: false`, never fails), but its specific
@@ -617,7 +618,7 @@ create pfile='/u01/app/oracle/staging/backups/spfile_apexdb_<epoch>.ora' from sp
 exit;
 ```
 
-📸 *Screenshot: Show_spfile_backup_output.png.*
+![The spfile backup output](screenshots/Show_spfile_backup_output.png)
 ```
 SQL*Plus: Release 12.2.0.1.0 Production on Sat Aug 15 01:47:13 2026
 Connected to:
@@ -636,7 +637,7 @@ select force_logging from v$database;
 exit;
 ```
 
-📸 *Screenshot: Show_current_FORCE_LOGGING_state.png.*
+![FORCE_LOGGING state on the primary](screenshots/Show_current_FORCE_LOGGING_state.png)
 
 
 Already `YES` on this run — the `alter database force logging;` task and
@@ -650,7 +651,7 @@ select flashback_on from v$database;
 exit;
 ```
 
-📸 *Screenshot: Show_current_Flashback_Database_state.png.*
+![Flashback Database state on the primary](screenshots/Show_current_Flashback_Database_state.png)
 
 Same result: already `YES`, so `alter system set db_flashback_retention_target=1440 scope=both sid='*'; alter database flashback on;` was skipped
 — which turned out to hide a real gap (`known-risks.md` #115): because
@@ -670,7 +671,7 @@ alter system set standby_file_management=manual scope=both sid='*';
 exit;
 ```
 
-📸 *Screenshot: Show_STANDBY_FILE_MANAGEMENT.png.*
+![STANDBY_FILE_MANAGEMENT before the change](screenshots/Show_STANDBY_FILE_MANAGEMENT.png)
 
 **6. Add the missing standby redo log groups** — MAA formula `(max ORL groups/thread + 1) × threads` = groups 11-16, 128MB single-member, all on `+RECO01`, thread 1 for 11-13 and thread 2 for 14-16. A PL/SQL loop checks `v$standby_log` per group# first, so a partial or repeat run only adds what's actually missing:
 
@@ -695,7 +696,7 @@ END;
 exit;
 ```
 
-📸 *Screenshot: Show_standby_redolog_creation.png.*
+![Standby redo log creation on the primary](screenshots/Show_standby_redolog_creation.png)
 
 
 **7. Set `STANDBY_FILE_MANAGEMENT` back to `AUTO`**
@@ -706,7 +707,7 @@ alter system set standby_file_management=auto scope=both sid='*';
 exit;
 ```
 
-📸 *Screenshot: Show_STANDBY_FILE_MANAGE_auto.png.*
+![STANDBY_FILE_MANAGEMENT set to AUTO](screenshots/Show_STANDBY_FILE_MANAGE_auto.png)
 
 
 **8. Confirm the standby redo log layout**
@@ -723,7 +724,7 @@ from v$standby_log sl, v$logfile lf where sl.group#=lf.group# order by sl.thread
 exit;
 ```
 
-📸 *Screenshot: Show_STANDBY_FILE_MANAGE_auto.png.*
+![STANDBY_FILE_MANAGEMENT set to AUTO](screenshots/Show_STANDBY_FILE_MANAGE_auto.png)
 
 **9. Check the ASM directory each broker config file will live under**
 
@@ -784,7 +785,7 @@ working file):
 ```bash
 srvctl config database -d apexdb
 ```
-📸 *Screenshot: Show_full_srvctl_config_db.png.*
+![srvctl config database for apexdb](screenshots/Show_full_srvctl_config_db.png)
 
 First run surfaced a second real bug: the check came back as
 `****ORACLE_HOME environment variable is not set` instead of real
@@ -935,16 +936,16 @@ oradbserv10: SID_DESC (GLOBAL_DBNAME = apexdb_stby, ORACLE_HOME = .../db_1, SID_
 login `run_once`, from whichever node happened to run first
 (`oradbserv05`)
 
-📸 *Screenshot: tnsping05_dataguard_net_config.png.*
-📸 *Screenshot: tnsping06_dataguard_net_config.png.*
-📸 *Screenshot: tnsping09_dataguard_net_config.png.*
-📸 *Screenshot: tnsping10_dataguard_net_config.png.*
+![tnsping from oradbserv05](screenshots/tnsping05_dataguard_net_config.png)
+![tnsping from oradbserv06](screenshots/tnsping06_dataguard_net_config.png)
+![tnsping from oradbserv09](screenshots/tnsping09_dataguard_net_config.png)
+![tnsping from oradbserv10](screenshots/tnsping10_dataguard_net_config.png)
 
 **Confirmed with the real password** (`-e sys_password='<redacted>'`): all 4 nodes
 (`oradbserv05`, `06`, `09`, `10`) connected successfully through both
 `apexdb` and `apexdb_dg`
 
-📸 *Screenshot: dataguard_net_config.png.*
+![dataguard_net_config completing across all four nodes](screenshots/dataguard_net_config.png)
 
 **Phase 3 — Prepare the standby host (built, run for real, fully green):**
 role [`dataguard_standby_prep`](../phase-01-foundation-2node-rac-12cR2/ansible/roles/dataguard_standby_prep/tasks/main.yml),
@@ -1060,7 +1061,7 @@ Full real run, both `PLAY RECAP`s clean:
 `localhost ok=36 changed=11 failed=0 skipped=3`,
 `oradbserv05/06/09/10 ok=3 changed=0 failed=0` each.
 
-📸 *Screenshot: dataguard_standby_prep.png.*
+![dataguard_standby_prep on oradbserv09](screenshots/dataguard_standby_prep.png)
 
 **Phase 4 — RMAN `DUPLICATE ... FOR STANDBY FROM ACTIVE DATABASE` (built
 from the SOP's section 8, run for real — confirmed clean after the `tnsnames.ora`
@@ -1132,7 +1133,7 @@ own closing note — only proceed to Phase 5 once transport/apply lag are
 healthy — is left as a manual gate; the role prints the real numbers, not
 an automated pass/fail.
 
-📸 *Screenshot: dataguard_duplicate_completed.png.*
+![RMAN DUPLICATE FOR STANDBY completing](screenshots/dataguard_duplicate_completed.png)
 
 **8.3.1 — Confirm standby role/state**, real output right after `DUPLICATE`
 finished:
@@ -1285,7 +1286,7 @@ Rman duplicate will multiplex the SRLs. Drop them.
 MAA best practice, stated as a direct "do not," not a preference.** From
 Oracle's MAA best-practices guidance on sizing redo log files and groups:
 
-📸 *Screenshot: Show_baseline_SRL_members.png.*
+![Baseline standby redo log members before the drop](screenshots/Show_baseline_SRL_members.png)
 
 > Best Practices for Sizing Redo Log Files and Groups
 > - Use a minimum of three redo log groups: this helps prevent the log
@@ -1332,7 +1333,7 @@ standby redo log on concern is being used by the transport service. To drop it, 
 database nodes, switch the current logfile by running the following command a few times in each
 node
 
-📸 *Screenshot: show_the_DROP_SRL_ORA-00261.png.*
+![ORA-00261 on the standby redo log member drop](screenshots/show_the_DROP_SRL_ORA-00261.png)
 
 
 ---

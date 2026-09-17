@@ -23,7 +23,7 @@ same reasoning doc referenced throughout [Part 1](part1-active-data-guard.md) an
 
 ## Contents
 
-16. [🟩 Confirmed — Post-standby validation](#16-confirmed--post-standby-validation)
+16. [🟩 Confirmed — Post-standby validation](#16--confirmed--post-standby-validation)
 17. [Screenshot checklist and naming convention](#17-screenshot-checklist-and-naming-convention)
 
 Back to **[Part 2: Broker, Fast-Start Failover, and Observer](part2-broker-fsfo-observer.md)**.

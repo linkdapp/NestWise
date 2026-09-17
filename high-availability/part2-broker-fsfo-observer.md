@@ -44,8 +44,8 @@ section numbers (14, 15).
 
 ## Contents
 
-14. [🟩 Confirmed — Data Guard Broker configuration](#14-confirmed--data-guard-broker-configuration)
-15. [🟩 Confirmed — Fast-Start Failover and Observer](#15-confirmed--fast-start-failover-and-observer)
+14. [🟩 Confirmed — Data Guard Broker configuration](#14--confirmed--data-guard-broker-configuration)
+15. [🟩 Confirmed — Fast-Start Failover and Observer](#15--confirmed--fast-start-failover-and-observer)
 
 Back to **[Part 1 — Setting Up Active Data Guard](part1-active-data-guard.md)**. Continue to
 **[Part 3 — Post checks](part3-post-checks.md)**.
@@ -77,7 +77,7 @@ See `known-risks.md` #137 for the full debugging journey.
 	```
 	SQL> alter system set dg_broker_start=true scope=both sid='*';
 	```
-	📸 *Screenshot: Show_primary_broker_config_file.png.*
+	![The primary's broker configuration file](screenshots/Show_primary_broker_config_file.png)
 	
 3. PAUSE, then clears `log_archive_dest_2` on both databases
    (check-then-clear, idempotent) — Broker manages it from here.
@@ -102,7 +102,7 @@ See `known-risks.md` #137 for the full debugging journey.
    DGMGRL> add database apexdb_stby as connect identifier is apexdb_stby_DGMGRL maintained as physical;
    DGMGRL> enable configuration;
    ```
-   📸 *Screenshot: Show_create_configuration.png.*
+   ![CREATE CONFIGURATION in dgmgrl](screenshots/Show_create_configuration.png)
    
 5. Sets MAA properties: `LogXptMode='SYNC'` on both databases (required for
    MaxAvailability — NOT `'ASYNC'`, `StandbyFileManagement='AUTO'` on the standby,
@@ -121,7 +121,7 @@ See `known-risks.md` #137 for the full debugging journey.
    ```
    DGMGRL> edit configuration set protection mode as maxavailability;
    ```
-   📸 *Screenshot: Show_current_protection_mode.png.*
+   ![The configuration's current protection mode](screenshots/Show_current_protection_mode.png)
    
 7. Final health check: `SHOW CONFIGURATION VERBOSE` + `SHOW DATABASE
    VERBOSE` for both databases. (`VALIDATE STATIC CONNECT IDENTIFIER` was
@@ -135,7 +135,7 @@ See `known-risks.md` #137 for the full debugging journey.
    DGMGRL> show database verbose apexdb_stby;
    ```
    
-   📸 *Screenshot: Show_enabled_configuration.png.*
+   ![The enabled broker configuration](screenshots/Show_enabled_configuration.png)
    
 8. The switchover test lives in its own standalone role/play.
    
@@ -163,7 +163,8 @@ See `known-risks.md` #137 for the full debugging journey.
    DGMGRL> show database verbose apexdb_stby;
    ```
    
-   📸 *Screenshot: Switchover_confirmed_role_flip.png.*
+   ⬜ Screenshot not captured: the role flip confirmation. The switchover output itself
+   is below.
 
    ```
    # --- New Primary (Old Standby)
@@ -184,7 +185,7 @@ See `known-risks.md` #137 for the full debugging journey.
    APEXDB    apexdb1          oradbserv09.usat.com OPEN    READ WRITE   TO STANDBY           ACTIVE
    
    ```
-📸 *Screenshot: Show_switchover_output.png.*
+![The switchover output](screenshots/Show_switchover_output.png)
 
    ``` 
    # --- New Standby (Old Primary)
@@ -208,7 +209,7 @@ See `known-risks.md` #137 for the full debugging journey.
    ```
 
 
-📸 *Screenshot: Show_configuration_pre_switchover.png.*
+![The configuration before the switchover](screenshots/Show_configuration_pre_switchover.png)
 
 
 
@@ -241,7 +242,7 @@ $ ansible-playbook -i inventory/hosts.ini site.yml --tags dataguard_fsfo -e sys_
    sudo chmod 0440 /etc/sudoers.d/ansible
    ```
    
-   📸 *Screenshot: creating_observer_directory.png.*
+   ![Creating the observer directory on oemserver01](screenshots/creating_observer_directory.png)
    ```
    Then from WSL2 (control node — reuses the same ansible-control key you already generated for 
    the other 4 nodes, no need to regenerate):
@@ -295,7 +296,7 @@ $ ansible-playbook -i inventory/hosts.ini site.yml --tags dataguard_fsfo -e sys_
 5. Sets `FastStartFailoverThreshold` (30s, Oracle's own default) and
    `ENABLE FAST_START FAILOVER` from the primary:
 
-   📸 *Screenshot: Show_current_FSFO_status.png.*
+   ![Fast-Start Failover status before enabling](screenshots/Show_current_FSFO_status.png)
    
       ```
    DGMGRL> edit configuration set property FastStartFailoverThreshold=30;
@@ -305,7 +306,7 @@ $ ansible-playbook -i inventory/hosts.ini site.yml --tags dataguard_fsfo -e sys_
      Threshold:          30 seconds
      Target:             apexdb_stby
    ```
-   📸 *Screenshot: Show_FSFO_enabled_status.png.*
+   ![Fast-Start Failover enabled](screenshots/Show_FSFO_enabled_status.png)
    
 6. Starts the Observer itself, wallet-authenticated (no embedded password, unlike
    every other one-shot DGMGRL script in this project — this one runs indefinitely
@@ -329,13 +330,13 @@ $ ansible-playbook -i inventory/hosts.ini site.yml --tags dataguard_fsfo -e sys_
      Last Ping to Primary:   3 seconds ago
      Last Ping to Target:    3 seconds ago
    ``` 
-   📸 *Screenshot: show_observer.png.*
+   ![SHOW OBSERVER in dgmgrl](screenshots/show_observer.png)
    
       ```
    DGMGRL> show fast_start failover;
    ```
 
-   📸 *Screenshot: show_fast_start_fail_over.png.*
+   ![SHOW FAST_START FAILOVER in dgmgrl](screenshots/show_fast_start_fail_over.png)
 
 **Real induced-failover drill — confirmed manually, not yet Ansible-automated.**
 Everything above proves FSFO *armed*. This proves it *exercised*: a real primary
@@ -521,9 +522,11 @@ Reinstating database "apexdb", please wait...
 Reinstatement of database "apexdb" succeeded
 ```
 
-📸 *Screenshots: `reinstate_database_apexdb_dgmgrl.png`,
-`reinstate_database_apexdb_alertlog.png`,
-`Show_configuration_after_reinstate.png`.*
+![REINSTATE DATABASE apexdb in dgmgrl](screenshots/reinstate_database_apexdb_dgmgrl.png)
+
+![The reinstatement as it appears in apexdb's alert log](screenshots/reinstate_database_apexdb_alertlog.png)
+
+![The broker configuration after the reinstatement](screenshots/Show_configuration_after_reinstate.png)
 
 **Worth carrying forward, even with the automated test on hold:** a real
 FSFO failover leaves the old primary needing a manual `srvctl start ... -o
