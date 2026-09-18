@@ -18,9 +18,9 @@ Status: 🟩 Confirmed. `19.32.0.0.0`, invalid objects 2 to 0, targets 43 to 43,
 | 13 | Datapatch, the step people forget | 🟩 Confirmed |
 | 14 | `extjob`, and two things left manual | 🟩 Confirmed |
 | 15 | Bring Enterprise Manager back | 🟩 Confirmed |
-| 16 | Verification checklist | 🟩 Confirmed (14 of 16 rows; 2 outstanding, §18 and §13.4) |
+| 16 | Verification checklist | 🟩 Confirmed (15 of 16 rows; 1 outstanding, §18.1. Row 5a superseded) |
 | 17 | Rollback, if verification fails | ⬜ Not needed |
-| 18 | Aftermath — what is still outstanding | 🟨 Two items open |
+| 18 | Aftermath — what is still outstanding | 🟨 The blackout, plus two smaller follow-ups |
 | 19 | Screenshot checklist and naming convention | 🟩 Confirmed |
 
 Screenshots referenced below are in [`screenshots/`](screenshots/), the same
@@ -324,7 +324,7 @@ Not one check. A patched database that OMS cannot use is not a successful patch.
 | 3 | Version | `SELECT banner_full FROM v$version` | `19.32.0.0.0` | 🟩 |
 | 4 | Datapatch verdict | datapatch's own `... apply: SUCCESS ... (no errors)` | `(no errors)` both patches. **Do not grep for `ORA-`**, §13.2 | 🟩 |
 | 5 | Invalid objects | `dba_invalid_objects`, §13.3 | back to the pre-patch count, not necessarily zero | 🟩 2 to 0 |
-| 5a | Oracle-maintained type data converted | §13.4's query | no rows | ⬜ Not run. Two rows found in Phase 7d |
+| 5a | Oracle-maintained type data converted | §13.4's query | no rows | Superseded. Never run against `oemcdb`, which no longer exists. Its successor `oempdb` returned two rows in Phase 7d and was converted |
 | 6 | Registry components | `SELECT comp_name, status FROM dba_registry` | no component worse than pre-patch | 🟩 1 to 1, `RAC OPTION OFF` |
 | 7 | All PDBs patched (CDB only) | `SELECT name, open_mode FROM v$pdbs` | every PDB open and patched | Not applicable at the time, non-CDB. Applicable from [Phase 7d](phase-7d-noncdb-to-pdb.md) onward |
 | 8 | `extjob` permissions | `ls -l $ORACLE_HOME/bin/extjob` | `-rwsr-x---`, owner `root` | 🟩 reasserted `root:4750` |
@@ -333,7 +333,7 @@ Not one check. A patched database that OMS cannot use is not a successful patch.
 | 11 | Agent uploading | `emctl status agent` | `Heartbeat Status : Ok`, 0 pending | 🟩 `EMD upload completed successfully` |
 | 12 | Target count intact | `emctl status agent` | **43 targets**, matching pre-patch | 🟩 43 to 43 |
 | 13 | Blackout cleared | `emctl status blackout` | none active | ⬜ outstanding, §18 |
-| 14 | Console loads | browser | `https://oemserver01.usat.com:7803/em` | ⬜ confirm |
+| 14 | Console loads | browser | `https://oemserver01.usat.com:7803/em` | 🟩 confirmed repeatedly since, most recently against the relocated repository in [Phase 7d Part 2 §7](phase-7d-part2-deployment.md#7-repoint-the-oms) |
 
 ### 16.1 Four of these deserve singling out
 
@@ -434,7 +434,7 @@ so `FLASHBACK DATABASE TO RESTORE POINT` is not available. **The RMAN backup at
 
 ## 18. Aftermath — what is still outstanding
 
-Both deliberately not automated, and both time-sensitive.
+Deliberately not automated, and time-sensitive.
 
 ### 18.1 Clear the blackout
 
@@ -456,13 +456,19 @@ what tells you whether monitoring should be trusted again.
 
 ### 18.2 Drop the guaranteed restore point
 
+🟩 Moot. `PRE_RU32` lived in `oemcdb`, whose datafiles were deleted in
+[Phase 7d Part 3 §5.3](phase-7d-part3-post-deployment.md#5-retire-the-old-non-cdb). The
+restore point went with the database.
+
 ```sql
 DROP RESTORE POINT PRE_RU32;
 ```
 
-It holds flashback logs indefinitely and will fill the fast recovery area, which
-on a host already at 15% free is a real risk rather than a theoretical one. It
-**must** be dropped, but only once a human agrees the patch is good.
+The reason it mattered stands for any future patch: a guaranteed restore point holds
+flashback logs indefinitely and will fill the fast recovery area. The same step is
+carried in
+[the gold image related-agent procedure §7](oem-gold-image-related-agent-check.md#7-drop-the-restore-point),
+where it was done.
 
 ### 18.3 Smaller follow-ups
 
@@ -470,7 +476,9 @@ on a host already at 15% free is a real risk rather than a theoretical one. It
   [Phase 7d Part 3 §6.2](phase-7d-part3-post-deployment.md#6-close-out). It ran against
   the container rather than the non-CDB, so the diff against the Part 1 §5.6 baseline
   carries that difference with it.
-- **Confirm the console loads** in a browser (§16 check 14).
+- ~~**Confirm the console loads**~~, §16 check 14. Confirmed repeatedly since, most
+  recently against the relocated repository in
+  [Phase 7d Part 2 §7](phase-7d-part2-deployment.md#7-repoint-the-oms).
 - **Fix the `group_vars/all.yml` description** of
   `/u01/app/oracle/product/19.3.0/db_1`, which calls it an Oracle *Client* home.
   The preflight proved an instance runs from it, recorded in

@@ -754,7 +754,7 @@ Deployments chart: V2 Current (3), V1 (0), No Version Deployed (0), Drifters (1)
 Agents on Gold Image 3, deployed Gold Image versions 2.
 
 Three of four moved to V2. Every `root.sh` was run by the job. `oradbserv06` is
-§5.7.6.
+§5.7.6, resolved 2026-09-17.
 
 Per host:
 
@@ -811,8 +811,8 @@ oradbserv09-oracle-apexdb1$
 
 🟩 **Resolved 2026-09-17.**
 
-`oradbserv06` runs agent version 24.1.0.0.0, its Image Version reads V1 and its
-Updated Status reads Pending. It is counted as the single drifter in §5.7.5.
+On this run `oradbserv06` ran agent version 24.1.0.0.0, its Image Version read V1 and
+its Updated Status read Pending. It is the single drifter in §5.7.5.
 
 The eligibility check and its criteria are in
 [Part 3 §16.4](phase-7b-part3-golden-image.md#164-checking-eligibility). The starting
@@ -849,8 +849,12 @@ records an unverified form.
 | 1 | `emctl status agent` on each host | `Running and Ready`, `Heartbeat Status : Ok`, zero pending uploads | 🟩 |
 | 2 | Agent version | 24.1.0.0.0 on all six | 🟩 |
 | 3 | **Setup → Manage Cloud Control → Agents** | Six Up, Secure Upload Yes, recent Last Successful Load | 🟩 |
-| 4 | Gold image Subscriptions tab | Subscribers on V2 Current | 🟨 Three of four. `oradbserv06` is §5.7.6 |
+| 4 | Gold image Subscriptions tab | Subscribers on V2 Current | 🟩 Three of four on the day. `oradbserv06` refused the update and was resolved later, per §5.7.6 |
 | 5 | `root.sh` run | Once per upgraded host | 🟩 Run by the job, per §5.5 |
+
+Row 4 records this run. The estate has since moved to `V3_24.1_RU12_BASE` in
+[Phase 7e](phase-7e-agent-patching.md), with every subscriber on the current version
+and no drifters.
 
 **No blackout was created for this run.** The Agent Upgrade Console created and
 cleared `AGT_UPG_BLK_OUT` for §5.4 on its own, per §5.3, and the §5.7 update was run

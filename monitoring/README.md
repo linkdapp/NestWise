@@ -1,11 +1,15 @@
 # Monitoring
 
-**Enterprise Manager Cloud Control: the OEM 13.5 estate, its repository database, and the road to 24ai**
+**Enterprise Manager Cloud Control: taking the OEM 13.5 estate to 24ai, and its repository into a container**
 
-Status: 🟨 In progress. Phases 7a, 7b and 7c are confirmed: the estate runs
-**24ai Release 1 Update 12** on the OMS, all six agents on 24ai Release 1, and 7d has
-moved the repository into a container database. 7e closes the patch level gap between
-the OMS and the agents.
+Status: 🟩 **Complete.** All five phases confirmed. The estate runs
+**24ai Release 1 Update 12** on the OMS and on all six agents, and the repository runs
+as `oempdb` inside `usatcdb`.
+
+Three items remain open in
+[Phase 7a's aftermath](phase-7a-part3-verification.md#18-aftermath--what-is-still-outstanding),
+none blocking this phase: the blackout raised on 2026-09-04, the `group_vars/all.yml`
+description of the Oracle home, and whether an RMAN recovery catalog exists.
 
 | Phase | Covers | Status |
 |---|---|---|
@@ -13,7 +17,6 @@ the OMS and the agents.
 | **7b** [Extending coverage](phase-7b-extending-coverage.md) | Agents onto the RAC clusters and the NestWise app tier from a gold agent image, administration groups and monitoring templates (Production, Test, Development), APEX, ORDS and MongoDB via Metric Extensions. Manual SOP, no Ansible | 🟩 Confirmed 2026-09-09 |
 | **7c** [OMS 13.5 to 24ai](phase-7c-oms-upgrade.md) | Part 1 took the OMS from base 13.5.0.0.0 to RU33 (13.5.0.33) with patch 39676211. Part 2 took it to **24ai Release 1 Update 12**, out of place, using **Upgrade software only with plug-ins and Configure Later** so RU12 was applied to the binaries before `ConfigureGC.sh` ran. Gates: OMS at 13.5 RU22 or later, repository database at 19.22 or later, 24ai target at RU06 or later from RU28 and above. Part 2c took the remaining agents to 24ai, one through the Agent Upgrade Console and the rest through the gold image | 🟩 Confirmed 2026-09-13 |
 | **7d** [Moving the repository into a container](phase-7d-noncdb-to-pdb.md), also indexed under [Multitenant](../multitenant/README.md) | `OEMCDB`, which despite the name is **not** a CDB, is plugged into a new container `usatcdb` as `oempdb`, and `ggpdb` is created alongside it for GoldenGate. There is no in-place conversion: a non-CDB becomes a PDB inside a container. A prerequisite for taking this database past 19c, since non-CDB is desupported from 21c onward. **Not** a prerequisite for 7c: 24ai supports a non-CDB repository | 🟩 Confirmed 2026-09-16. [Parts 1 and 2](phase-7d-part2-deployment.md) ran the window on 2026-09-15 and the console is served from `oempdb`. [Part 3](phase-7d-part3-post-deployment.md) retired the old non-CDB including its datafiles, backed up the container and closed the compliance check. The repository service not restarting with the PDB took the OMS down the next day and is recorded as [Part 2 §6.5](phase-7d-part2-deployment.md#65-what-happens-when-the-service-does-not-come-back) |
-
 | **7e** [Patching the 24ai agents to RU12](phase-7e-agent-patching.md) | The six agents sit at 24ai Release 1 while the OMS runs Release 1 Update 12. Patch plans need My Oracle Support, which this estate does not have, so `agentpatcher` patches the central agent and the gold image source by hand and a new image version, `V3_24.1_RU12_BASE`, carries it to the rest. Patches 33355570 and 39675970. No Ansible | 🟩 Confirmed 2026-09-17. `oemserver01` and `oradbserv05` patched by hand; the rest updated from the new image version. `oradbserv06` needed the related-agent closure check overridden first, written up at [When a gold image cut from a RAC node cannot update the other node](oem-gold-image-related-agent-check.md) |
 
 **Coverage before the upgrade.** 7b was moved ahead of the OMS upgrade
