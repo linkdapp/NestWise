@@ -1,8 +1,8 @@
 ---
 title: "Road to OracleOCM — Project Roadmap"
 generated: 2026-08-05
-updated: 2026-08-31
-status: "Phases 0/1, 2, 3, 6 and 10 built. Phases 4, 5, 7, 8, 9, 11, 12 outstanding."
+updated: 2026-09-16
+status: "Phases 0/1, 2, 3, 6, 7 and 10 built. Phases 4, 5, 8, 9, 11, 12 outstanding."
 ---
 
 # Road to OracleOCM — Roadmap
@@ -40,14 +40,30 @@ repository would otherwise find them contradicting each other.
 
 ## The gap that outranks the remaining phases
 
-Five phases are built and, until 2026-08-31, **none of them had been written up**.
-For a project whose stated purpose is showing hiring managers and other DBAs what
-this work looks like, unpublished work counts for very little. The first post
-(the Data Guard switchover under load) exists now; Phases 0/1, 6 and 10 still have
-none.
+Six phases are built and two have been written up: the Data Guard switchover under
+load, and the non-CDB to PDB conversion from 7d. For a project whose stated purpose is
+showing hiring managers and other DBAs what this work looks like, unpublished work
+counts for very little. Phases 0/1, 3, 6 and 10 still have no post, and that remains a
+larger gap than any unstarted phase.
 
 Still open: exact pacing past the current position, and whether GoldenGate (Phase 4)
 or the security and performance baseline (Phase 5) comes first.
+
+## Sequence decided 2026-09-16
+
+Phase 7 closed with 7d, which moved the Enterprise Manager repository out of a non-CDB
+and into `usatcdb` as `oempdb`. Two phases were inserted ahead of the rest:
+
+1. **7e, patch the 24ai agents.** Manual, through the Enterprise Manager console. No
+   Ansible.
+2. **9a, upgrade `usatcdb` from 19c to 21c.** 🛑 Stopped the same day, on repository
+   certification. `usatcdb` is the Enterprise Manager repository and Oracle has not
+   certified a post-19c repository for 24ai.
+
+`apexdb` remains a 19c **non-CDB** on the RAC cluster. Non-CDB is desupported from 21c
+onward, so nothing past 19c is reachable for it until it is converted, the same gate
+7d cleared for the repository. That work is now **Phase 9b** and blocks the rest of
+Phase 9.
 
 | Phase | Focus | Build | 2-3 features to demo | Showcase post angle |
 |---|---|---|---|---|
@@ -57,9 +73,12 @@ or the security and performance baseline (Phase 5) comes first.
 | 4 | GoldenGate Classic | Extract/Pump/Replicat colocated with DG on one server | GoldenGate Classic capture setup against a live app | "Same server, two jobs: Data Guard and GoldenGate side by side" — ⬜ Not started. Largest untouched area |
 | 5 | Security & performance baseline | TDE, Unified Audit, Data Redaction; AWR/ADDM/SQL Tuning Advisor baseline against NestWise's real workload | TDE tablespace encryption; Unified Audit policies | "Locking down and measuring the cluster once something's actually using it" — ⬜ Not started. Prerequisite now exists: `nestwise-app/loadtest/k6/` gives repeatable, application-shaped load |
 | 6 | Upgrade 12c → 19c | AutoUpgrade / DBMS_ROLLING across RAC and DG | 2-3 genuinely-new-in-19c features | "Upgrading a live RAC+DG stack without starting over" — 🟩 **Built out of sequence.** Now on 19.32.0.0.0. See `maintenance/` parts 1-2, including the `DBMS_ROLLING.DESTROY_PLAN` finding. No post yet |
-| 7 | OEM 13.5 → 24ai | Out-of-place EM upgrade (13.5 RU22+ required), then the standalone agents to 24ai via an Agent Gold Image; 7d converts the `OEMCDB` repository from non-CDB to CDB | Agent Gold Image lifecycle; full NestWise observability | "Upgrading the thing that watches everything else" — 🟩 **7a, 7b and 7c built.** OMS and all six agents on 24ai Release 1 Update 12. 7d not started |
+| 7 | OEM 13.5 → 24ai | Out-of-place EM upgrade (13.5 RU22+ required), then the standalone agents to 24ai via an Agent Gold Image; 7d moved the `OEMCDB` repository out of a non-CDB into `usatcdb` as `oempdb` | Agent Gold Image lifecycle; non-CDB to PDB with `DBMS_PDB`; full NestWise observability | "Upgrading the thing that watches everything else" — 🟩 **Built.** OMS and all six agents on 24ai Release 1 Update 12; repository running from a PDB. **Post published** |
+| 7e | Patch the 24ai agents to RU12 | `agentpatcher` by hand against the central agent and the gold image source, then a new image version `V3_24.1_RU12_BASE` for the subscribed agents. Patch plans ruled out: they require My Oracle Support | AgentPatcher apply and rollback without MOS; gold image version lifecycle; why a patched agent needs a configuration refresh before it can be an image source | "Patching agents with no support account, and the image that carries it" — 🟩 **Built 2026-09-17.** One agent deferred to its own write-up |
 | 8 | GoldenGate Classic → Microservices | Migrate the Phase 4 GoldenGate deployment to Microservices/REST architecture | Microservices deployment model; REST-based monitoring | "Retiring GoldenGate Classic: the migration, not just the theory" |
-| 9 | Upgrade 19c → 26ai | AutoUpgrade (or ZDM) to 26ai | Built-in AI Vector Search / Select AI; Automatic Transaction Rollback; Real-Time SQL Plan Management | "What an AI-native Oracle release actually changes for a DBA" |
+| 9a | Upgrade `usatcdb` 19c → 21c | AutoUpgrade at the latest available 21c Release Update, against the container holding `oempdb` and `ggpdb`. Ansible stages the config and invokes AutoUpgrade; AutoUpgrade owns the upgrade | AutoUpgrade `analyze` → `fixups` → `deploy`; upgrading a CDB with its PDBs; what 21c removes | 🛑 **Stopped 2026-09-16, not deferred for pacing.** See below |
+| 9b | Convert `apexdb` to a PDB | The RAC/Data Guard database is still a 19c non-CDB. AutoUpgrade with `target_cdb` converts and upgrades in one pass, the route 7d deliberately did not take | `target_cdb` conversion; the same move against RAC, ASM and a standby rather than a single instance on a filesystem | "Doing it again, on the hard one" — ⬜ Blocks everything past 19c for `apexdb` |
+| 9c | Upgrade → 26ai | AutoUpgrade (or ZDM) to 26ai, once the OS gate in `known-risks.md` #1 is cleared | Built-in AI Vector Search / Select AI; Automatic Transaction Rollback; Real-Time SQL Plan Management | "What an AI-native Oracle release actually changes for a DBA" — ⬜ |
 | 10 | **NestWise v2** — MongoDB cross-database integration | Node/Express proxy fronting MongoDB, surfaced through APEX REST Data Sources. Listings with embedded reviews, movies, weather, venues | Hybrid relational + document rendering on one page; a real cross-database integrity bug found and fixed at the cause | "Polyglot persistence, running behind an app people can actually use" — 🟩 **Built out of sequence**, alongside Phase 3. 12 pages. See `nestwise-app/README.md`. No post yet |
 | 11 | Automation & CI/CD wrap-up | GitLab CI pipelines for patch testing/deployment; consolidated Ansible playbooks; OCI DBaaS excursion (name the specific service) | GitLab CI pipeline for DB patching; OCI DBaaS comparison | "From clicking through patches to pipelines" |
 | 12 | Capstone | End-to-end OCM-style practical run-through across the whole stack, NestWise included | — | "What I'd tell someone starting this same road" |
@@ -70,3 +89,78 @@ and the skill drafts the post using the template in `03-showcase-post-template.m
 SQL Server heterogeneous connectivity (originally slated for the old Phase 8) is
 deferred indefinitely — MongoDB is the confirmed cross-database target for NestWise
 v2; a second non-Oracle source isn't currently planned unless that changes.
+
+---
+
+## Phase 9a: stopped on certification
+
+**Decision 2026-09-16: not attempted.** Enterprise Manager 24ai requires a certified
+repository database with a minimum of 19.22. 23ai and 26ai are not certified as OMS
+repositories, and 21c's status could not be confirmed. Upgrading `usatcdb` means
+running the console off a repository Oracle may not support, and the console is the
+subject of the entire Phase 7 arc.
+
+This is a hold rather than a cancellation. It reopens when Oracle certifies a post-19c
+repository for Enterprise Manager 24ai, at which point the target release is whatever
+is certified rather than 21c specifically.
+
+**Anything past 19c goes through Phase 9b instead.** `apexdb` is not an Enterprise
+Manager repository, so it carries none of this constraint. It is the database to
+demonstrate a modern upgrade against, once it is a PDB.
+
+The rest of this section is kept as the analysis done before the decision, so the
+reasoning survives with it.
+
+**21c is an Innovation Release.** Not eligible for Extended Support, with a shorter
+error-correction window than a Long Term Support release. "The latest RU" may be a
+fixed number rather than a moving one.
+
+**Two components in `usatcdb` would not have survived the move.** Read from the
+repository's own `dba_registry` on 2026-09-15, both currently `VALID`:
+
+| Component | In 21c |
+|---|---|
+| `ORDIM`, Oracle Multimedia | Desupported at 19c, removed at 21c |
+| `APS` and `XOQ`, OLAP | Desupported at 21c |
+
+AutoUpgrade's `analyze` phase reports both. Neither is used by Enterprise Manager, but
+removing a component from a live repository is its own change with its own backout.
+
+**Keep `COMPATIBLE` at 19.0.0 through the upgrade.** AutoUpgrade does not raise it
+unless told to. Raising it is irreversible and ends the downgrade path, which is the
+only route back if the OMS refuses the new repository. Raise it later, deliberately,
+once the console has been proven against 21c.
+
+## Why Ansible stays thin on any future upgrade phase
+
+Written for 9a and kept, because it applies unchanged to 9b and 9c. The instruction is
+to avoid debugging Ansible. The way to do that is to write as little of it as possible.
+
+`docs/known-risks.md` holds 157 entries and `docs/ansible-preflight-checklist.md`
+distils them into a checklist walked **before** code is handed over, which is the
+lesson #145 paid for: a trap documented as a comment on the code that avoids it is
+invisible to the person writing the next piece of code.
+`ansible/syntax-check.sh` mechanises nine of those checks.
+
+The trap-dense areas in that checklist are shell and SQL\*Plus heredocs (#77, #78,
+#82, #143, #144, #153), looped tasks and their `failed_when` (#97, #99, #130, #154),
+and `set_fact` visibility under narrow `--tags` runs (#71, #142). A hand-rolled
+upgrade role lives in all three at once.
+
+AutoUpgrade avoids them by owning the work:
+
+| Concern | Owner |
+|---|---|
+| Prechecks and fixups | AutoUpgrade `analyze` and `fixups` |
+| Restore point and backout | AutoUpgrade, guaranteed restore point |
+| Running the upgrade across the CDB and every PDB | AutoUpgrade `deploy` |
+| `datapatch` and recompilation | AutoUpgrade |
+| Progress and logging | AutoUpgrade's own job status and log tree |
+| Staging the config file, invoking the jar, capturing evidence | Ansible |
+
+That leaves Ansible doing file placement, one `java -jar` invocation per phase, and
+output capture: a role that touches almost none of the recorded traps.
+
+Two checklist items still apply and are not optional. `syntax-check.sh` passes before
+handover, and the confirm gate pattern from `oem_repo_patch` is reused, because #129
+requires that a step which stops a database cannot be reached by a broad `--tags` run.
