@@ -16,9 +16,9 @@ Status: 🟩 **Confirmed 2026-09-17.** `oemserver01` and `oradbserv05` patched b
 `V3_24.1_RU12_BASE` cut and set current, `oradbserv04`, `oradbserv09` and `oradbserv10`
 updated from it.
 
-`oradbserv06` is carried out of this phase. It failed the update for a condition that
-predates this work and is written up separately: see
-[§5.1](#51-oradbserv06-is-carried-out-of-this-phase).
+`oradbserv06` needed the related-agent closure check overridden before it would take
+the image. Written up separately:
+**[When a gold image cut from a RAC node cannot update the other node](oem-gold-image-related-agent-check.md)**.
 
 > ### The window, in one line
 >
@@ -123,7 +123,7 @@ for 24ai Release 1. This is the first, which decides the rollback identifier lis
 |---|---|---|
 | `oemserver01` | Manual | Central agent. *"You cannot update a central agent with an Agent Gold Image."* [Phase 7b Part 3 §16.2](phase-7b-part3-golden-image.md#162-two-agents-cannot-be-subscribed) |
 | `oradbserv05` | Manual | Image source. An agent cannot subscribe to the image cut from it |
-| `oradbserv06` | Deferred | Clustered with `oradbserv05`, and a drifter that fails the update. Carried out of this phase, [§5.1](#51-oradbserv06-is-carried-out-of-this-phase) |
+| `oradbserv06` | Gold image, after an override | Clustered with `oradbserv05`, so the related-agent check refuses the update. [§5.1](#51-oradbserv06-needed-the-related-agent-check-overridden) |
 | `oradbserv04` | Gold image | Subscribed, on V2, no drift |
 | `oradbserv09` | Gold image | Subscribed, on V2, no drift |
 | `oradbserv10` | Gold image | Subscribed, on V2, no drift |
@@ -422,23 +422,25 @@ Version readiness and the eligibility checks are in
 7. after the job completes `oradbserv04, oradbserv09, and oradbserv10` will be on the new `V3_24.1_RU12_BASE` while `oradbserv06` will fail because of a prior existing issue later addressed in <place_holder_for_article>
 
 
-### 5.1 `oradbserv06` is carried out of this phase
+### 5.1 `oradbserv06` needed the related-agent check overridden
 
-It failed the V3 update for a condition that predates this work: it is recorded on
-**V1** and reported as a drifter since
-[Phase 7c Part 2c §5.7.6](phase-7c-part2c-post-deployment.md#576-oradbserv06-did-not-take-the-update).
-[Appendix A.5](#a5-why-oradbserv06-is-a-drifter) summarises the measured reasons.
+It failed the update with `NotUpdatable`, for a condition predating this work and
+first reported at
+[Phase 7c Part 2c §5.7.6](phase-7c-part2c-post-deployment.md#576-oradbserv06-did-not-take-the-update):
 
-Resolving it is its own piece of work and is written up separately in
-`<place_holder_for_article>`.
+```
+oradbserv06.usat.com:3872   NotUpdatable   ERROR   Related agents are not updatable.
+                                                   Monitoring Target : +ASM_usatclust1,..
+```
 
-> ### Until then, `usatclust1` is split across two agent patch levels
->
-> `oradbserv05` carries RU12 and `oradbserv06` does not. That is exactly the state the
-> RU README's cluster instruction exists to prevent, so it is a known open condition
-> rather than a completed one.
->
-> `usatclust2` is not affected. `oradbserv09` and `oradbserv10` both took V3.
+`GI_AGENT_LINUX_X64` was cut from `oradbserv05`, the other node of `usatclust1`. Both
+nodes monitor `+ASM_usatclust1`, so Enterprise Manager requires them to update together,
+and the image source can never be updated from its own image. The closure is
+unsatisfiable.
+
+Resolved 2026-09-17 by overriding the check in `EM_GI_MASTER_INFO` and updating the
+single agent. Full procedure:
+**[When a gold image cut from a RAC node cannot update the other node](oem-gold-image-related-agent-check.md)**.
 
 ---
 
@@ -494,9 +496,8 @@ From the console:
 | 3 | `Agent Version` | Still `24.1.0.0.0`. The RU does not change it |
 | 4 | Target count | Unchanged. `oradbserv05` carried 16 before and after |
 | 5 | Patches Applied, console | `39675970` listed, after the §4.6 refresh |
-| 6 | Gold image | `oradbserv04`, `oradbserv09` and `oradbserv10` on `V3_24.1_RU12_BASE` |
-| 7 | `usatclust2` | `oradbserv09` and `oradbserv10` at the same patch level |
-| 8 | `usatclust1` | Split until `oradbserv06` is resolved. [§5.1](#51-oradbserv06-is-carried-out-of-this-phase) |
+| 6 | Gold image | Every subscribed agent on `V3_24.1_RU12_BASE`, zero drifters |
+| 7 | Both cluster pairs | Same patch level on both nodes |
 
 ---
 
@@ -581,14 +582,20 @@ The last two apply directly: this estate runs two clusters, and
 [Phase 7d Part 3 §1.2](phase-7d-part3-post-deployment.md#1-repoint-the-repository-target)
 used auto discovery against a host with a shared `listener.ora`.
 
-### A.5 Why `oradbserv06` is a drifter
+### A.5 Why `oradbserv06` failed the update
 
-Its own article: `<place_holder_for_article>`.
+Two separate things were true and only one of them blocked the update.
 
-Measured on 2026-09-17, it carries more than the image rather than less, and its drift
-is reported against **V1** rather than V2. Enterprise Manager refuses an update that
-would remove plug-ins from a working host, which is the refusal recorded at
-[Phase 7b Part 3 Appendix B.2](phase-7b-part3-golden-image.md#b2-updating-an-agent-that-carries-more-plug-ins-than-the-image).
+| Symptom | Cause | Blocking |
+|---|---|---|
+| Drifter flag in the console | It is recorded on **V1** while carrying a 24ai agent and more plug-ins than that image | No. A status label |
+| `NotUpdatable` from the update job | The related-agent closure check. `+ASM_usatclust1` is shared with `oradbserv05`, which is the image source and can never be updated from its own image | **Yes** |
+
+The drifter panel is what the console shows and it is not the reason the job refused.
+The reason comes from `emcli get_agent_update_status`.
+
+Resolved 2026-09-17:
+**[When a gold image cut from a RAC node cannot update the other node](oem-gold-image-related-agent-check.md)**.
 
 
 ---

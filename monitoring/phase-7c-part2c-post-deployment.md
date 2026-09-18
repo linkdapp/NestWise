@@ -809,14 +809,14 @@ oradbserv09-oracle-apexdb1$
 
 #### 5.7.6 `oradbserv06` did not take the update
 
-⬜ **Open. Deferred to a later date.**
+🟩 **Resolved 2026-09-17.**
 
 `oradbserv06` runs agent version 24.1.0.0.0, its Image Version reads V1 and its
 Updated Status reads Pending. It is counted as the single drifter in §5.7.5.
 
 The eligibility check and its criteria are in
 [Part 3 §16.4](phase-7b-part3-golden-image.md#164-checking-eligibility). The starting
-point when this is picked up:
+point when this was picked up:
 
 ```bash
 emcli get_not_updatable_agents -image_name="GI_AGENT_LINUX_X64"
@@ -825,6 +825,14 @@ emcli get_updatable_agents     -image_name="GI_AGENT_LINUX_X64"
 
 `get_not_updatable_agents` returns the agent name and the reason it is excluded. The
 console shows the same behind the information icon in the Drifters column.
+
+**The reason was the related-agent closure check,** not drift. `GI_AGENT_LINUX_X64` was
+cut from `oradbserv05`, the other node of `usatclust1`. Both nodes monitor
+`+ASM_usatclust1`, so Enterprise Manager requires them to update together, and an
+image source can never be updated from its own image. The closure is unsatisfiable.
+
+Full procedure and the override:
+**[When a gold image cut from a RAC node cannot update the other node](oem-gold-image-related-agent-check.md)**.
 
 #### 5.7.7 Rollback
 

@@ -47,7 +47,7 @@ match this page's section numbers (13 to 17).
 
 **Console first.** Every section is written as console steps.
 [Appendix A](#appendix-a-emcli-equivalents) gives the `emcli` equivalents.
-[Appendix B](#appendix-b-additional-scenarios) covers two situations outside this
+[Appendix B](#appendix-b-additional-scenarios) covers three situations outside this
 build.
 
 ---
@@ -425,7 +425,7 @@ deployed Gold Image versions 1, Platform Name Linux x86-64.
 
 | Agent | Reason |
 |---|---|
-| `oradbserv05` | Image source. An agent cannot subscribe to the image cut from it. Its software state is V1 by definition, so it does not appear in the drift chart |
+| `oradbserv05` | Image source. An agent cannot subscribe to the image cut from it. Its software state is V1 by definition, so it does not appear in the drift chart. It is also a cluster node, which extends the exclusion to `oradbserv06`: [Appendix B.3](#b3-the-image-source-is-on-a-cluster-node) |
 | `oemserver01` | Central agent. Oracle: *"You cannot update a central agent with an Agent Gold Image."* It is upgraded with the OMS, which is Phase 7b |
 
 Gold agent images manage standalone agents. Both exclusions are documented
@@ -710,7 +710,7 @@ emcli get_not_updatable_agents -image_name="GI_AGENT_LINUX_X64"
 
 ## Appendix B: Additional scenarios
 
-Neither situation arises in this build. Both are recorded because they apply to
+None of these arises in this build. All are recorded because they apply to
 this estate later.
 
 ### B.1 Updating an agent that is already monitoring live targets
@@ -783,6 +783,24 @@ emcli list_plugins_on_agent -all
 one plug-in, `oracle.sysman.oh`. `oradbserv01` carries three and `orappsserv01`
 carries two, which is why neither could be updated from V1. Full inventory in
 [Phase 7c Part 2 Appendix A](phase-7c-part2-24ai-upgrade.md#appendix-a-oradbserv01-and-orappsserv01).
+
+### B.3 The image source is on a cluster node
+
+`oradbserv05` is the source of `GI_AGENT_LINUX_X64` and one node of `usatclust1`. Both
+nodes monitor `+ASM_usatclust1`, so Enterprise Manager treats the two agents as related
+and requires them to update together. An image source can never be updated from its own
+image, so the closure can never be satisfied and `oradbserv06` reports `NotUpdatable`
+on every attempt.
+
+The state persisted through a 13.5 to 24ai OMS upgrade and two image versions. It is
+cleared by an override in `EM_GI_MASTER_INFO`, not by retrying or resubscribing.
+
+Full procedure:
+**[When a gold image cut from a RAC node cannot update the other node](oem-gold-image-related-agent-check.md)**.
+
+**Choose a standalone host as the image source where there is a choice.** §16.2 already
+records that the source cannot subscribe to its own image; on a clustered host that
+exclusion spreads to every other node of the cluster.
 
 ---
 
